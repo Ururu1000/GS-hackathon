@@ -106,11 +106,10 @@ fn item(state: &ApiState, r: &StoredRule, stats: Option<&Value>) -> Value {
 
 pub async fn list(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
     let team = query_param(raw.as_deref(), "team");
-    if let Some(t) = &team {
-        if !state.session.can_see(t) {
+    if let Some(t) = &team
+        && !state.session.can_see(t) {
             return Err(ApiError::forbidden(format!("team `{t}` is not visible to this session")));
         }
-    }
     let stats = stats(&state).await?;
     let items: Vec<Value> = config_store::list(&state.pool)
         .await?
