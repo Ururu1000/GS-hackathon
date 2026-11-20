@@ -62,6 +62,10 @@ pub fn consumer(bootstrap: &str, group: &str, topics: &[&str], from_beginning: b
         .set("isolation.level", "read_committed")
         .set("fetch.wait.max.ms", "5")
         .set("partition.assignment.strategy", "cooperative-sticky")
+        // Detect a crashed member in seconds, not the 45 s default, so its
+        // partitions move to a live replica quickly.
+        .set("session.timeout.ms", "10000")
+        .set("heartbeat.interval.ms", "1000")
         .create()
         .context("creating Kafka consumer")?;
     rdkafka::consumer::Consumer::subscribe(&consumer, topics).context("subscribing")?;

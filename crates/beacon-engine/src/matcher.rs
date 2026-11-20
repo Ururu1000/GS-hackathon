@@ -35,7 +35,13 @@ pub async fn run_matcher(
     let mut pending: Vec<DeliveryFuture> = Vec::new();
     let mut offsets: HashMap<i32, i64> = HashMap::new();
     let mut last_flush = Instant::now();
+    let (mut seen, mut matched, mut last_stats) = (0u64, 0u64, Instant::now());
     loop {
+        if last_stats.elapsed() >= Duration::from_secs(5) {
+            let secs = last_stats.elapsed().as_secs_f64();
+            info!(events_per_s = (seen as f64 / secs) as u64, matches_per_s = (matched as f64 / secs) as u64, "matcher throughput");
+            (seen, matched, last_stats) = (0, 0, Instant::now());
+        }
         let recv = tokio::time::timeout(FLUSH_INTERVAL, consumer.recv());
         let msg = tokio::select! {
             _ = shutdown.changed() => break,
@@ -48,6 +54,7 @@ pub async fn run_matcher(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Ok(Ok(m)) => {
+                seen += 1;
                 offsets.insert(m.partition(), m.offset());
                 match m.payload().map(serde_json::from_slice::<Event>) {
                     Some(Ok(event)) => {
@@ -55,6 +62,7 @@ pub async fn run_matcher(
                         if !diags.is_empty() {
                             debug!(?diags, "mapping diagnostics");
                         }
+                        matched += matches.len() as u64;
                         for rec in matches {
                             let payload = serde_json::to_vec(&rec)?;
                             pending.push(send(&producer, &rec.fingerprint, payload).await);

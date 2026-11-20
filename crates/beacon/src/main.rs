@@ -280,8 +280,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let terminate = async {
+        #[cfg(unix)]
+        {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
+            sig.recv().await;
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
+        // docker stop / kill send SIGTERM: leave consumer groups cleanly.
+        _ = terminate => info!("SIGTERM: shutting down"),
         Some(res) = tasks.join_next() => {
             if let Err(e) = res { tracing::error!(error = %e, "role task panicked"); }
         }

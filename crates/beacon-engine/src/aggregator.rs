@@ -33,8 +33,14 @@ use uuid::Uuid;
 use crate::OUTBOX_CHANNEL;
 
 pub const GROUP: &str = "beacon-aggregator";
-const MAX_BATCH: usize = 2000;
-const LINGER: Duration = Duration::from_millis(5);
+const MAX_BATCH: usize = 5000;
+
+/// How long to keep collecting after the first match of a batch. Longer means
+/// fewer, larger transactions and more duplicates coalesced per write.
+fn linger() -> Duration {
+    let ms = std::env::var("AGGREGATOR_LINGER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    Duration::from_millis(ms)
+}
 
 /// In-memory state of one alert row while a batch is planned.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -250,17 +256,20 @@ fn new_alert(m: &MatchRecord, generation: i32) -> AlertState {
 }
 
 /// Load the active alerts for the batch's fingerprints, locking them.
-async fn load_active(tx: &mut sqlx::PgConnection, fingerprints: &[String]) -> Result<Vec<AlertState>> {
+async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> Result<Vec<AlertState>> {
+    let (rules, fps): (Vec<String>, Vec<String>) = keys.iter().cloned().unzip();
     let rows = sqlx::query(
         "SELECT id, rule_id, rule_revision, rule_name, team, fingerprint, generation, dedup_active,
                 dedup_window_ms, status, severity, color, title, body, fields, count, first_seen,
                 last_seen, version, status_version, notify_seq, source, schema, last_event_id,
                 resolved_by, resolved_at, resolved_reason
          FROM alerts
-         WHERE fingerprint = ANY($1) AND dedup_active AND status IN ('open', 'acked')
+         WHERE (rule_id, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+           AND dedup_active AND status IN ('open', 'acked')
          FOR UPDATE",
     )
-    .bind(fingerprints)
+    .bind(&rules)
+    .bind(&fps)
     .fetch_all(&mut *tx)
     .await
     .context("loading active alerts")?;
@@ -304,11 +313,12 @@ async fn load_active(tx: &mut sqlx::PgConnection, fingerprints: &[String]) -> Re
 
 /// Apply one batch in a single transaction. Returns the plan that was written.
 pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
-    let mut fps: Vec<String> = batch.iter().map(|m| m.fingerprint.clone()).collect();
-    fps.sort();
-    fps.dedup();
+    // Lookup by (rule_id, fingerprint) so the partial unique index is used.
+    let mut keys: Vec<(String, String)> = batch.iter().map(|m| (m.rule_id.clone(), m.fingerprint.clone())).collect();
+    keys.sort();
+    keys.dedup();
     let mut tx = pool.begin().await?;
-    let existing = load_active(&mut tx, &fps).await?;
+    let existing = load_active(&mut tx, &keys).await?;
     let plan = plan(batch, existing, Utc::now());
 
     if !plan.updates.is_empty() {
@@ -368,7 +378,8 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
 
 pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let consumer = kafka::consumer(&bootstrap, GROUP, &[ALERTS_MATCHES], true)?;
-    info!("aggregator started");
+    let linger = linger();
+    info!(linger_ms = linger.as_millis() as u64, "aggregator started");
     loop {
         // Block for the first message, then linger briefly to build a batch.
         let first = tokio::select! {
@@ -384,7 +395,7 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                 continue;
             }
         }
-        let deadline = tokio::time::Instant::now() + LINGER;
+        let deadline = tokio::time::Instant::now() + linger;
         while msgs.len() < MAX_BATCH {
             match tokio::time::timeout_at(deadline, consumer.recv()).await {
                 Ok(Ok(m)) => msgs.push(m),

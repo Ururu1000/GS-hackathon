@@ -2,8 +2,8 @@
 //!
 //! Claims pending rows with `FOR UPDATE SKIP LOCKED` (any number of relays,
 //! no leader), publishes the alert's **current** full state keyed by alert id,
-//! and marks the rows processed in the same transaction once the broker has
-//! acknowledged. Several rows for one alert collapse into one publish; each
+//! and deletes the rows in the same transaction once the broker has
+//! acknowledged (they exist only for this relay, so nothing is kept). Several rows for one alert collapse into one publish; each
 //! record carries the alert `version`, so consumers drop stale ones.
 //! Woken by `NOTIFY beacon_outbox`, with a short polling fallback.
 
@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::OUTBOX_CHANNEL;
 use crate::feed::{FEED_COLUMNS, row_to_feed};
 
-const BATCH: i64 = 1000;
+const BATCH: i64 = 5000;
 const POLL: Duration = Duration::from_millis(250);
 
 pub async fn run_relay(bootstrap: String, pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -102,7 +102,7 @@ pub async fn relay_once(pool: &PgPool, producer: &FutureProducer) -> Result<usiz
         // Roll back: the rows stay pending and are relayed again (at-least-once).
         anyhow::bail!("publishing alert updates: {e}");
     }
-    sqlx::query("UPDATE outbox SET processed_at = now() WHERE id = ANY($1)")
+    sqlx::query("DELETE FROM outbox WHERE id = ANY($1)")
         .bind(&outbox_ids)
         .execute(&mut *tx)
         .await?;
