@@ -110,6 +110,15 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
   - bounded signature and regex sizes
   - money formatting
   - localhost-only ports
+- **Rules API milestone (tester agent):** the judges' unknown-schema flow passes end to end. An unknown JSON is discovered, dry-run in the test panel, saved as a rule, and the next event raises an alert with no restart.
+  - Fixed from that review:
+    - a race where two creates of the same rule id could both succeed
+    - unredacted event samples
+    - an unbounded sampler map
+    - zeroed stats in write responses
+    - 409 bodies that could reveal another team's rule
+    - prototype keys accepted in rule specs
+    - a missing stats index
 - **Tests:** 70+ Rust tests across core, ingest, engine and API, many of them against a real Postgres.
 
 ## Known limitations
