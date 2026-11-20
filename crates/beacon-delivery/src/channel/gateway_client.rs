@@ -5,11 +5,22 @@
 //! `POST {base_url}/provider/{sms|phone}` with header `Idempotency-Key: <job_id>` and JSON
 //! [`ProviderRequest`]. Responses:
 //! - `200` [`ProviderResponse`] → `Ok(Receipt)` (also for a duplicate: same `receipt_id`).
-//! - `429` / `503` → `SendError::RetryAfter` when a `Retry-After: <secs>` header is present,
-//!   else `SendError::Transient`.
+//! - `429` / `503` → `SendError::RetryAfter` when a `Retry-After: <secs>` header is present
+//!   (saturated and clamped to [`MAX_RETRY_AFTER`]), else `SendError::Transient`.
 //! - `504`, connect/read timeout after the request was sent → `SendError::Ambiguous`.
 //! - connection refused / DNS → `SendError::Transient`.
+//! - `3xx` → `SendError::Permanent`: the client never follows redirects, so a 3xx means the
+//!   configured provider URL is wrong (never a reason to retry, and never an excuse for the
+//!   client to be pointed somewhere else).
 //! - other `4xx` → `SendError::Permanent`; other `5xx` → `SendError::Transient`.
+//!
+//! Hardening (delivery review):
+//! - redirects are disabled on the reqwest client (see above);
+//! - error bodies are read with a bounded loop (at most 4 KiB) instead of buffered whole;
+//! - `Retry-After` is clamped to [`MAX_RETRY_AFTER`] so no provider answer can park a job
+//!   for years;
+//! - [`GatewayClientConfig::token`] makes the channel send `Authorization: Bearer <token>`
+//!   when the gateway runs authenticated.
 
 use std::time::Duration;
 
@@ -21,6 +32,12 @@ use crate::model::DeliveryJob;
 
 /// Hard SMS length bound (single GSM segment).
 pub const SMS_MAX_CHARS: usize = 160;
+
+/// Upper bound for a provider's `Retry-After` delay. `parse_retry_after` clamps to it, and
+/// `worker::finalize_failed` clamps the final retry delay to it again (defence in depth:
+/// other channels may produce `SendError::RetryAfter` too). Without it a hostile or broken
+/// provider could park a job for decades.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +83,9 @@ pub struct GatewayClientConfig {
     /// Public UI base for SMS short links, e.g. `http://localhost:5173`.
     pub public_url: String,
     pub timeout: Duration,
+    /// Bearer token for the gateway's provider routes. `Some` → every request carries
+    /// `Authorization: Bearer <token>`; `None` (the default) → no auth header (dev gateway).
+    pub token: Option<String>,
 }
 
 impl Default for GatewayClientConfig {
@@ -74,6 +94,7 @@ impl Default for GatewayClientConfig {
             base_url: "http://localhost:8070".into(),
             public_url: "http://localhost:5173".into(),
             timeout: Duration::from_secs(5),
+            token: None,
         }
     }
 }
@@ -89,6 +110,10 @@ impl GatewayChannel {
         let client = reqwest::Client::builder()
             .timeout(cfg.timeout)
             .connect_timeout(cfg.timeout)
+            // Never follow redirects: a 3xx from the provider is a permanent misrouting
+            // (the client must not POST credentials/payloads to wherever the provider
+            // points), not something to retry against a different URL.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("cannot build gateway http client: {e}"))?;
         Ok(Self { kind, client, cfg })
@@ -164,8 +189,15 @@ fn classify_reqwest_error(e: &reqwest::Error) -> SendError {
     }
 }
 
-/// Map a non-200 provider status to a [`SendError`]. `retry_after_secs` is the parsed
-/// `Retry-After` header, if present. Pure function (no I/O), unit-tested below.
+/// Cap on error-body bytes read before truncation: a huge (or slow-dripping) error page must
+/// not be buffered whole, and must not delay the worker's retry decision. Reading used to be
+/// `resp.text().await`, which reads to EOF.
+const ERROR_BODY_MAX_BYTES: usize = 4096;
+/// Error snippets in `SendError` messages are kept short for logs and the job row.
+const SNIPPET_MAX_CHARS: usize = 300;
+
+/// Map a non-200 provider status to a [`SendError`]. `retry_after_secs` is the parsed and
+/// already-clamped `Retry-After` header, if present. Pure function (no I/O), unit-tested below.
 fn send_error_for_status(status: u16, retry_after_secs: Option<u64>, snippet: &str) -> SendError {
     let message = if snippet.is_empty() {
         format!("gateway returned HTTP {status}")
@@ -173,8 +205,15 @@ fn send_error_for_status(status: u16, retry_after_secs: Option<u64>, snippet: &s
         format!("gateway returned HTTP {status}: {snippet}")
     };
     match status {
+        // 3xx: the client has redirects disabled, so this means the provider URL itself is
+        // wrong. Permanent, never retried, never followed.
+        300..=399 => SendError::Permanent(message),
         429 | 503 => match retry_after_secs {
-            Some(secs) => SendError::RetryAfter(message, Duration::from_secs(secs)),
+            // Clamped again here as defence in depth: the caller should never be able to
+            // hand us a value above MAX_RETRY_AFTER, but if one does, it stops here.
+            Some(secs) => {
+                SendError::RetryAfter(message, Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+            }
             None => SendError::Transient(message),
         },
         504 => SendError::Ambiguous(message),
@@ -184,9 +223,53 @@ fn send_error_for_status(status: u16, retry_after_secs: Option<u64>, snippet: &s
     }
 }
 
-/// Parse a `Retry-After` header value in delay-seconds form.
+/// Parse a `Retry-After` header value in delay-seconds form. The number is accumulated
+/// digit by digit with saturation (a 20-digit value must not fail to overflow-handling) and
+/// clamped to [`MAX_RETRY_AFTER`]. The HTTP-date form (`Wed, 21 Oct 2015 07:28:00 GMT`) is
+/// deliberately not supported: it contains non-digits, so it parses to `None` and the error
+/// stays a plain `Transient`.
 fn parse_retry_after(value: &str) -> Option<u64> {
-    value.trim().parse::<u64>().ok()
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut secs: u64 = 0;
+    for b in trimmed.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        secs = secs
+            .checked_mul(10)
+            .and_then(|s| s.checked_add(u64::from(b - b'0')))
+            .unwrap_or(u64::MAX);
+    }
+    Some(secs.min(MAX_RETRY_AFTER.as_secs()))
+}
+
+/// Read at most [`ERROR_BODY_MAX_BYTES`] of an error body, then stop: the body is only used
+/// for a short snippet, so nothing beyond the cap is ever buffered or waited for.
+async fn error_snippet(resp: &mut reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < ERROR_BODY_MAX_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = ERROR_BODY_MAX_BYTES - buf.len();
+                if chunk.len() > room {
+                    // Take what fits and stop reading: the rest of the body is dropped
+                    // together with the response.
+                    buf.extend_from_slice(&chunk[..room]);
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            // End of body or transport error: keep whatever was read so far.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .chars()
+        .take(SNIPPET_MAX_CHARS)
+        .collect()
 }
 
 impl Channel for GatewayChannel {
@@ -235,14 +318,14 @@ impl Channel for GatewayChannel {
                 text: msg.body.clone(),
                 approval_challenge: None,
             };
-            let resp = match self
+            let mut request = self
                 .client
                 .post(&url)
-                .header("Idempotency-Key", msg.job_id.to_string())
-                .json(&req_body)
-                .send()
-                .await
-            {
+                .header("Idempotency-Key", msg.job_id.to_string());
+            if let Some(token) = self.cfg.token.as_deref() {
+                request = request.bearer_auth(token);
+            }
+            let mut resp = match request.json(&req_body).send().await {
                 Ok(resp) => resp,
                 Err(e) => return Err(classify_reqwest_error(&e)),
             };
@@ -266,13 +349,8 @@ impl Channel for GatewayChannel {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            let snippet: String = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(300)
-                .collect();
+            // Bounded read (4 KiB max): never buffer a whole error page just to truncate it.
+            let snippet = error_snippet(&mut resp).await;
             Err(send_error_for_status(status, retry_after, &snippet))
         })
     }
@@ -462,9 +540,44 @@ mod tests {
             send_error_for_status(502, Some(3), ""),
             SendError::Transient(_)
         ));
+        // 3xx -> Permanent (the client never follows redirects).
+        for status in [301u16, 302, 307, 308] {
+            match send_error_for_status(status, None, "go away") {
+                SendError::Permanent(m) => {
+                    assert!(m.contains(&status.to_string()), "message: {m}");
+                }
+                e => panic!("HTTP {status} must be Permanent, got {e:?}"),
+            }
+        }
         // Retry-After parsing.
         assert_eq!(parse_retry_after("2"), Some(2));
         assert_eq!(parse_retry_after("  10 "), Some(10));
         assert_eq!(parse_retry_after("soon"), None);
+        // The HTTP-date form stays unsupported: plain Transient, exactly as before.
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn retry_after_is_saturated_and_clamped() {
+        assert_eq!(MAX_RETRY_AFTER, Duration::from_secs(600));
+        // A 20-digit value saturates instead of overflowing, then clamps to 600 s.
+        assert_eq!(parse_retry_after("99999999999999999999"), Some(600));
+        // 19 digits fit in u64 but still clamp.
+        assert_eq!(parse_retry_after("9999999999999999999"), Some(600));
+        // A decade is far above the cap.
+        assert_eq!(parse_retry_after("315360000"), Some(600));
+        // The cap itself passes unchanged, one second above it clamps.
+        assert_eq!(parse_retry_after("600"), Some(600));
+        assert_eq!(parse_retry_after("601"), Some(600));
+        // Not a delay-seconds value at all.
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("   "), None);
+        assert_eq!(parse_retry_after("-5"), None);
+        assert_eq!(parse_retry_after("1e9"), None);
+        // Defence in depth: even a caller that smuggles a raw u64 in gets clamped.
+        match send_error_for_status(503, Some(u64::MAX), "") {
+            SendError::RetryAfter(_, d) => assert_eq!(d, MAX_RETRY_AFTER),
+            e => panic!("expected RetryAfter, got {e:?}"),
+        }
     }
 }

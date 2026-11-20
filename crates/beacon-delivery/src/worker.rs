@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::breaker::{self, Gate};
+use crate::channel::gateway_client::MAX_RETRY_AFTER;
 use crate::channel::{AlertView, Channel, Receipt, SendError};
 use crate::model::{AlertStatus, DeliveryJob, JobStatus};
 use crate::{BackoffPolicy, Shutdown, WorkerConfig};
@@ -217,8 +218,9 @@ pub async fn finalize_cancelled(
 
 /// Permanent errors, or any error when `attempts >= max_attempts`, -> `dead`; every death
 /// also inserts at most one fallback job (SPEC §5.6) in the same transaction. Otherwise ->
-/// `pending` with `due_at = now() + max(backoff_delay(policy, attempts), retry_after)`.
-/// Returns `Some(new_status)` or `None` if the lease was lost.
+/// `pending` with `due_at = now() + min(max(backoff_delay(policy, attempts), retry_after),
+/// MAX_RETRY_AFTER)`: the provider's requested minimum delay wins when larger, but no delay
+/// can exceed the 10-minute cap. Returns `Some(new_status)` or `None` if the lease was lost.
 pub async fn finalize_failed(
     pool: &PgPool,
     job: &DeliveryJob,
@@ -262,8 +264,14 @@ async fn finalize_failed_inner(
         .execute(&mut *tx)
         .await?
     } else {
-        // The provider's requested minimum delay wins over our own backoff when it is larger.
-        let delay = backoff_delay(policy, job.attempts).max(err.retry_after().unwrap_or_default());
+        // The provider's requested minimum delay wins over our own backoff when it is
+        // larger, but the final delay is clamped to MAX_RETRY_AFTER (10 minutes): a hostile
+        // or broken Retry-After must not park a job for years, whatever any channel
+        // produced (the gateway channel clamps its own values as well; this is defence in
+        // depth for every other channel).
+        let delay = backoff_delay(policy, job.attempts)
+            .max(err.retry_after().unwrap_or_default())
+            .min(MAX_RETRY_AFTER);
         sqlx::query(
             "UPDATE delivery_jobs \
              SET status = 'pending', last_error = $3, last_error_class = $4, \

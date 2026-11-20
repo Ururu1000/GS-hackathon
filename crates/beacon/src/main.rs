@@ -14,7 +14,8 @@
 //! | `DELIVERY_CHANNELS`  | `email,sms,phone`                         | delivery          |
 //! | `SMS_GATEWAY_URL`    | `http://localhost:8070`                   | delivery          |
 //! | `PUBLIC_URL`         | `http://localhost:5173` (SMS short links) | delivery          |
-//! | `GATEWAY_ADDR`       | `0.0.0.0:8070`                            | gateway           |
+//! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
+//! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery |
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
 //! | `INGEST_ADDR`        | `0.0.0.0:8090`                            | ingest            |
 //! | `INGEST_MAX_INFLIGHT`| `20000` (events in flight before 429)     | ingest            |
@@ -294,6 +295,9 @@ async fn main() -> Result<()> {
                 let gateway_cfg = GatewayClientConfig {
                     base_url: env_or("SMS_GATEWAY_URL", "http://localhost:8070"),
                     public_url: env_or("PUBLIC_URL", "http://localhost:5173"),
+                    token: std::env::var("GATEWAY_TOKEN")
+                        .ok()
+                        .filter(|t| !t.is_empty()),
                     ..GatewayClientConfig::default()
                 };
                 for name in env_or("DELIVERY_CHANNELS", "email,sms,phone")
@@ -339,10 +343,14 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Gateway => {
-                let addr: std::net::SocketAddr = env_or("GATEWAY_ADDR", "0.0.0.0:8070")
+                let addr: std::net::SocketAddr = env_or("GATEWAY_ADDR", "127.0.0.1:8070")
                     .parse()
                     .context("GATEWAY_ADDR")?;
-                let state = beacon_delivery::gateway::GatewayState::new(pool.clone());
+                let state = beacon_delivery::gateway::GatewayState::new(pool.clone()).with_token(
+                    std::env::var("GATEWAY_TOKEN")
+                        .ok()
+                        .filter(|t| !t.is_empty()),
+                );
                 let rx = shutdown_rx.clone();
                 tasks.spawn(async move {
                     if let Err(e) = beacon_delivery::gateway::serve(state, addr, rx, |bound| {

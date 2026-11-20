@@ -15,6 +15,8 @@
 //! - `DATABASE_URL`     required, e.g. `postgres://beacon:beacon@localhost:5432/beacon`
 //! - `INGEST_URL`       default `http://localhost:8090`
 //! - `GATEWAY_URL`      default `http://localhost:8070`
+//! - `GATEWAY_TOKEN`    optional; sent as `Authorization: Bearer` on the outage POST when the
+//!   gateway runs authenticated
 //!
 //! Usage: `cargo run -p beacon-delivery --example sms_outage_demo -- [--events N] [--outage-secs S]`
 //! (or `scripts/demo_sms_outage.sh`). Exits 0 only if every expected sms job was found and
@@ -44,6 +46,8 @@ async fn run() -> Result<(), String> {
         std::env::var("INGEST_URL").unwrap_or_else(|_| "http://localhost:8090".to_string());
     let gateway_url =
         std::env::var("GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8070".to_string());
+    // When the gateway runs authenticated, its outage control API needs the same token.
+    let gateway_token = std::env::var("GATEWAY_TOKEN").ok();
 
     let mut events: usize = 50;
     let mut outage_secs: u64 = 60;
@@ -61,6 +65,7 @@ async fn run() -> Result<(), String> {
             println!("env:   DATABASE_URL (required)");
             println!("       INGEST_URL   default http://localhost:8090");
             println!("       GATEWAY_URL  default http://localhost:8070");
+            println!("       GATEWAY_TOKEN  optional bearer token for the gateway's outage API");
             std::process::exit(0);
         }
         let raw = match inline {
@@ -107,15 +112,24 @@ async fn run() -> Result<(), String> {
     // ---- 1. start the outage at the gateway -----------------------------------------------------
     let outage_start_utc = Utc::now();
     let outage_started = Instant::now();
-    let resp = http
-        .post(format!(
-            "{}/api/simulator/outage",
-            gateway_url.trim_end_matches('/')
-        ))
-        .json(&json!({ "channel": "sms", "seconds": outage_secs }))
+    let outage_url = format!("{}/api/simulator/outage", gateway_url.trim_end_matches('/'));
+    let mut outage_req = http
+        .post(&outage_url)
+        .json(&json!({ "channel": "sms", "seconds": outage_secs }));
+    if let Some(token) = gateway_token.as_deref() {
+        outage_req = outage_req.bearer_auth(token);
+    }
+    let resp = outage_req
         .send()
         .await
         .map_err(|e| format!("cannot reach the gateway at {gateway_url}: {e}"))?;
+    if resp.status().as_u16() == 401 {
+        return Err(
+            "gateway refused the outage request: HTTP 401 unauthorized (is GATEWAY_TOKEN set \
+             to the gateway's token?)"
+                .to_string(),
+        );
+    }
     if !resp.status().is_success() {
         return Err(format!(
             "gateway refused the outage request: HTTP {} {}",

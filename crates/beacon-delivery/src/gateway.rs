@@ -3,6 +3,19 @@
 //! BEFORE replying, and can simulate outages. It also serves the device-simulator read API that
 //! the UI uses (board #101/#102/#103); `router()` can be mounted by beacon-api later.
 //!
+//! Authentication (delivery review, "unauthenticated gateway on 0.0.0.0"): by default the
+//! gateway runs without auth (dev mode; `serve` logs a `warn!` about it). Configure a token
+//! with [`GatewayState::with_token`] and the control endpoints — `POST /provider/{sms|phone}`,
+//! `POST /api/simulator/outage`, `DELETE /api/simulator/outage` — require
+//! `Authorization: Bearer <token>` (compared in constant time) and answer `401 unauthorized`
+//! otherwise. The read endpoints the UI's device simulator uses (`GET /api/simulator/messages`,
+//! `GET /api/simulator/stream`, `GET /api/simulator/outage`) stay open.
+//!
+//! Request limits: the provider and outage POST routes cap bodies at 16 KiB
+//! (`DefaultBodyLimit` → `413`), and `ProviderRequest` fields are validated (text <= 1600
+//! chars, to <= 32 chars of `+`/digits/spaces, recipient <= 128, approval_challenge <= 32,
+//! no NUL bytes → `400 bad_request`), which also bounds the SSE broadcast ring.
+//!
 //! Provider side (called by `channel::gateway_client::GatewayChannel`):
 //! - `POST /provider/sms`, `POST /provider/phone`: body `ProviderRequest`, header
 //!   `Idempotency-Key: <job_id>`. Insert `ON CONFLICT (job_id) DO UPDATE SET duplicates =
@@ -13,14 +26,16 @@
 //! Simulator side (UI, board #102):
 //! - `GET /api/simulator/messages?to=&recipient=&channel=&limit=&cursor=` →
 //!   `{items: [SimMessage], next_cursor: string|null}`, newest first, keyset on
-//!   `(received_at, id)`, opaque base64 cursor, `limit` default 50, max 500.
+//!   `(received_at, id)`, opaque base64 cursor, `limit` default 50, max 500, cursors longer
+//!   than 256 chars → `400`.
 //! - `GET /api/simulator/stream` (SSE): first `snapshot` `{items, next_cursor}`, then one
 //!   `simulator.message` event (a `SimMessage`) per new or duplicated receipt; `: ping` every
 //!   15 s; header `X-Accel-Buffering: no`.
 //! - `POST /api/simulator/outage` `{channel: sms|phone, seconds, mode?: down|lose_response}`
 //!   (default mode `down`) → `{outages}`; `DELETE /api/simulator/outage?channel=` ends it early;
 //!   `GET /api/simulator/outage` → `{outages: [{channel, mode, until}]}` (expired ones omitted).
-//! - Errors: `{error: {code, message}}` with 400/404.
+//! - Errors: `{error: {code, message}}` with 400/401/404/413. 500s are always the fixed
+//!   `{code: "internal", message: "internal error"}` (the real error is logged, never leaked).
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -28,7 +43,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
@@ -39,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::Shutdown;
@@ -53,6 +70,20 @@ const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 /// Snapshot page size for a new SSE stream.
 const SNAPSHOT_LIMIT: i64 = 50;
+
+/// Request-body cap on the provider and outage POST routes (`DefaultBodyLimit` → `413`).
+const REQUEST_BODY_LIMIT: usize = 16 * 1024;
+/// `ProviderRequest::text` bound in chars (SMS segment stack at most; also bounds every
+/// persisted row, the SSE broadcast ring and the simulator UI payload).
+const PROVIDER_TEXT_MAX_CHARS: usize = 1600;
+/// `ProviderRequest::to` bound in chars.
+const PROVIDER_TO_MAX_CHARS: usize = 32;
+/// `ProviderRequest::recipient` bound in chars.
+const PROVIDER_RECIPIENT_MAX_CHARS: usize = 128;
+/// `ProviderRequest::approval_challenge` bound in chars.
+const PROVIDER_CHALLENGE_MAX_CHARS: usize = 32;
+/// Cursor strings longer than this are rejected before decoding.
+const MAX_CURSOR_CHARS: usize = 256;
 
 /// One `gateway_receipts` row as the UI sees it (board #102).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,12 +117,16 @@ pub struct Outage {
     pub until: DateTime<Utc>,
 }
 
-/// Shared state: the pool, the in-memory outage table, and a broadcast of new receipts for SSE.
+/// Shared state: the pool, the in-memory outage table, a broadcast of new receipts for SSE,
+/// and the optional bearer token for the control (provider + outage) endpoints.
 #[derive(Clone)]
 pub struct GatewayState {
     pool: PgPool,
     outages: Arc<RwLock<HashMap<String, Outage>>>,
     tx: tokio::sync::broadcast::Sender<SimMessage>,
+    /// `Some` → the control endpoints require `Authorization: Bearer <token>`; `None` →
+    /// no auth (dev; `serve` warns about it once).
+    token: Option<String>,
 }
 
 impl GatewayState {
@@ -101,7 +136,17 @@ impl GatewayState {
             pool,
             outages: Arc::new(RwLock::new(HashMap::new())),
             tx,
+            token: None,
         }
+    }
+
+    /// Require `Authorization: Bearer <token>` (constant-time compare) on
+    /// `POST /provider/{sms|phone}`, `POST /api/simulator/outage` and
+    /// `DELETE /api/simulator/outage`. `None` switches auth off again (dev). The read
+    /// endpoints the UI's device simulator uses stay open either way.
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
     }
 
     /// Start an outage programmatically (tests, demo); same effect as `POST /api/simulator/outage`.
@@ -145,13 +190,21 @@ impl GatewayState {
     }
 }
 
-/// All gateway routes (provider + simulator) on one router.
+/// All gateway routes (provider + simulator) on one router. The two body-consuming POST
+/// routes are capped at [`REQUEST_BODY_LIMIT`] (a longer body is rejected with `413` before
+/// any handler or field validation runs).
 pub fn router(state: GatewayState) -> axum::Router {
     axum::Router::new()
-        .route("/provider/{channel}", post(provider_handler))
+        .route(
+            "/provider/{channel}",
+            post(provider_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
         .route("/api/simulator/messages", get(messages_handler))
         .route("/api/simulator/stream", get(stream_handler))
-        .route("/api/simulator/outage", post(outage_post_handler))
+        .route(
+            "/api/simulator/outage",
+            post(outage_post_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
         .route("/api/simulator/outage", get(outage_get_handler))
         .route("/api/simulator/outage", delete(outage_delete_handler))
         .fallback(fallback_404)
@@ -166,6 +219,13 @@ pub async fn serve(
     mut shutdown: Shutdown,
     on_bound: impl FnOnce(SocketAddr) + Send,
 ) -> std::io::Result<()> {
+    if state.token.is_none() {
+        warn!(
+            "gateway accepts UNAUTHENTICATED provider and outage requests; anyone reachable \
+             can send messages and trigger outages. Configure GatewayState::with_token(Some(..)) \
+             for anything exposed past localhost."
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     on_bound(listener.local_addr()?);
     axum::serve(listener, router(state))
@@ -186,6 +246,39 @@ fn error_response(status: StatusCode, code: &str, message: impl Into<String>) ->
     (status, Json(body)).into_response()
 }
 
+/// Fixed body for every 500: the real error is logged with `error!` and never leaked to the
+/// client (raw `sqlx::Error` text used to end up in HTTP bodies).
+fn internal_error_response() -> Response {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "internal error",
+    )
+}
+
+/// Map a `JsonRejection` from a body-limited route: the body-limit rejection becomes
+/// `413 bad_request`, every other malformed body stays `400 bad_request`.
+fn json_rejection_response(e: JsonRejection) -> Response {
+    if matches!(
+        &e,
+        JsonRejection::BytesRejection(BytesRejection::FailedToBufferBody(
+            FailedToBufferBody::LengthLimitError(_)
+        ))
+    ) {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "bad_request",
+            format!("request body exceeds {REQUEST_BODY_LIMIT} bytes"),
+        )
+    } else {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!("invalid JSON body: {e}"),
+        )
+    }
+}
+
 async fn fallback_404() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "unknown route")
 }
@@ -195,15 +288,102 @@ fn is_valid_channel(channel: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------------------------
+
+/// Constant-time byte comparison: no early exit, so the response time never reveals how
+/// many leading bytes of the token matched. (A plain `==` would.)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() != b.len()) as u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The token part of `Authorization: Bearer <token>` (scheme case-insensitive), or `None`
+/// when the header is missing or malformed.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
+}
+
+/// `None` when the request may proceed, `Some(401 response)` when a token is configured and
+/// the request did not carry it (exactly). With no token configured (dev) everything passes.
+fn require_bearer(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
+    let expected = state.token.as_deref()?;
+    match bearer_token(headers) {
+        Some(supplied) if constant_time_eq(expected.as_bytes(), supplied.as_bytes()) => None,
+        _ => Some(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid Authorization: Bearer token",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Provider side
 // ---------------------------------------------------------------------------------------------
+
+/// Field bounds for [`ProviderRequest`]: `text` <= 1600 chars, `to` <= 32 chars of
+/// `+`/digits/spaces, `recipient` <= 128, `approval_challenge` <= 32, and no NUL bytes
+/// anywhere (a NUL used to reach the persist query and turn into a 500). Violations are
+/// `400 bad_request`. The bounds also keep one receipt — and the SSE broadcast that carries
+/// it — small no matter what the caller sends.
+fn validate_provider_request(req: &ProviderRequest) -> Option<&'static str> {
+    // NUL bytes first, whatever the length: a NUL used to reach the persist query and turn
+    // into a 500, so it is refused with its own message before any other rule.
+    if req.text.contains('\0') {
+        return Some("text must not contain NUL bytes");
+    }
+    if req.to.contains('\0') {
+        return Some("to must not contain NUL bytes");
+    }
+    if req.recipient.contains('\0') {
+        return Some("recipient must not contain NUL bytes");
+    }
+    if let Some(challenge) = req.approval_challenge.as_deref()
+        && challenge.contains('\0')
+    {
+        return Some("approval_challenge must not contain NUL bytes");
+    }
+    if req.text.chars().count() > PROVIDER_TEXT_MAX_CHARS {
+        return Some("text exceeds 1600 chars");
+    }
+    if req.to.chars().count() > PROVIDER_TO_MAX_CHARS
+        || !req
+            .to
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == ' ')
+    {
+        return Some("to must be at most 32 chars of +, digits and spaces");
+    }
+    if req.recipient.chars().count() > PROVIDER_RECIPIENT_MAX_CHARS {
+        return Some("recipient exceeds 128 chars");
+    }
+    if let Some(challenge) = req.approval_challenge.as_deref()
+        && challenge.chars().count() > PROVIDER_CHALLENGE_MAX_CHARS
+    {
+        return Some("approval_challenge exceeds 32 chars");
+    }
+    None
+}
 
 async fn provider_handler(
     State(state): State<GatewayState>,
     Path(channel): Path<String>,
     headers: HeaderMap,
-    body: Result<Json<ProviderRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<ProviderRequest>, JsonRejection>,
 ) -> Response {
+    // Auth first: no token, no parsing, no persisting.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
     if !is_valid_channel(&channel) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -213,13 +393,7 @@ async fn provider_handler(
     }
     let req = match body {
         Ok(Json(req)) => req,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                format!("invalid JSON body: {e}"),
-            );
-        }
+        Err(e) => return json_rejection_response(e),
     };
     if let Some(key) = headers.get("idempotency-key") {
         let key = key.to_str().unwrap_or_default();
@@ -230,6 +404,9 @@ async fn provider_handler(
                 "Idempotency-Key must equal job_id",
             );
         }
+    }
+    if let Some(problem) = validate_provider_request(&req) {
+        return error_response(StatusCode::BAD_REQUEST, "bad_request", problem);
     }
 
     // Outage gate: `down` rejects without persisting; `lose_response` persists then drops.
@@ -256,11 +433,9 @@ async fn provider_handler(
                 );
             }
             Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    format!("cannot persist receipt: {e}"),
-                );
+                error!(channel = %channel, job_id = %req.job_id, error = %e,
+                       "cannot persist gateway receipt");
+                return internal_error_response();
             }
         }
     }
@@ -285,11 +460,11 @@ async fn provider_handler(
             )
                 .into_response()
         }
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            format!("cannot persist receipt: {e}"),
-        ),
+        Err(e) => {
+            error!(channel = %channel, job_id = %req.job_id, error = %e,
+                   "cannot persist gateway receipt");
+            internal_error_response()
+        }
     }
 }
 
@@ -421,12 +596,23 @@ async fn messages_handler(
 ) -> Response {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let cursor: Option<FeedCursor> = match q.cursor {
-        Some(ref s) => match decode_cursor(s) {
-            Some(c) => Some(c),
-            None => {
-                return error_response(StatusCode::BAD_REQUEST, "bad_request", "invalid cursor");
+        Some(ref s) => {
+            // Cap before decoding: a multi-megabyte cursor must not be base64-decoded or
+            // JSON-parsed at all.
+            if s.chars().count() > MAX_CURSOR_CHARS {
+                return error_response(StatusCode::BAD_REQUEST, "bad_request", "cursor too long");
             }
-        },
+            match decode_cursor(s) {
+                Some(c) => Some(c),
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "invalid cursor",
+                    );
+                }
+            }
+        }
         None => None,
     };
     match fetch_page(
@@ -444,11 +630,10 @@ async fn messages_handler(
             Json(serde_json::json!({ "items": items, "next_cursor": next_cursor })),
         )
             .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            format!("cannot read simulator feed: {e}"),
-        ),
+        Err(e) => {
+            error!(error = %e, "cannot read simulator feed");
+            internal_error_response()
+        }
     }
 }
 
@@ -461,11 +646,8 @@ async fn stream_handler(State(state): State<GatewayState>) -> Response {
         match fetch_page(&state.pool, None, None, None, SNAPSHOT_LIMIT, None).await {
             Ok(page) => page,
             Err(e) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    format!("cannot read simulator feed: {e}"),
-                );
+                error!(error = %e, "cannot read simulator feed");
+                return internal_error_response();
             }
         };
     let snapshot = serde_json::json!({ "items": items, "next_cursor": next_cursor }).to_string();
@@ -518,17 +700,16 @@ fn outages_body(outages: Vec<Outage>) -> serde_json::Value {
 
 async fn outage_post_handler(
     State(state): State<GatewayState>,
-    body: Result<Json<OutagePost>, axum::extract::rejection::JsonRejection>,
+    headers: HeaderMap,
+    body: Result<Json<OutagePost>, JsonRejection>,
 ) -> Response {
+    // Auth first: with a token configured, outage control is operator-only.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
     let req = match body {
         Ok(Json(req)) => req,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                format!("invalid JSON body: {e}"),
-            );
-        }
+        Err(e) => return json_rejection_response(e),
     };
     if !is_valid_channel(&req.channel) {
         return error_response(
@@ -563,8 +744,13 @@ struct OutageDeleteQuery {
 
 async fn outage_delete_handler(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Query(q): Query<OutageDeleteQuery>,
 ) -> Response {
+    // Auth first (the matching GET stays open for the UI's simulator).
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
     match q.channel {
         Some(channel) if is_valid_channel(&channel) => {
             state.clear_outage(&channel);
@@ -650,6 +836,121 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider_req(text: &str, to: &str, recipient: &str) -> ProviderRequest {
+        ProviderRequest {
+            job_id: Uuid::new_v4(),
+            alert_id: Uuid::new_v4(),
+            recipient: recipient.to_string(),
+            to: to.to_string(),
+            text: text.to_string(),
+            approval_challenge: None,
+        }
+    }
+
+    #[test]
+    fn bearer_token_parses_the_scheme_case_insensitively() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(bearer_token(&headers), None, "no header at all");
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwdw=="),
+        );
+        assert_eq!(bearer_token(&headers), None, "non-bearer scheme");
+        for (raw, expected) in [
+            ("Bearer sekrit", Some("sekrit")),
+            ("bearer sekrit", Some("sekrit")),
+            ("BEARER sekrit", Some("sekrit")),
+            ("Bearer ", Some("")),
+            ("Bearer", None),
+        ] {
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static(raw),
+            );
+            assert_eq!(bearer_token(&headers), expected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_values() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"token", b"tokeN"));
+        assert!(!constant_time_eq(b"token", b"tokenn"));
+        assert!(!constant_time_eq(b"tokenn", b"token"));
+        assert!(!constant_time_eq(b"", b"token"));
+        // Same length, differs only in the last byte: the classic early-exit leak case.
+        assert!(!constant_time_eq(b"aaaaaaaX", b"aaaaaaaY"));
+    }
+
+    #[test]
+    fn provider_validation_accepts_in_bounds_requests() {
+        let req = provider_req(&"x".repeat(1600), "+1 55 5000 1111", "user:anna");
+        assert_eq!(validate_provider_request(&req), None);
+        let mut with_challenge = provider_req("hi", "+1555", "user:anna");
+        with_challenge.approval_challenge = Some("8-char".to_string());
+        assert_eq!(validate_provider_request(&with_challenge), None);
+    }
+
+    #[test]
+    fn provider_validation_rejects_oversize_fields() {
+        let oversize_text = provider_req(&"x".repeat(1601), "+1555", "user:anna");
+        assert_eq!(
+            validate_provider_request(&oversize_text),
+            Some("text exceeds 1600 chars")
+        );
+        let oversize_to = provider_req("hi", &"+".repeat(33), "user:anna");
+        assert_eq!(
+            validate_provider_request(&oversize_to),
+            Some("to must be at most 32 chars of +, digits and spaces")
+        );
+        let oversize_recipient = provider_req("hi", "+1555", &"u".repeat(129));
+        assert_eq!(
+            validate_provider_request(&oversize_recipient),
+            Some("recipient exceeds 128 chars")
+        );
+        let mut oversize_challenge = provider_req("hi", "+1555", "user:anna");
+        oversize_challenge.approval_challenge = Some("c".repeat(33));
+        assert_eq!(
+            validate_provider_request(&oversize_challenge),
+            Some("approval_challenge exceeds 32 chars")
+        );
+    }
+
+    #[test]
+    fn provider_validation_rejects_bad_to_and_nul_bytes() {
+        for to in ["+155a5", "4412-3", "+44 111\t", "☎555"] {
+            let req = provider_req("hi", to, "user:anna");
+            assert_eq!(
+                validate_provider_request(&req),
+                Some("to must be at most 32 chars of +, digits and spaces"),
+                "to={to:?}"
+            );
+        }
+        // NUL bytes used to turn into a 500 deep inside the persist path.
+        let nul_text = provider_req("a\0b", "+1555", "user:anna");
+        assert_eq!(
+            validate_provider_request(&nul_text),
+            Some("text must not contain NUL bytes")
+        );
+        let nul_to = provider_req("hi", "+155\u{0}5", "user:anna");
+        assert_eq!(
+            validate_provider_request(&nul_to),
+            Some("to must not contain NUL bytes")
+        );
+        let nul_recipient = provider_req("hi", "+1555", "user:\0anna");
+        assert_eq!(
+            validate_provider_request(&nul_recipient),
+            Some("recipient must not contain NUL bytes")
+        );
+        let mut nul_challenge = provider_req("hi", "+1555", "user:anna");
+        nul_challenge.approval_challenge = Some("c\0".to_string());
+        assert_eq!(
+            validate_provider_request(&nul_challenge),
+            Some("approval_challenge must not contain NUL bytes")
+        );
+    }
 
     #[test]
     fn cursor_round_trip() {

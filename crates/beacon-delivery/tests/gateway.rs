@@ -20,7 +20,15 @@ use uuid::Uuid;
 /// Start the gateway on an ephemeral port. Returns the state, its base URL, and the shutdown
 /// sender (keep it alive for the whole test; dropping it stops the server).
 async fn start_gateway(pool: PgPool) -> (GatewayState, String, tokio::sync::watch::Sender<bool>) {
-    let state = GatewayState::new(pool);
+    start_gateway_token(pool, None).await
+}
+
+/// Like [`start_gateway`], with an optional bearer token configured on the gateway.
+async fn start_gateway_token(
+    pool: PgPool,
+    token: Option<&str>,
+) -> (GatewayState, String, tokio::sync::watch::Sender<bool>) {
+    let state = GatewayState::new(pool).with_token(token.map(str::to_string));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     let serve_state = state.clone();
@@ -50,6 +58,7 @@ fn channel_for(kind: GatewayKind, base_url: &str) -> GatewayChannel {
             base_url: base_url.to_string(),
             public_url: "http://localhost:5173".to_string(),
             timeout: Duration::from_secs(5),
+            token: None,
         },
     )
     .expect("build GatewayChannel")
@@ -322,6 +331,7 @@ async fn gateway_connection_refused_is_transient(pool: PgPool) {
             base_url: format!("http://127.0.0.1:{port}"),
             public_url: "http://localhost:5173".to_string(),
             timeout: Duration::from_secs(3),
+            token: None,
         },
     )
     .expect("build channel");
@@ -553,4 +563,568 @@ async fn gateway_sse_snapshot_then_live_message(pool: PgPool) {
     assert_eq!(live.channel, "sms");
     assert_eq!(live.text, "live via sse");
     assert_eq!(live.to, "+15550001111");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7. Auth: with a token configured, the control routes need `Authorization: Bearer`.
+// ---------------------------------------------------------------------------------------------
+
+/// Raw POST to the provider endpoint (bypasses `GatewayChannel` so a test controls headers).
+async fn post_provider(
+    http: &reqwest::Client,
+    base_url: &str,
+    job_id: Uuid,
+    body: &Value,
+    bearer: Option<&str>,
+) -> reqwest::Response {
+    let mut req = http
+        .post(format!("{base_url}/provider/sms"))
+        .header("Idempotency-Key", job_id.to_string())
+        .json(body);
+    if let Some(token) = bearer {
+        req = req.bearer_auth(token);
+    }
+    req.send().await.expect("provider POST")
+}
+
+/// A minimal valid `ProviderRequest` body for one job id.
+fn provider_body(job_id: Uuid) -> Value {
+    serde_json::json!({
+        "job_id": job_id,
+        "alert_id": Uuid::new_v4(),
+        "recipient": "user:anna",
+        "to": "+15550001111",
+        "text": "auth test",
+    })
+}
+
+async fn receipt_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM gateway_receipts")
+        .fetch_one(pool)
+        .await
+        .expect("count receipts")
+}
+
+async fn error_body(resp: reqwest::Response) -> (u16, Value) {
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.expect("error JSON");
+    (status, body)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn gateway_with_token_requires_bearer_auth_on_control_routes(pool: PgPool) {
+    const TOKEN: &str = "sekrit-gateway-token";
+    let (_state, base_url, _shutdown) = start_gateway_token(pool.clone(), Some(TOKEN)).await;
+    let http = reqwest::Client::new();
+
+    // Provider POST without a token, with a wrong token, and with a case-mangled token: all
+    // 401 unauthorized, and nothing is persisted by any of them.
+    for bearer in [
+        None,
+        Some("wrong-token"),
+        Some("SEKRIT-GATEWAY-TOKEN"),
+        Some(""),
+    ] {
+        let job_id = Uuid::new_v4();
+        let resp = post_provider(&http, &base_url, job_id, &provider_body(job_id), bearer).await;
+        let (status, body) = error_body(resp).await;
+        assert_eq!(status, 401, "bearer={bearer:?}: {body}");
+        assert_eq!(body["error"]["code"], Value::String("unauthorized".into()));
+    }
+    assert_eq!(
+        receipt_count(&pool).await,
+        0,
+        "401s must not persist anything"
+    );
+
+    // With the right token the provider accepts and persists.
+    let job_id = Uuid::new_v4();
+    let resp = post_provider(
+        &http,
+        &base_url,
+        job_id,
+        &provider_body(job_id),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let accepted: Value = resp.json().await.expect("ProviderResponse JSON");
+    assert_eq!(accepted["duplicate"], Value::Bool(false));
+    assert_eq!(receipt_count(&pool).await, 1);
+
+    // The GatewayChannel sends the token from its config.
+    let sms = GatewayChannel::new(
+        GatewayKind::Sms,
+        GatewayClientConfig {
+            base_url: base_url.clone(),
+            public_url: "http://localhost:5173".to_string(),
+            timeout: Duration::from_secs(5),
+            token: Some(TOKEN.to_string()),
+        },
+    )
+    .expect("build channel");
+    let receipt = sms.send(&sms_msg(Uuid::new_v4(), "via channel")).await;
+    assert!(receipt.is_ok(), "{receipt:?}");
+    assert_eq!(receipt_count(&pool).await, 2);
+
+    // Outage POST/DELETE need the token; the read endpoints stay open for the UI.
+    let resp = http
+        .post(format!("{base_url}/api/simulator/outage"))
+        .json(&serde_json::json!({"channel": "sms", "seconds": 30}))
+        .send()
+        .await
+        .expect("outage POST without token");
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], Value::String("unauthorized".into()));
+
+    let resp = http
+        .post(format!("{base_url}/api/simulator/outage"))
+        .bearer_auth(TOKEN)
+        .json(&serde_json::json!({"channel": "sms", "seconds": 30}))
+        .send()
+        .await
+        .expect("outage POST with token");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // GET outage is open and shows the outage started above.
+    let outages: Value = http
+        .get(format!("{base_url}/api/simulator/outage"))
+        .send()
+        .await
+        .expect("GET outage")
+        .error_for_status()
+        .expect("GET outage must stay open")
+        .json()
+        .await
+        .expect("outages JSON");
+    assert_eq!(outages["outages"].as_array().unwrap().len(), 1);
+
+    // DELETE without the token: 401, the outage survives.
+    let resp = http
+        .delete(format!("{base_url}/api/simulator/outage?channel=sms"))
+        .send()
+        .await
+        .expect("DELETE outage without token");
+    assert_eq!(resp.status().as_u16(), 401);
+    let outages: Value = http
+        .get(format!("{base_url}/api/simulator/outage"))
+        .send()
+        .await
+        .expect("GET outage")
+        .json()
+        .await
+        .expect("outages JSON");
+    assert_eq!(outages["outages"].as_array().unwrap().len(), 1);
+
+    // DELETE with the token ends it.
+    let resp = http
+        .delete(format!("{base_url}/api/simulator/outage?channel=sms"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("DELETE outage with token");
+    assert_eq!(resp.status().as_u16(), 200);
+    let outages: Value = http
+        .get(format!("{base_url}/api/simulator/outage"))
+        .send()
+        .await
+        .expect("GET outage")
+        .json()
+        .await
+        .expect("outages JSON");
+    assert_eq!(outages["outages"].as_array().unwrap().len(), 0);
+
+    // The other read endpoints stay open too.
+    let resp = http
+        .get(format!("{base_url}/api/simulator/messages"))
+        .send()
+        .await
+        .expect("GET messages");
+    assert_eq!(resp.status().as_u16(), 200);
+    let resp = http
+        .get(format!("{base_url}/api/simulator/stream"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("GET stream");
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn gateway_without_token_keeps_every_route_open(pool: PgPool) {
+    // Dev mode: no token configured, no Authorization header sent, everything works
+    // (this is what the earlier sections exercise; here it is pinned down explicitly).
+    let (_state, base_url, _shutdown) = start_gateway(pool.clone()).await;
+    let http = reqwest::Client::new();
+
+    let job_id = Uuid::new_v4();
+    let resp = post_provider(&http, &base_url, job_id, &provider_body(job_id), None).await;
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let resp = http
+        .post(format!("{base_url}/api/simulator/outage"))
+        .json(&serde_json::json!({"channel": "sms", "seconds": 10}))
+        .send()
+        .await
+        .expect("outage POST");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let resp = http
+        .delete(format!("{base_url}/api/simulator/outage?channel=sms"))
+        .send()
+        .await
+        .expect("outage DELETE");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(receipt_count(&pool).await, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 8. Field validation: bounds and NUL bytes on ProviderRequest.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn gateway_rejects_oversize_and_invalid_provider_fields(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_gateway(pool.clone()).await;
+    let http = reqwest::Client::new();
+
+    async fn assert_bad_request(http: &reqwest::Client, base_url: &str, body: &Value) -> String {
+        let job_id: Uuid = serde_json::from_value(body["job_id"].clone()).expect("job_id");
+        let resp = post_provider(http, base_url, job_id, body, None).await;
+        let (status, err) = error_body(resp).await;
+        assert_eq!(status, 400, "{err}");
+        assert_eq!(err["error"]["code"], Value::String("bad_request".into()));
+        err["error"]["message"]
+            .as_str()
+            .expect("message")
+            .to_string()
+    }
+
+    // Oversize fields.
+    let mut big_text = provider_body(Uuid::new_v4());
+    big_text["text"] = Value::String("x".repeat(1601));
+    assert_eq!(
+        assert_bad_request(&http, &base_url, &big_text).await,
+        "text exceeds 1600 chars"
+    );
+
+    let mut bad_to = provider_body(Uuid::new_v4());
+    bad_to["to"] = Value::String("+1a55-5000".into());
+    assert_eq!(
+        assert_bad_request(&http, &base_url, &bad_to).await,
+        "to must be at most 32 chars of +, digits and spaces"
+    );
+
+    let mut long_to = provider_body(Uuid::new_v4());
+    long_to["to"] = Value::String("+".repeat(33));
+    assert_eq!(
+        assert_bad_request(&http, &base_url, &long_to).await,
+        "to must be at most 32 chars of +, digits and spaces"
+    );
+
+    let mut big_recipient = provider_body(Uuid::new_v4());
+    big_recipient["recipient"] = Value::String("u".repeat(129));
+    assert_eq!(
+        assert_bad_request(&http, &base_url, &big_recipient).await,
+        "recipient exceeds 128 chars"
+    );
+
+    let mut big_challenge = provider_body(Uuid::new_v4());
+    big_challenge["approval_challenge"] = Value::String("c".repeat(33));
+    assert_eq!(
+        assert_bad_request(&http, &base_url, &big_challenge).await,
+        "approval_challenge exceeds 32 chars"
+    );
+
+    // NUL bytes in every text-ish field (these used to become 500s inside the query).
+    for field in ["text", "to", "recipient", "approval_challenge"] {
+        let mut nul = provider_body(Uuid::new_v4());
+        nul[field] = Value::String("a\0b".into());
+        let message = assert_bad_request(&http, &base_url, &nul).await;
+        assert!(
+            message.contains("NUL"),
+            "NUL in {field} must be a 400, got {message:?}"
+        );
+    }
+
+    assert_eq!(
+        receipt_count(&pool).await,
+        0,
+        "rejected requests must not persist anything"
+    );
+
+    // The boundary itself passes: exactly 1600 chars.
+    let job_id = Uuid::new_v4();
+    let mut boundary = provider_body(job_id);
+    boundary["text"] = Value::String("x".repeat(1600));
+    let resp = post_provider(&http, &base_url, job_id, &boundary, None).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(receipt_count(&pool).await, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 9. Body limit: > 16 KiB on the provider and outage POST routes is a 413.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn gateway_caps_provider_and_outage_bodies_at_16_kib(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_gateway(pool.clone()).await;
+    let http = reqwest::Client::new();
+
+    // A ~20 KiB provider body (giant text field): rejected by the route's body limit
+    // before any field validation runs.
+    let job_id = Uuid::new_v4();
+    let mut big = provider_body(job_id);
+    big["text"] = Value::String("x".repeat(20 * 1024));
+    let resp = post_provider(&http, &base_url, job_id, &big, None).await;
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 413, "{body}");
+    assert_eq!(body["error"]["code"], Value::String("bad_request".into()));
+
+    // The outage POST route carries the same cap; a padded body is refused and starts
+    // nothing.
+    let resp = http
+        .post(format!("{base_url}/api/simulator/outage"))
+        .json(&serde_json::json!({
+            "channel": "sms",
+            "seconds": 10,
+            "padding": "p".repeat(20 * 1024),
+        }))
+        .send()
+        .await
+        .expect("outage POST");
+    let (status, body) = error_body(resp).await;
+    assert!(status == 413 || status == 400, "status {status}: {body}");
+    assert_eq!(body["error"]["code"], Value::String("bad_request".into()));
+
+    assert_eq!(receipt_count(&pool).await, 0);
+    let outages: Value = http
+        .get(format!("{base_url}/api/simulator/outage"))
+        .send()
+        .await
+        .expect("GET outage")
+        .json()
+        .await
+        .expect("outages JSON");
+    assert_eq!(outages["outages"].as_array().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 10. Cursor cap: longer than 256 chars is refused before decoding.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn gateway_rejects_overlong_cursors_before_decoding(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_gateway(pool.clone()).await;
+    let http = reqwest::Client::new();
+
+    // 300 chars of valid base64: over the cap, so it never reaches the decoder.
+    let resp = http
+        .get(format!("{base_url}/api/simulator/messages"))
+        .query(&[("cursor", "A".repeat(300))])
+        .send()
+        .await
+        .expect("GET messages");
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        Value::String("cursor too long".into())
+    );
+
+    // A short undecodable cursor is still the plain invalid-cursor 400.
+    let resp = http
+        .get(format!("{base_url}/api/simulator/messages"))
+        .query(&[("cursor", "!!!")])
+        .send()
+        .await
+        .expect("GET messages");
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        Value::String("invalid cursor".into())
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 11. 500s never leak sqlx details.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn gateway_internal_errors_have_a_fixed_generic_body(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_gateway(pool.clone()).await;
+    let http = reqwest::Client::new();
+    // Break the persist path: the throwaway test DB is the only casualty.
+    sqlx::query("DROP TABLE gateway_receipts")
+        .execute(&pool)
+        .await
+        .expect("drop gateway_receipts");
+
+    let expected = serde_json::json!({
+        "error": { "code": "internal", "message": "internal error" }
+    });
+
+    // Provider POST: the persist fails; the client sees the fixed body, not the sqlx text.
+    let job_id = Uuid::new_v4();
+    let resp = post_provider(&http, &base_url, job_id, &provider_body(job_id), None).await;
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body, expected);
+    assert!(
+        !body.to_string().to_lowercase().contains("relation"),
+        "driver error text leaked: {body}"
+    );
+
+    // The read endpoints fail the same fixed way.
+    let resp = http
+        .get(format!("{base_url}/api/simulator/messages"))
+        .send()
+        .await
+        .expect("GET messages");
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body, expected);
+
+    let resp = http
+        .get(format!("{base_url}/api/simulator/stream"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("GET stream");
+    assert_eq!(resp.status().as_u16(), 500);
+    let (_, body) = error_body(resp).await;
+    assert_eq!(body, expected);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 12. Client hardening: redirects are never followed; error bodies are read bounded.
+// ---------------------------------------------------------------------------------------------
+
+/// Serve `router` on an ephemeral port for the rest of the test.
+async fn serve_test_router(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("test server");
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn gateway_channel_never_follows_redirects() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let moved_hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_target = moved_hits.clone();
+    let router = axum::Router::new()
+        .route(
+            "/provider/sms",
+            axum::routing::post(|| async {
+                // A 302 pointing somewhere else on the same server.
+                (
+                    axum::http::StatusCode::FOUND,
+                    [("location", "/moved")],
+                    "the provider moved",
+                )
+            }),
+        )
+        .route(
+            "/moved",
+            axum::routing::get(move || {
+                let hits = hits_for_target.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "the redirect target must never be reached"
+                }
+            }),
+        );
+    let base_url = serve_test_router(router).await;
+
+    let sms = channel_for(GatewayKind::Sms, &base_url);
+    let err = sms
+        .send(&sms_msg(Uuid::new_v4(), "redirect me"))
+        .await
+        .expect_err("a 302 must be an error, not a silent follow");
+    match err {
+        SendError::Permanent(m) => assert!(m.contains("302"), "message: {m}"),
+        e => panic!("a redirect must be Permanent, got {e:?}"),
+    }
+    assert_eq!(
+        moved_hits.load(Ordering::SeqCst),
+        0,
+        "the redirect target was followed"
+    );
+}
+
+#[tokio::test]
+async fn gateway_channel_stops_reading_huge_error_bodies_early() {
+    use std::time::Instant;
+
+    // 10 MiB of 'x' in 64 KiB chunks, every chunk after the first delayed by 25 ms: fully
+    // reading the body would take >= 4 s and run into the 2 s channel timeout below (which
+    // maps to Ambiguous); a client that stops after its 4 KiB cap returns as Transient in
+    // milliseconds.
+    const CHUNK: usize = 64 * 1024;
+    const CHUNKS: u32 = 160; // 160 * 64 KiB = 10 MiB
+    let router = axum::Router::new().route(
+        "/provider/sms",
+        axum::routing::post(|| async {
+            let body =
+                axum::body::Body::from_stream(futures::stream::unfold(0u32, |i| async move {
+                    if i >= CHUNKS {
+                        return None;
+                    }
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Some((
+                        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(vec![
+                            b'x';
+                            CHUNK
+                        ])),
+                        i + 1,
+                    ))
+                }));
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, body)
+        }),
+    );
+    let base_url = serve_test_router(router).await;
+
+    let sms = GatewayChannel::new(
+        GatewayKind::Sms,
+        GatewayClientConfig {
+            base_url,
+            public_url: "http://localhost:5173".to_string(),
+            timeout: Duration::from_secs(2),
+            token: None,
+        },
+    )
+    .expect("build channel");
+
+    let started = Instant::now();
+    let err = sms
+        .send(&sms_msg(Uuid::new_v4(), "boom"))
+        .await
+        .expect_err("a 500 must fail");
+    match err {
+        SendError::Transient(m) => {
+            assert!(m.contains("500"), "message: {m}");
+            // The snippet is truncated to 300 chars, not the 4 KiB read, not the 10 MiB body.
+            assert!(
+                m.matches('x').count() <= 300,
+                "snippet not truncated: {} x's",
+                m.matches('x').count()
+            );
+        }
+        e => panic!("a 500 must be Transient, got {e:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the client must stop reading the error body early, took {:?}",
+        started.elapsed()
+    );
 }

@@ -567,6 +567,57 @@ async fn retry_after_failure_waits_for_the_provider_delay(pool: PgPool) {
 // ---------------------------------------------------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn hostile_retry_after_is_clamped_to_ten_minutes(pool: PgPool) {
+    use beacon_delivery::channel::gateway_client::MAX_RETRY_AFTER;
+
+    let cfg = m4_cfg("w-ra-clamp");
+    let alert = insert_alert(&pool, "open", &format!("retry clamp m4 {}", unique_tag())).await;
+    let job_id = insert_sms_job(&pool, alert, "anna", "+44111", json!({})).await;
+
+    // A "wait 31.7 years" answer from the provider: the retry delay must clamp to
+    // MAX_RETRY_AFTER (600 s), not park the job for decades.
+    let (fake, channel) = Scripted::new("sms")
+        .failing(
+            SendError::RetryAfter(
+                "gateway says wait forever".into(),
+                Duration::from_secs(1_000_000_000),
+            ),
+            1,
+        )
+        .into_channel();
+    let stats = work_once_bounded(&pool, &channel, &cfg).await;
+    assert_eq!(stats.claimed, 1, "{stats:?}");
+    assert_eq!(stats.retried, 1, "{stats:?}");
+    assert_eq!(stats.dead, 0, "{stats:?}");
+    assert_eq!(fake.calls(), 1);
+
+    let job = job_row(&pool, job_id).await;
+    assert_eq!(job.status, "pending");
+    assert_eq!(job.last_error_class.as_deref(), Some("transient"));
+    let due_in = job.due_at - Utc::now();
+    assert!(
+        due_in >= chrono::Duration::seconds(595),
+        "the clamped provider delay (600 s) must still win over backoff, got {due_in}"
+    );
+    assert!(
+        due_in <= chrono::Duration::seconds(605),
+        "due_at must clamp to MAX_RETRY_AFTER ({} s), got {due_in}",
+        MAX_RETRY_AFTER.as_secs()
+    );
+
+    // And the job is claimable again once the clamped delay is over.
+    sqlx::query("UPDATE delivery_jobs SET due_at = now() WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("make due");
+    let (good_fake, good) = Scripted::new("sms").into_channel();
+    let sent = work_once_bounded(&pool, &good, &cfg).await;
+    assert_eq!(sent.sent, 1, "{sent:?}");
+    assert_eq!(good_fake.sent(), vec![job_id]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn dead_job_creates_exactly_one_fallback_job(pool: PgPool) {
     let cfg = m4_cfg("w-fb");
     let alert = insert_alert(&pool, "open", &format!("fallback m4 {}", unique_tag())).await;
@@ -823,6 +874,7 @@ async fn run_outage_scenario(pool: PgPool, mode: OutageMode, secs: u64) {
                 base_url: format!("http://{addr}"),
                 public_url: "http://localhost:5173".into(),
                 timeout: Duration::from_secs(5),
+                token: None,
             },
         )
         .expect("build gateway channel"),
