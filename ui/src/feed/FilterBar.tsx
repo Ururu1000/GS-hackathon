@@ -68,7 +68,7 @@ export const FilterBar = forwardRef<HTMLInputElement, Props>(function FilterBar(
         <input
           ref={searchRef}
           type="search"
-          placeholder="Title, body or field value  ( / )"
+          placeholder="Title, body or field value"
           value={filters.query}
           onChange={(e) => onChange({ ...filters, query: e.target.value })}
           onKeyDown={(e) => {

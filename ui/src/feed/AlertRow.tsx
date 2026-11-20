@@ -28,13 +28,7 @@ export const AlertRow = memo(function AlertRow({ alert: a, selected, fresh, now,
           <span className="row-title">{a.title}</span>
         </div>
         <div className="row-body">{a.body}</div>
-        <div className="row-meta">
-          <span>{a.rule.name}</span>
-          <span aria-hidden="true">·</span>
-          <span>{a.team}</span>
-          <span aria-hidden="true">·</span>
-          <span title={a.first_seen}>opened {relTime(a.first_seen, now)}</span>
-        </div>
+        <div className="row-meta">{a.rule.name}</div>
       </div>
       <div className="row-side">
         <CountBadge count={a.count} />

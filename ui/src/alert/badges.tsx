@@ -1,14 +1,6 @@
 import { COLOR_TOKENS, type AlertStatus, type ColorToken, type FeedAlert, type Severity } from '../api/types'
 import { fmtCount } from '../lib/time'
 
-// Shape + text, never colour alone (colour-blind safe).
-const SEVERITY_ICON: Record<Severity, string> = {
-  critical: '▲',
-  error: '■',
-  warning: '◆',
-  info: '●',
-}
-
 export const SEVERITY_LABEL: Record<Severity, string> = {
   critical: 'Critical',
   error: 'Error',
@@ -28,7 +20,6 @@ export const colorToken = (c: string): ColorToken => ((COLOR_TOKENS as readonly 
 export function SeverityBadge({ severity }: { severity: Severity }) {
   return (
     <span className={`sev sev-${severity}`}>
-      <span aria-hidden="true">{SEVERITY_ICON[severity] ?? '●'}</span>
       {SEVERITY_LABEL[severity] ?? severity}
     </span>
   )
@@ -46,7 +37,7 @@ export function StatusPill({ alert }: { alert: FeedAlert }) {
 
 /** Live dedup counter. Keyed by value so the CSS pulse replays on change. */
 export function CountBadge({ count }: { count: number }) {
-  if (count <= 1) return <span className="count count-one" title="1 event">×1</span>
+  if (count <= 1) return null
   return (
     <span key={count} className="count count-bump" title={`${count.toLocaleString()} matching events folded into this alert`}>
       ×{fmtCount(count)}
