@@ -123,7 +123,13 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
     let mut plan = Plan::default();
     let mut recovered_dirty = std::collections::HashSet::new();
 
-    for m in batch {
+    // Fold each incident's matches in event-time order, so a recovery that
+    // overtook or trailed fires within one batch lands in the right place.
+    // The sort is stable: ties keep their arrival order.
+    let mut ordered: Vec<&MatchRecord> = batch.iter().collect();
+    ordered.sort_by_key(|m| m.ingested_at);
+
+    for m in ordered {
         let key = (m.rule_id.clone(), m.fingerprint.clone());
         let current = active.get(&key).copied();
         match m.kind {
@@ -168,18 +174,36 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
                     *latest = m.ingested_at;
                 }
                 recovered_dirty.insert(key.clone());
-                // A recovery older than the alert's latest fire does not close it.
-                if let Some(i) = current.filter(|&i| m.ingested_at >= states[i].last_seen) {
-                    let s = &mut states[i];
-                    s.status = "resolved".into();
-                    s.resolved_at = Some(m.ingested_at);
-                    s.resolved_by = Some("system".into());
-                    s.resolved_reason = Some("recovered".into());
-                    s.dedup_active = false;
-                    s.status_changed = true;
-                    s.touched = true;
+                // A recovery older than the whole incident belongs to an earlier one.
+                let Some(i) = current.filter(|&i| m.ingested_at >= states[i].first_seen) else {
+                    continue;
+                };
+                // A recovery that trails a later fire (applied in an earlier
+                // batch) ends the incident at its own time, and the later fire
+                // starts a new incident, which is paged as new.
+                let reopened = (m.ingested_at < states[i].last_seen).then(|| split_after_recovery(&states[i]));
+                let s = &mut states[i];
+                s.status = "resolved".into();
+                s.resolved_at = Some(m.ingested_at);
+                s.resolved_by = Some("system".into());
+                s.resolved_reason = Some("recovered".into());
+                s.dedup_active = false;
+                s.status_changed = true;
+                s.touched = true;
+                if reopened.is_some() {
+                    // Only the latest fire's time is known, so exactly that fire
+                    // moves to the new incident.
+                    s.count -= 1;
+                    s.last_seen = m.ingested_at;
+                } else {
                     s.last_event_id = Some(m.event_id.clone());
-                    active.remove(&key);
+                }
+                active.remove(&key);
+                if let Some(new) = reopened {
+                    states.push(new);
+                    let j = states.len() - 1;
+                    active.insert(key, j);
+                    notifies.push((j, NotifyReason::New, 1, m));
                 }
             }
         }
@@ -232,6 +256,28 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
         }
     }
     plan
+}
+
+/// The incident opened by the latest fire of `old`, whose recovery arrived late.
+fn split_after_recovery(old: &AlertState) -> AlertState {
+    AlertState {
+        id: Uuid::now_v7(),
+        generation: old.generation + 1,
+        dedup_active: true,
+        status: "open".into(),
+        count: 1,
+        first_seen: old.last_seen,
+        version: 1,
+        status_version: 1,
+        notify_seq: 1,
+        resolved_by: None,
+        resolved_at: None,
+        resolved_reason: None,
+        is_new: true,
+        touched: true,
+        status_changed: false,
+        ..old.clone()
+    }
 }
 
 fn within(s: &AlertState, m: &MatchRecord) -> bool {
@@ -654,11 +700,44 @@ mod tests {
     }
 
     #[test]
-    fn stale_recovery_does_not_close_a_newer_fire() {
+    fn late_recovery_splits_the_incident() {
+        // fire(t0), fire(t8) were applied; the recovery at t5 arrives afterwards.
         let mut ex = plan(&[fire("a", "fp", 0), fire("b", "fp", 8)], vec![], Recoveries::new(), t(8)).inserts.remove(0);
         ex.is_new = false;
         ex.touched = false;
-        let p = plan(&[m("r", "fp", 5, MatchKind::Recover, "error")], vec![ex], Recoveries::new(), t(9));
-        assert!(p.updates.is_empty(), "recovery at t=5 is older than the fire at t=8");
+        let p = plan(&[m("r", "fp", 5, MatchKind::Recover, "error")], vec![ex.clone()], Recoveries::new(), t(9));
+        let old = &p.updates[0];
+        assert_eq!((old.id, old.status.as_str(), old.count), (ex.id, "resolved", 1));
+        assert_eq!(old.resolved_at, Some(t(5)));
+        let new = &p.inserts[0];
+        assert_eq!((new.status.as_str(), new.count, new.first_seen), ("open", 1, t(8)));
+        assert_eq!(new.last_event_id.as_deref(), Some("b"));
+        assert!(new.dedup_active && !old.dedup_active);
+        let n: Vec<_> = p.outbox.iter().filter(|o| o.kind == "notify").collect();
+        assert_eq!(n.len(), 1, "the incident opened at t8 is paged as new");
+        assert_eq!(n[0].alert_id, new.id);
+    }
+
+    #[test]
+    fn in_batch_order_is_event_time() {
+        // Arrival order fire(t1), fire(t3), recover(t2) within one batch.
+        let p = plan(
+            &[fire("a", "fp", 1), fire("c", "fp", 3), m("r", "fp", 2, MatchKind::Recover, "error")],
+            vec![],
+            Recoveries::new(),
+            t(3),
+        );
+        let states: Vec<(&str, i64)> = p.inserts.iter().map(|s| (s.status.as_str(), s.count)).collect();
+        assert_eq!(states, vec![("resolved", 1), ("open", 1)]);
+        assert_eq!(kinds(&p).iter().filter(|k| **k == "notify").count(), 2);
+    }
+
+    #[test]
+    fn recovery_older_than_the_incident_is_ignored() {
+        let mut ex = plan(&[fire("a", "fp", 10)], vec![], Recoveries::new(), t(10)).inserts.remove(0);
+        ex.is_new = false;
+        ex.touched = false;
+        let p = plan(&[m("r", "fp", 5, MatchKind::Recover, "error")], vec![ex], Recoveries::new(), t(11));
+        assert!(p.updates.is_empty() && p.inserts.is_empty());
     }
 }
