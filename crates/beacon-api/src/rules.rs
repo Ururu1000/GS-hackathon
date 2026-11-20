@@ -157,15 +157,25 @@ fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
     }
 }
 
-fn map_write(state: &ApiState, e: WriteError) -> ApiError {
+async fn item_with_stats(state: &ApiState, r: &StoredRule) -> Result<Value, ApiError> {
+    let id = r.spec.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let stats = stats(state).await?;
+    Ok(item(state, r, stats.get(&id)))
+}
+
+async fn map_write(state: &ApiState, e: WriteError) -> ApiError {
     match e {
         WriteError::Invalid(d) => invalid(d),
         WriteError::NotFound => rule_not_found(),
-        WriteError::Conflict(current) => ApiError::conflict(
-            "revision_conflict",
-            "the rule changed since you loaded it",
-            current.map(|c| item(state, &c, None)).unwrap_or(Value::Null),
-        ),
+        WriteError::Conflict(current) => {
+            // Only show the current rule to someone allowed to see its team.
+            let visible = current.filter(|c| state.session.can_see(&team_of(&c.spec)));
+            let current = match visible {
+                Some(c) => item_with_stats(state, &c).await.unwrap_or(Value::Null),
+                None => Value::Null,
+            };
+            ApiError::conflict("revision_conflict", "the rule changed since you loaded it", current)
+        }
     }
 }
 
@@ -174,8 +184,8 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Byt
     let b: WriteBody = parse_body(&body, "{\"rule\": {...}}")?;
     check_team(&state, &b.rule)?;
     match config_store::create(&state.pool, &b.rule, &state.session.actor()).await? {
-        Ok(r) => Ok((StatusCode::CREATED, Json(item(&state, &r, None))).into_response()),
-        Err(e) => Err(map_write(&state, e)),
+        Ok(r) => Ok((StatusCode::CREATED, Json(item_with_stats(&state, &r).await?)).into_response()),
+        Err(e) => Err(map_write(&state, e).await),
     }
 }
 
@@ -188,8 +198,8 @@ pub async fn update(State(state): State<ApiState>, headers: HeaderMap, Path(id):
     }
     check_team(&state, &b.rule)?;
     match config_store::update(&state.pool, &id, &b.rule, expected, &state.session.actor()).await? {
-        Ok(r) => Ok(Json(item(&state, &r, None))),
-        Err(e) => Err(map_write(&state, e)),
+        Ok(r) => Ok(Json(item_with_stats(&state, &r).await?)),
+        Err(e) => Err(map_write(&state, e).await),
     }
 }
 
@@ -202,7 +212,7 @@ pub async fn delete(State(state): State<ApiState>, headers: HeaderMap, Path(id):
     check_team(&state, &existing.spec)?;
     match config_store::delete(&state.pool, &id, expected, &state.session.actor()).await? {
         Ok(()) => Ok(Json(json!({"deleted": id}))),
-        Err(e) => Err(map_write(&state, e)),
+        Err(e) => Err(map_write(&state, e).await),
     }
 }
 

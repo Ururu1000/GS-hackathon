@@ -354,3 +354,19 @@ async fn rule_test_panel_and_discovery(pool: PgPool) {
     let (_, sc) = get(&h.app, "/api/schemas").await;
     assert!(sc.as_array().unwrap().iter().any(|x| x["spec"]["schema"] == json!("prometheus.alert")));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_creates_of_one_id_conflict(pool: PgPool) {
+    let rule = json!({"id": "race", "team": "rates", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "team:rates"}], "present": {"title": "t"}});
+    for _ in 0..10 {
+        let (a, b) = tokio::join!(
+            beacon_engine::config_store::create(&pool, &rule, "user:a"),
+            beacon_engine::config_store::create(&pool, &rule, "user:b")
+        );
+        let ok = [a.unwrap().is_ok(), b.unwrap().is_ok()].iter().filter(|x| **x).count();
+        assert_eq!(ok, 1, "exactly one create of the same id wins");
+        let cur = beacon_engine::config_store::get(&pool, "race").await.unwrap().unwrap();
+        beacon_engine::config_store::delete(&pool, "race", cur.revision, "user:a").await.unwrap().unwrap();
+    }
+}

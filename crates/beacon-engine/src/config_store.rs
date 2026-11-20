@@ -56,6 +56,9 @@ pub enum WriteError {
 pub fn validate(spec: &Value) -> Result<RuleSpec, Vec<Invalid>> {
     let mut problems = Vec::new();
     let inv = |path: &str, message: String| Invalid { path: path.into(), message };
+    if let Some(p) = forbidden_key_path(spec, "") {
+        return Err(vec![inv(&p, "this key name is not allowed".into())]);
+    }
     let rule: RuleSpec = match serde_json::from_value(spec.clone()) {
         Ok(r) => r,
         Err(e) => return Err(vec![inv("", format!("not a valid rule: {e}"))]),
@@ -111,6 +114,28 @@ pub fn validate(spec: &Value) -> Result<RuleSpec, Vec<Invalid>> {
     if problems.is_empty() { Ok(rule) } else { Err(problems) }
 }
 
+/// Serialize rule writes. A `FOR UPDATE` on a not-yet-existing rule row locks
+/// nothing, so two creates of the same id would both succeed; locking the
+/// ruleset row first makes every create/update/delete strictly ordered.
+async fn lock_rules(tx: &mut PgConnection) -> Result<()> {
+    sqlx::query("SELECT revision FROM config_state WHERE key = 'rules' FOR UPDATE").execute(&mut *tx).await?;
+    Ok(())
+}
+
+/// Keys that turn into prototype pollution in JS consumers of the rule JSON.
+const FORBIDDEN_KEYS: &[&str] = &["__proto__", "constructor", "prototype"];
+
+fn forbidden_key_path(v: &Value, path: &str) -> Option<String> {
+    let join = |k: &str| if path.is_empty() { k.to_string() } else { format!("{path}.{k}") };
+    match v {
+        Value::Object(m) => m.iter().find_map(|(k, v)| {
+            if FORBIDDEN_KEYS.contains(&k.as_str()) { Some(join(k)) } else { forbidden_key_path(v, &join(k)) }
+        }),
+        Value::Array(a) => a.iter().enumerate().find_map(|(i, v)| forbidden_key_path(v, &join(&i.to_string()))),
+        _ => None,
+    }
+}
+
 async fn bump(tx: &mut PgConnection) -> Result<i64> {
     let rev: i64 = sqlx::query_scalar("UPDATE config_state SET revision = revision + 1 WHERE key = 'rules' RETURNING revision")
         .fetch_one(&mut *tx)
@@ -162,6 +187,7 @@ pub async fn create(pool: &PgPool, spec: &Value, actor: &str) -> Result<Result<S
         Err(p) => return Ok(Err(WriteError::Invalid(p))),
     };
     let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
     let existing = current(&mut tx, &rule.id, true).await?;
     if let Some(e) = existing.as_ref().filter(|e| !e.deleted) {
         return Ok(Err(WriteError::Conflict(Some(e.clone()))));
@@ -183,6 +209,7 @@ pub async fn update(pool: &PgPool, id: &str, spec: &Value, expected_revision: i6
         return Ok(Err(WriteError::Invalid(vec![Invalid { path: "id".into(), message: format!("must match the URL ({id})") }])));
     }
     let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
     let Some(existing) = current(&mut tx, id, true).await?.filter(|e| !e.deleted) else {
         return Ok(Err(WriteError::NotFound));
     };
@@ -197,6 +224,7 @@ pub async fn update(pool: &PgPool, id: &str, spec: &Value, expected_revision: i6
 
 pub async fn delete(pool: &PgPool, id: &str, expected_revision: i64, actor: &str) -> Result<Result<(), WriteError>> {
     let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
     let Some(existing) = current(&mut tx, id, true).await?.filter(|e| !e.deleted) else {
         return Ok(Err(WriteError::NotFound));
     };
@@ -343,5 +371,8 @@ mod tests {
         let mut bad = rule();
         bad["route"] = json!([]);
         assert_eq!(validate(&bad).unwrap_err()[0].path, "route");
+        let mut bad = rule();
+        bad["present"]["__proto__"] = json!({"x": 1});
+        assert_eq!(validate(&bad).unwrap_err()[0].path, "present.__proto__");
     }
 }

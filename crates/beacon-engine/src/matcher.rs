@@ -105,6 +105,24 @@ pub struct SampleSink {
 }
 
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(2);
+const MAX_TRACKED_SCHEMAS: usize = 10_000;
+
+/// Samples are shown in the UI, so values under secret-looking keys are masked.
+fn redact(v: serde_json::Value) -> serde_json::Value {
+    const SECRET: &[&str] = &["password", "passwd", "secret", "token", "authorization", "api_key", "apikey", "cookie", "private_key", "credential"];
+    match v {
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.into_iter()
+                .map(|(k, v)| {
+                    let lk = k.to_ascii_lowercase();
+                    if SECRET.iter().any(|s| lk.contains(s)) { (k, serde_json::Value::String("[redacted]".into())) } else { (k, redact(v)) }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(redact).collect()),
+        other => other,
+    }
+}
 const SAMPLES_KEPT: i64 = 2000;
 
 impl SampleSink {
@@ -114,7 +132,8 @@ impl SampleSink {
         tokio::spawn(async move {
             let mut since_prune = 0usize;
             while let Some(e) = rx.recv().await {
-                let raw = beacon_core::matcher::bounded_to(e.raw, beacon_core::model::MAX_NOTIFY_RAW);
+                let raw = beacon_core::matcher::bounded_to(redact(e.raw), beacon_core::model::MAX_NOTIFY_RAW);
+                let fields = beacon_core::matcher::bounded_to(serde_json::Value::Object(e.fields), 4096);
                 let res = sqlx::query(
                     "INSERT INTO event_samples (event_id, source, schema, received_at, fields, raw) VALUES ($1, $2, $3, $4, $5, $6)",
                 )
@@ -122,7 +141,7 @@ impl SampleSink {
                 .bind(&e.source)
                 .bind(&e.schema)
                 .bind(e.ingested_at)
-                .bind(serde_json::Value::Object(e.fields))
+                .bind(strip_nul(fields))
                 .bind(strip_nul(raw))
                 .execute(&pool)
                 .await;
@@ -148,6 +167,14 @@ impl SampleSink {
             let mut last = self.last.lock().unwrap();
             if last.get(&e.schema).is_some_and(|t| now.duration_since(*t) < SAMPLE_EVERY) {
                 return;
+            }
+            // Senders control unknown shapes, so the map is capped: past the
+            // cap, stale entries are dropped (worst case: a few extra samples).
+            if last.len() >= MAX_TRACKED_SCHEMAS {
+                last.retain(|_, t| now.duration_since(*t) < SAMPLE_EVERY);
+                if last.len() >= MAX_TRACKED_SCHEMAS {
+                    return;
+                }
             }
             last.insert(e.schema.clone(), now);
         }
