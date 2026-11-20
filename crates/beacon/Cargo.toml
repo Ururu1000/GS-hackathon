@@ -1,0 +1,15 @@
+[package]
+name = "beacon"
+description = "Beacon binary: runs the roles selected with --role"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+beacon-delivery = { path = "../beacon-delivery" }
+tokio.workspace = true
+sqlx.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

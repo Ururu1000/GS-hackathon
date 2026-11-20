@@ -1,0 +1,46 @@
+# Dev dependencies for the delivery crate only (Postgres + Mailpit).
+#
+#   docker compose -f deploy/compose.delivery-dev.yml up -d --wait
+#   export DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon
+#   cargo test -p beacon-delivery -- --nocapture
+#   docker compose -f deploy/compose.delivery-dev.yml down -v
+#
+# Env vars read by crates/beacon-delivery/tests/delivery_m0.rs:
+#   DATABASE_URL  required; sqlx::test creates one throwaway database per test from it
+#   SMTP_HOST     default localhost
+#   SMTP_PORT     default 1025
+#   MAILPIT_URL   default http://localhost:8025 (Mailpit HTTP API / UI)
+#
+# Mailpit UI: http://localhost:8025
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: beacon
+      POSTGRES_PASSWORD: beacon
+      POSTGRES_DB: beacon
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beacon -d beacon"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  mailpit:
+    image: axllent/mailpit:v1.34.0
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      MP_MAX_MESSAGES: "20000"
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

@@ -1,0 +1,3 @@
+user: dave
+name: Dave Example
+contact: { email: dave@example.test, phone: "+44 7700 900126" }
