@@ -75,7 +75,7 @@ const CUT: Record<Exclude<Severity, 'info'>, React.ReactNode> = {
 export function SeverityIcon({ severity, size = 16 }: { severity: Severity; size?: number }) {
   const label = SEVERITY_LABEL[severity] ?? severity
   const mask = `sev-${useId().replace(/[^\w-]/g, '')}`
-  const sev = severity in CUT ? (severity as keyof typeof CUT) : null
+  const sev = Object.hasOwn(CUT, severity) ? (severity as keyof typeof CUT) : null
   return (
     <svg className={`sev-icon sev-${severity}`} width={size} height={size} viewBox="0 0 24 24" role="img" aria-label={label}>
       <title>{label}</title>

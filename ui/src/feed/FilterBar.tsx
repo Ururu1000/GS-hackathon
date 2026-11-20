@@ -82,13 +82,13 @@ export function FilterChips({ filters, counts, onChange }: Omit<Props, 'onReset'
 export const SearchBox = forwardRef<HTMLInputElement, Pick<Props, 'filters' | 'onChange' | 'onReset'>>(function SearchBox({ filters, onChange, onReset }, searchRef) {
   return (
     <div className="filters">
-      <label className={`field field-grow search ${isDefault(filters) ? '' : 'has-reset'}`}>
-        <span className="field-label">Search</span>
+      <div className={`field field-grow search ${isDefault(filters) ? '' : 'has-reset'}`}>
         <SearchIcon size={15} className="search-icon" />
         <input
           className="input"
           ref={searchRef}
           type="search"
+          aria-label="Search"
           placeholder="Search, e.g. a trade or workflow ID"
           value={filters.query}
           onChange={(e) => onChange({ ...filters, query: e.target.value })}
@@ -97,13 +97,13 @@ export const SearchBox = forwardRef<HTMLInputElement, Pick<Props, 'filters' | 'o
           }}
         />
         {!isDefault(filters) ? (
-          <button className="search-reset" onClick={(e) => { e.preventDefault(); onReset() }}>
+          <button className="search-reset" onClick={onReset}>
             Reset filters
           </button>
         ) : (
           <kbd className="search-kbd" aria-hidden="true">/</kbd>
         )}
-      </label>
+      </div>
     </div>
   )
 })

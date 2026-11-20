@@ -3,7 +3,7 @@
    coss-inspired tactile controls, inset rounded list rows, and tinted semantic badges. */
 
 :root {
-  /* ---- T3 Code OKLCH primitives ---- */
+  /* ---- OKLCH primitives ---- */
   --color-zinc-25: oklch(99.2% 0 0);
   --color-zinc-50: oklch(98.5% 0 none);
   --color-zinc-100: oklch(96.7% .001 286.375);
@@ -37,7 +37,7 @@
   --color-purple-400: oklch(71.4% .203 305.504);
   --color-purple-500: oklch(62.7% .265 303.9);
 
-  /* ---- T3 Code Default Light palette ---- */
+  /* ---- Light palette ---- */
   color-scheme: light;
   --background: var(--color-zinc-25);
   --foreground: var(--color-zinc-900);
@@ -80,7 +80,7 @@
   --shadow-overlay: 0 12px 32px rgb(0 0 0 / .10), 0 2px 6px rgb(0 0 0 / .05);
   --backdrop: rgb(0 0 0 / .28);
 
-  /* T3 Code semantic tokens (light) */
+  /* Semantic tokens (light) */
   --error: var(--color-red-500);
   --error-foreground: var(--color-red-700);
   --error-surface: color-mix(in srgb, var(--error) 8%, transparent);
@@ -140,7 +140,7 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* ---- T3 Code Default Dark palette (system dark or explicit data-theme="dark") ---- */
+/* ---- Dark palette (system dark or explicit data-theme="dark") ---- */
 :root[data-theme='dark'] {
   color-scheme: dark;
   --background: #000000;
@@ -313,13 +313,13 @@ option { background: var(--popover); color: var(--popover-foreground); }
   box-shadow: 0 0 0 2px var(--background), 0 0 0 4px color-mix(in srgb, var(--ring) 72%, transparent);
 }
 
-/* T3 Code thin overlay-feel scrollbars */
+/* thin overlay-feel scrollbars */
 :where(:not(iframe))::-webkit-scrollbar { width: var(--app-scrollbar-width); height: var(--app-scrollbar-width); }
 :where(:not(iframe))::-webkit-scrollbar-track { background: transparent; }
 :where(:not(iframe))::-webkit-scrollbar-thumb { background: var(--app-scrollbar-thumb); border-radius: 999px; }
 :where(:not(iframe))::-webkit-scrollbar-thumb:hover { background: var(--app-scrollbar-thumb-hover); }
 
-/* T3 Code kbd keycap */
+/* kbd keycap */
 kbd {
   display: inline-flex;
   align-items: center;
@@ -364,7 +364,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
   container: topbar / inline-size;
 }
 
-/* T3 Code monogram-style brand badge */
+/* monogram-style brand badge */
 .brand {
   display: inline-flex;
   align-items: center;
@@ -378,7 +378,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 
 .spacer { flex: 1; }
 
-/* T3 Code / coss input & select controls */
+/* input & select controls */
 .select, .input {
   background: var(--control-bg);
   border: 1px solid var(--input);
@@ -477,10 +477,9 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 }
 @media (max-width: 900px) {
   .detail-pane { position: fixed; inset: 0; width: auto; z-index: 5; border-left: 0; }
-  .user { display: none; }
 }
 
-/* ---- filters (T3 Code segmented tracks & search bar) ---------------------- */
+/* ---- filters (segmented tracks & search bar) ---------------------- */
 .filters {
   display: flex;
   flex-wrap: wrap;
@@ -568,7 +567,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 }
 .search-reset:hover { color: var(--foreground); background: var(--control-bg-hover); }
 
-/* ---- list (T3 Code inset rounded rows) ------------------------------------ */
+/* ---- list (inset rounded rows) ------------------------------------ */
 .feed-list-wrap { position: relative; flex: 1; min-height: 0; }
 .feed-list { position: absolute; inset: 0; overflow-y: auto; overflow-anchor: none; padding: 6px 0; }
 .feed-list:focus-visible { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--ring) 60%, transparent); }
@@ -631,7 +630,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 }
 .row-age { min-width: 52px; text-align: right; color: var(--faint); }
 
-/* ---- severity & T3 Code tinted semantic badges ---------------------------- */
+/* ---- severity & tinted semantic badges ---------------------------- */
 .sev-icon { flex: none; color: var(--sev-c, var(--muted-foreground)); display: block; }
 .sev-critical { --sev-c: var(--sev-critical); --sev-bg: var(--error-surface); }
 .sev-error { --sev-c: var(--sev-error); --sev-bg: var(--orange-surface); }
@@ -708,7 +707,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 .empty { padding: 56px 24px; text-align: center; color: var(--muted-foreground); font-size: 13.5px; }
 .empty p { margin: 0 0 14px; }
 
-/* ---- detail pane (T3 Code card hierarchy & coss buttons) ------------------ */
+/* ---- detail pane (card hierarchy & coss buttons) ------------------ */
 .detail { padding: 20px 20px 32px; display: flex; flex-direction: column; gap: 18px; }
 .head { display: flex; flex-direction: column; gap: 10px; }
 .head-top { display: flex; align-items: center; gap: 10px; }
@@ -747,7 +746,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
 
-/* T3 Code / coss Button */
+/* Button */
 .btn {
   border: 1px solid var(--input);
   background: var(--control-bg);
@@ -806,7 +805,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 .tech h4 { font-size: 12px; font-weight: 600; color: var(--muted-foreground); margin: 16px 0 8px; }
 .tech code { font-size: 12px; }
 
-/* T3 Code details card table */
+/* details card table */
 .fields {
   margin: 0;
   display: grid;
@@ -843,6 +842,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 }
 .copy-btn:hover { color: var(--foreground); background: var(--accent); }
 .copy-btn.is-copied { color: var(--success-foreground); }
+.copy-btn.is-failed { color: var(--error-foreground); }
 
 .placeholder { color: var(--muted-foreground); font-size: 13px; }
 .placeholder.error { color: var(--error-foreground); }
@@ -923,7 +923,7 @@ code, pre { font-family: var(--mono); font-size: 12px; }
 .dstate-dead { color: var(--error-foreground); background: var(--error-surface); }
 .dstate-cancelled { color: var(--muted-foreground); background: var(--accent); }
 
-/* ---- toasts & dialog (T3 Code popover surfaces) --------------------------- */
+/* ---- toasts & dialog (popover surfaces) --------------------------- */
 .toasts {
   position: fixed;
   left: 16px;

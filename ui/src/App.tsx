@@ -101,9 +101,11 @@ function useTheme(): ['light' | 'dark', () => void] {
     }
   }, [pref])
 
+  // Flipping to the theme the OS already uses drops the override, so "system" is reachable again.
   const toggle = useCallback(() => {
-    setPref(resolved === 'dark' ? 'light' : 'dark')
-  }, [resolved])
+    const next = resolved === 'dark' ? 'light' : 'dark'
+    setPref(next === (systemDark ? 'dark' : 'light') ? 'system' : next)
+  }, [resolved, systemDark])
 
   return [resolved, toggle]
 }

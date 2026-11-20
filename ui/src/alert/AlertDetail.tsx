@@ -125,7 +125,7 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
             {[...detail.timeline].reverse().map((t, i) => (
               <li key={`${t.at}-${i}`} className={`tl tl-${t.kind}`}>
                 <span className="tl-at" title={absTime(t.at)}>{relTime(t.at, now)}</span>
-                <span className="tl-msg">{timelineText(t)}</span>
+                <span className="tl-msg">{timelineText(t, a)}</span>
               </li>
             ))}
           </ol>
@@ -177,7 +177,7 @@ function StatusLine({ alert: a, now }: { alert: FeedAlert; now: number }) {
   const at = (iso: string | null) => <span title={absTime(iso)}>{relTime(iso, now)}</span>
   const why = a.status === 'resolved' ? resolvedReasonText(a.resolved_reason) : null
   return (
-    <p className="state-line" role="status">
+    <p className="state-line">
       <strong className={`status-${a.status}`}>{STATUS_LABEL[a.status]}</strong>{' '}
       {a.status === 'acked' && <>by {actorName(a.acked_by)} {at(a.acked_at)}</>}
       {a.status === 'resolved' && <>{a.resolved_by === 'system' ? 'automatically' : `by ${actorName(a.resolved_by)}`} {at(a.resolved_at)}</>}
@@ -188,13 +188,11 @@ function StatusLine({ alert: a, now }: { alert: FeedAlert; now: number }) {
   )
 }
 
-/** Status changes are phrased from their kind; other entries use the server's message. */
-function timelineText(t: TimelineEntry): string {
+/** Status changes are phrased from their kind; other entries use the server's message.
+ * Only the alert's current resolution has a structured reason, so older resolves omit it. */
+export function timelineText(t: TimelineEntry, a: Pick<FeedAlert, 'resolved_at' | 'resolved_reason'>): string {
   if (t.kind === 'acked') return `Acknowledged by ${actorName(t.actor)}`
-  if (t.kind === 'resolved') {
-    const reason = t.message.match(/\((\w+)\)\s*$/)?.[1] ?? null
-    return resolvedText(t.actor, reason)
-  }
+  if (t.kind === 'resolved') return resolvedText(t.actor, a.resolved_at === t.at ? a.resolved_reason : null)
   if (t.kind === 'reopened') return 'Reopened: the problem came back'
   const person = t.actor !== 'system' && !t.actor.startsWith('rule:')
   return person ? `${t.message} · ${actorName(t.actor)}` : t.message
@@ -204,17 +202,21 @@ function timelineText(t: TimelineEntry): string {
 const isId = (label: string) => /\bid$/i.test(label.trim())
 
 function CopyButton({ value, label }: { value: string; label: string }) {
-  const [copied, setCopied] = useState(false)
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle')
   useEffect(() => {
-    if (!copied) return
-    const t = setTimeout(() => setCopied(false), 1500)
+    if (state === 'idle') return
+    const t = setTimeout(() => setState('idle'), 1500)
     return () => clearTimeout(t)
-  }, [copied])
-  // navigator.clipboard exists only on https or localhost.
-  const copy = () => navigator.clipboard?.writeText(value).then(() => setCopied(true), () => {})
+  }, [state])
+  // navigator.clipboard exists only on https or localhost; say so instead of failing silently.
+  const copy = () => {
+    if (!navigator.clipboard) return setState('failed')
+    navigator.clipboard.writeText(value).then(() => setState('copied'), () => setState('failed'))
+  }
+  const text = state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed: clipboard needs https or localhost' : 'Copy'
   return (
-    <button className={`copy-btn ${copied ? 'is-copied' : ''}`} onClick={copy} aria-label={copied ? 'Copied' : `Copy ${label}`} title={copied ? 'Copied' : 'Copy'}>
-      {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+    <button className={`copy-btn ${state === 'copied' ? 'is-copied' : state === 'failed' ? 'is-failed' : ''}`} onClick={copy} aria-label={state === 'idle' ? `Copy ${label}` : text} title={text}>
+      {state === 'copied' ? <CheckIcon size={14} /> : state === 'failed' ? <CloseIcon size={14} /> : <CopyIcon size={14} />}
     </button>
   )
 }
