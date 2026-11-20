@@ -378,6 +378,48 @@ async fn finalize_cancelled_logged(
     }
 }
 
+/// Render a throttle digest job: the title names the parked count and rule, the body
+/// lists the covered alert ids (one per line) plus where to read them.
+fn digest_alert_view(
+    alert_id: Uuid,
+    status: String,
+    severity: String,
+    route_info: &serde_json::Value,
+) -> AlertView {
+    let digest = route_info.get("digest");
+    let count = digest
+        .and_then(|d| d.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let rule_id = digest
+        .and_then(|d| d.get("rule_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let ids: Vec<String> = digest
+        .and_then(|d| d.get("alert_ids"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let title = format!("{count} more alert(s) for rule {rule_id} were held back by throttling");
+    let body = if ids.is_empty() {
+        "Open the Beacon feed for details.".to_string()
+    } else {
+        format!("{}\nOpen the Beacon feed for details.", ids.join("\n"))
+    };
+    AlertView {
+        id: alert_id,
+        status,
+        severity,
+        title,
+        body,
+    }
+}
+
 async fn process_job(
     pool: &PgPool,
     channel: &dyn Channel,
@@ -402,16 +444,23 @@ async fn process_job(
     let Some((status, title, body, severity)) = alert else {
         return finalize_cancelled_logged(pool, &job, token, "alert not found").await;
     };
-    if !AlertStatus::parse(&status).is_some_and(AlertStatus::is_deliverable) {
+    // A throttle digest summarizes several alerts: it is never cancelled because the
+    // latest alert was acked or resolved, but the alert row must still exist.
+    let is_digest = job.route_info.get("digest").is_some_and(|v| v.is_object());
+    if !is_digest && !AlertStatus::parse(&status).is_some_and(AlertStatus::is_deliverable) {
         return finalize_cancelled_logged(pool, &job, token, &format!("alert {status}")).await;
     }
 
-    let alert = AlertView {
-        id: job.alert_id,
-        status,
-        severity,
-        title,
-        body,
+    let alert = if is_digest {
+        digest_alert_view(job.alert_id, status, severity, &job.route_info)
+    } else {
+        AlertView {
+            id: job.alert_id,
+            status,
+            severity,
+            title,
+            body,
+        }
     };
     let msg = channel.render(&alert, &job);
     match channel.send(&msg).await {
