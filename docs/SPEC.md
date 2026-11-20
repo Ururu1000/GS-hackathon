@@ -43,7 +43,7 @@ Working name: **Beacon** (placeholder).
          aggregator (partition owner)  dedup / group windows / quiet timers
               │   one fenced PG tx: alert mutations + intents + window state + next offset
               ▼
-         Postgres ── outbox relay ──►  notifications   key: recipient id
+         Postgres ── outbox relay ──►  notifications   key: recipient id (relay expands route → users)
               │                   └─►  alerts.updates  key: alert id (broadcast to every API replica)
               │
          recipient router (partition owner)  freeze routing, per-(rule,recipient) + per-recipient throttle
@@ -80,8 +80,8 @@ The result: **exactly-once effects per consumed offset.**
 
 **Matcher replay.**
 - The matcher publishes matches and commits its input offsets in one **Kafka transaction**. Downstream consumers read with `read_committed`. Each match carries a stable `match_id = (event_id, rule_id)` and, separately, the config revision.
-- Fallback if transactions fail the M0 spike: at-least-once matching, with `match_id` deduplicated durably by the aggregator over the retention horizon.
-- Ingest retries keep the same event id.
+- Fallback if transactions fail the M1 spike: at-least-once matching, with `match_id` deduplicated durably by the aggregator over the retention horizon.
+- Ingest retries keep the same event id. HTTP clients send an `Idempotency-Key` header for this; without one, a retry is a new event.
 
 **Alert identity and dedup generations.**
 - Dedup is a **sliding inactivity window** over `last_seen`, with a persisted generation.
@@ -138,9 +138,9 @@ Versions were verified on docs.rs/crates.io during review. Pin them in `Cargo.lo
 |---|---|---|
 | Language | Rust stable (≥ 1.89 for `serde-saphyr`), Cargo workspace | |
 | Async / HTTP | `tokio 1.54`, `axum 0.8.9`, `tower 0.5` | REST + SSE on one port; finite deadlines except on SSE |
-| Broker | Redpanda via `rdkafka 0.39` (`cmake-build`) | M0 must verify: native compose build, advertised listeners, transactional produce on the pinned image. JetStream would be a **different backend design** (no partition ownership/seek model), not a drop-in swap. |
+| Broker | Redpanda via `rdkafka 0.39` (`cmake-build`) | M0 must verify: native compose build, advertised listeners, plain produce/consume on the pinned image. Transactional produce is checked at M1. JetStream would be a **different backend design** (no partition ownership/seek model), not a drop-in swap. |
 | DB | Postgres 16, `sqlx =0.8.6` (`postgres, runtime-tokio, migrate, json`) | Typed runtime queries and checked-in migrations, so the build doesn't need a DB. Dedicated `PgListener` connection. |
-| Rules | typed condition tree → `cel-interpreter 0.10` | `Program::compile`/`execute` verified. Semantics in §4.3. |
+| Rules | typed condition tree, evaluated directly; `cel-interpreter 0.10` later | `Program::compile`/`execute` verified. Semantics in §4.3. |
 | Templates | `minijinja 2.x` | Strict undefined, registered filters (`money`), output/render budget, context-aware escaping |
 | Config | Postgres-backed versioned snapshot + `notify 8.2` importer for `config/` + `arc-swap 1.8` | §4.6 |
 | YAML / Markdown | `serde-saphyr 2.2`, `pulldown-cmark 0.13` | |
@@ -152,26 +152,11 @@ Versions were verified on docs.rs/crates.io during review. Pin them in `Cargo.lo
 | UI | **React + TypeScript** (decided 2026-11-20, §3.1), built as static assets | Native form controls, virtualized list, code editor for YAML/JSON |
 | Packaging | `docker compose up` | Pulls pinned prebuilt images, including built UI assets. A build override is for local edits. Health checks, one idempotent bootstrap job (migrations, topics, seed), and a smoke event that reaches the UI. |
 
-### 3.1 UI: decided React/TS (GPUI web considered)
+### 3.1 UI: decided React/TS
 
-**Decision (erop-laptop, 2026-11-20): React/TS now, with no GPUI spike.** The UI carries much of the UX score, and the gates below were too much risk to take on in the hackathon. The analysis is kept for reference.
+**Decision (erop-laptop, 2026-11-20): React/TS now, with no GPUI spike.** The UI carries much of the UX score, and the GPUI spike gates were too much risk to take on in the hackathon. The GPUI web analysis is in [reviews/2026-11-20-sol/ui.md](reviews/2026-11-20-sol/ui.md).
 
-State of GPUI web as of the review:
-- `gpui-pre-web 0.3.13` is a published snapshot of Zed's `gpui_web`.
-- Longbridge's `gpui-component 0.10.0` has a working WASM web gallery pinned to `gpui-pre-web =0.3.12`, so a known-good dependency graph exists.
-- Nobody has compiled it locally or run it in a browser yet.
-
-**Spike (timeboxed to 3 h, using the gpui-component 0.10 graph).** GPUI is chosen only if **all** of these pass on the demo laptop:
-
-1. A clean locked release build, with static assets packaged separately from the native Cargo build, served from compose. It runs in Chromium and Firefox; WebGL2 is tested if it is advertised as a fallback.
-2. Keyboard-only rule edit → test → save, and ack/resolve. Focus is visible and controls have accessible names.
-3. Multiline YAML/JSON paste, text selection, clipboard, IME, and clickable runbook links.
-4. 5,000 alerts plus 200 updates/s: p95 frame time under 33 ms while scrolling, and bounded queues.
-5. Reconnecting to a different API replica mid-burst converges to the PG state.
-
-**If any gate fails at the deadline, React/TS.** It has native controls, a statically built client and predictable virtual-list and editor integration. Second choice is axum + htmx for the simple forms. Leptos only if someone already ships it.
-
-The UI is a thin client either way. All logic (validation, test/preview, rendering) is behind the API in §8, which is specified with OpenAPI and SSE fixtures so either frontend can be built against it.
+The UI is a thin client. All logic (validation, test/preview, rendering) is behind the API in §8, which is specified with OpenAPI and SSE fixtures so the frontend can be built against it.
 
 ---
 
@@ -181,7 +166,7 @@ The UI is a thin client either way. All logic (validation, test/preview, renderi
 
 ```json
 {
-  "id": "evt_01J...",             // stable: source id + topic/partition/offset, or a ULID kept across HTTP retries
+  "id": "evt_01J...",             // stable: source id + topic/partition/offset, or source id + the client's Idempotency-Key
   "source": "kafka:workflows",     // transport source instance (≠ producer/service)
   "ingested_at": "2026-10-23T09:14:02.400Z",
   "schema": "workflow.failed",     // detected, or "unknown:<structural signature>"
@@ -193,7 +178,7 @@ The UI is a thin client either way. All logic (validation, test/preview, renderi
 }
 ```
 
-Rules filter on `fields.*` **or** any `raw.*` path. Paths use a restricted dot syntax for common cases (`raw.error.code`) and JSON Pointer for arbitrary keys and array indices.
+Rules filter on the envelope's `source` and `schema`, on `fields.*`, **or** on any `raw.*` path. Paths use a restricted dot syntax for common cases (`raw.error.code`) and JSON Pointer for arbitrary keys and array indices.
 
 ### 4.2 Schema mappings and unknown schemas (config, not code)
 
@@ -261,7 +246,7 @@ escalate_after: 10m
 
 **Condition semantics (one compiler for publish and preview).**
 - **Operators:** `eq, neq, gt, gte, lt, lte, in, not_in, contains, starts_with, regex, exists, not_exists`, nested under `all` / `any` / `not`.
-- The tree is lowered to CEL, with paths and literals bound as typed variables (never string-spliced). Results must be Boolean.
+- The tree is evaluated directly. Lowering to CEL (paths and literals bound as typed variables, never string-spliced; Boolean results) comes later, with hand-written CEL.
 - **Missing values:** missing ≠ JSON `null`. Comparisons on a missing or incompatible value are **false**, including `neq` and `not_in`. `not` negates that result. `exists` is true for a present `null`.
 - **Regex** is precompiled; a malformed one is rejected at publish.
 - **Errors:** a runtime error is reported against that rule and other rules keep evaluating.
@@ -304,9 +289,9 @@ preferences:                                # first match wins
 ```
 
 **Routing precedence.**
-1. Expand team and on-call targets into users, and deduplicate users reached by several routes.
-2. For each user, take the first matching personal preference, then the team default, then the rule's fallback channels.
-3. A rule's explicit `channels:` restricts the choice.
+1. Expand team and on-call targets into users, and deduplicate users reached by several routes. Delivery owns this: after M0 the outbox relay expands before publishing to `notifications`.
+2. If the route lists `channels:`, those are used. A user reached through several routes gets the union of their channels.
+3. Otherwise, for each user, take the first matching personal preference, then the team default, then `[ui]`.
 4. The decision is made **once at dispatch planning** and frozen on the intent. Escalation steps re-evaluate.
 
 **Escalation** is a durable state machine: `(alert_id, step, due_at, intent_id)` rows.
@@ -321,10 +306,10 @@ preferences:                                # first match wins
 | Table | Purpose |
 |---|---|
 | `config_revisions`, `rules`, `schemas`, `runbooks`, `people`, `teams` | Versioned JSONB under relational ids and revisions. Compare-and-set on edit. |
-| `alerts` | `id, rule_id, rule_revision, fingerprint, generation, dedup_active, status[open\|acked\|resolved], severity, title, body, fields, color, count, first_seen, last_seen, version, runbook_revision, ack_by, resolved_by, resolved_reason` |
+| `alerts` | `id, rule_id, rule_revision, team, fingerprint, generation, dedup_active, status[open\|acked\|resolved], severity, title, body, fields, color, count, first_seen, last_seen, version, notify_seq, runbook_revision, ack_by, resolved_by, resolved_reason` |
 | `alert_events` | Sampled event refs (first N + latest), with a broker locator while retained |
 | `checkpoints` | `(pipeline, topic, partition) → epoch, next_offset, state blob` |
-| `outbox` | Intents to publish (`notifications`, `alerts.updates`), with lease + token |
+| `outbox` | `id bigserial, kind (alert_update \| notify), alert_id, payload jsonb, created_at, processed_at`. Partial index on `(kind, id) WHERE processed_at IS NULL`. |
 | `delivery_jobs` | Unique `(alert_id, recipient_id, channel, notify_seq)`. State, attempts, `due_at`, lease, receipt, fallback-of. |
 | `approvals` | Pending requests: frozen params, eligible approvers, challenge hashes, expiry, state |
 | `action_executions` | Stable execution id, frozen intent, lease, outcome (`ok \| failed \| uncertain`) |
@@ -357,13 +342,14 @@ Feeds are indexed by team + recency, and audit by alert + time. Terminal outbox 
 2. **Normalize + match.**
    - Load the config snapshot, detect the schema, map fields, select candidate rules, evaluate them.
    - Emit `Match{match_id, rule_id, revision, key, event_ref + context projection}`. Presentation is rendered later.
+   - Each candidate rule's `recover_when` is evaluated separately; a hit emits `Recovery{rule_id, key}` on the same partition key. Recovery candidates are indexed from `recover_when`, independently of `when`.
    - Publish in a Kafka transaction with the input offsets.
 3. **Aggregate** (partition owner, fenced commit).
    - *Dedup:* same key within the sliding window → `count += 1`, `last_seen`. The UI gets a counter update; recipients are not re-paged, except on a severity escalation or a configured re-notify interval.
    - *Group:* the bucket persists its deadline, flushes when due even if idle, and emits one digest.
    - *Quiet timer:* evaluated by the owner after it has processed earlier buffered matches. It locks the alert and checks generation and `last_seen` before resolving.
    - *Recovery signals* route to the same incident key.
-4. **Route + throttle** (recipient owner, fenced commit). Resolve and freeze routing (§4.4). Debit the `(rule, recipient)` and recipient-wide buckets. Write delivery jobs. Excess is folded into a "N more suppressed" digest that is emitted when quota returns; nothing is silently dropped.
+4. **Route + throttle** (recipient owner, fenced commit). The aggregator writes the unexpanded route in the `notify` outbox row. Delivery's outbox relay expands team and on-call targets into users and publishes one `notifications` record per user, keyed by recipient. The router picks and freezes channels (§4.4). Debit the `(rule, recipient)` and recipient-wide buckets. Write delivery jobs. Excess is folded into a "N more suppressed" digest that is emitted when quota returns; nothing is silently dropped.
 5. **Render per channel** from an immutable presentation/runbook snapshot taken when the alert opens:
    - **UI and email:** the full body plus the filled-in steps.
    - **SMS:** a bounded title, an absolute short link (configured public URL), and an approval challenge if one is needed.
@@ -506,7 +492,8 @@ GET    /metrics · /ready                   Prometheus · per-role readiness
 4. It drains the buffer as absolute upserts and removals, dropping any per-alert `version` that is older than or equal to what the client has.
 5. Rows not in the snapshot are validated against the authorized PG projection before insert, so a delayed update can't resurrect a stale row. Removal versions are cached for the connection, bounded.
 6. On buffer overflow, a consumer gap or a rebalance, the stream restarts with a fresh snapshot. A client can reconnect to **any** replica.
-7. Heartbeats run and proxy buffering is off.
+7. When a removal leaves the filtered page short, the client refills it over REST (`GET /api/alerts` with the same filters and a cursor after its last row) and merges by `version`. The server sends no refill.
+8. Heartbeats run and proxy buffering is off.
 
 True `Last-Event-ID` replay needs a durable, commit-ordered feed log, which is a later feature.
 
@@ -528,13 +515,13 @@ True `Last-Event-ID` replay needs a durable, commit-ordered feed log, which is a
   |---|---|---|
   | a | 1-process baseline, steady run | |
   | b | 3 matchers + 3 aggregators + 2 routers over 24 partitions; also high-cardinality and hot-key variants with per-partition lag | |
-  | c | SMS gateway down for 60 s | every expected SMS job reconciled against persisted gateway receipts: 0 lost, duplicates counted |
+  | c | SMS gateway down for 60 s (retry horizon longer than the outage) | every expected SMS job reconciled against persisted gateway receipts: 0 lost, duplicates counted |
   | d | 500 dupes/s on one fingerprint | 1 alert, exact count |
   | e | kill an aggregator mid-run | exact counts, group deadlines kept, outbox invariants hold |
   | f | force SSE reconnect to another API replica during writes | the client converges to PG |
   | g | slow action targets | the alert pipeline's p99 is unaffected |
 
-- **Output:** `loadtest/results/*.md` plus a Grafana screenshot. A minimal load test runs at **M1** so bottlenecks show up early.
+- **Output:** `loadtest/results/*.md` plus a Grafana screenshot. A minimal measured run over HTTP and Kafka happens at **M0** so bottlenecks show up early.
 
 **Target (to beat, not a promise):** ≥ 20k raw events/s with a selective / duplicate-heavy workload, and first-alert p99 < 250 ms. We publish what we actually measure, including the high-fanout run where Postgres will be the limit.
 
@@ -546,12 +533,13 @@ True `Last-Event-ID` replay needs a durable, commit-ordered feed log, which is a
 crates/
   beacon-core/      envelope, paths, condition tree → CEL, templates, schema mapping, config snapshot
   beacon-ingest/    Source trait + http, kafka adapters
-  beacon-engine/    matcher, aggregator, router/throttle, checkpoints
-  beacon-delivery/  Channel trait + registry, job leasing, retry/breaker, email/sms/phone, fake gateway
+  beacon-engine/    matcher, aggregator, checkpoints
+  beacon-delivery/  router/throttle, Channel trait + registry, job leasing, retry/breaker, email/sms/phone, fake gateway
   beacon-runbook/   format adapters, Action trait + HTTP-config actions, approvals, action workers
   beacon-api/       axum REST + SSE, OpenAPI
   beacon/           the binary (role flags; wires adapters)
   beacon-loadgen/
+migrations/         one dir, `YYYYMMDDHHMMSS_<name>.sql`, applied with `sqlx migrate`
 ui/                 React/TS frontend, built separately as static assets
 config/             sources/ schemas/ rules/ people/ teams/ runbooks/ actions/  (seed = Appendix A/B)
 deploy/             docker-compose.yml (pinned images), compose.build.yml, compose.scale.yml, grafana/
@@ -567,14 +555,14 @@ Dependencies point one way: transport-neutral types live in `core`, adapters are
 
 | # | Deliverable | Done when |
 |---|---|---|
-| M0 | **Walking skeleton (simple on purpose):** webhook + Kafka ingest → typed condition tree → simple dedup (count bump on the open alert) → PG alerts → SSE feed in the React UI + Mailpit email, with the load-test harness running. **In parallel:** the rdkafka compose build. | an Appendix A event reaches the browser and Mailpit via `docker compose up`; the first measured numbers are recorded |
+| M0 | **Walking skeleton (simple on purpose):** webhook + Kafka ingest → typed condition tree → simple dedup (sliding window on the active alert, §13) → PG alerts → SSE feed in the React UI + Mailpit email (basic PG router, job queue and email worker, §13), with the load-test harness running. **In parallel:** the rdkafka compose build. | an Appendix A event reaches the browser and Mailpit via `docker compose up`; the first measured numbers are recorded |
 | M1 | Make the skeleton correct: **fenced aggregator** checkpoints, the SSE snapshot protocol, the matcher exactly-once path (transactions or match-id dedup) | a worker killed before/after commit leaves counts exact |
-| M2 | Versioned config + importer + hot reload, rule editor + test panel, unknown-schema flow | all 4 seed rules pass; judge-style unknown JSON → rule → alert with no deploy |
+| M2 | Versioned config + importer + hot reload, rule editor + test panel, unknown-schema flow | all 4 seed rules' predicates and rendering pass; judge-style unknown JSON → rule → alert with no deploy |
 | M3 | Dedup generations, grouping buckets, quiet timers | 500 dupes → 1 alert / count 500; Pricing digest per 5-min bucket |
-| M4 | Router + throttles, preferences + Anna, delivery jobs + retries/breaker/fallback, fake gateway, Mailpit, escalation (one chain) | 60 s outage: 0 lost, reconciled against receipts |
+| M4 | Kafka recipient router + throttles, preferences + Anna, delivery retries/breaker/fallback, fake gateway, escalation (one chain) | 60 s outage: 0 lost, reconciled against receipts |
 | M5 | Runbooks: YAML + Markdown/free text/link display + manual import, one config HTTP action, approval state machine (UI + SMS) | settlement-timeout flow end to end with audit |
 | M6 | Full load test suite + metrics | numbers with workload parameters in README |
-| M7 | Stretch: signed email approvals, proposals, LLM mapping/runbook proposals, post-incident diffs | |
+| M7 | Stretch: signed email approvals, auto-suggested proposals, LLM mapping/runbook proposals, post-incident diffs | |
 | M8 | README, "what is mocked", security/AI notes, video | |
 
 ---
@@ -583,15 +571,15 @@ Dependencies point one way: transport-neutral types live in `core`, adapters are
 
 - ~~UI stack~~ **Decided: React/TS** (§3.1).
 - ~~Dedup expiry~~ **Decided:** expiry retires the dedup generation (`dedup_active = false`) and leaves the incident open until it is resolved.
-- **Matcher exactly-once.** Kafka transactions (preferred) or match-id dedup, decided at M0.
-- **Team split** (proposed by alexey/claude): (a) ingest + matcher + dedup/aggregator, (b) delivery: router, delivery_jobs, channel mocks, escalation/approvals, runbooks, (c) UI + playground + rule builder. **erop-laptop takes (c).** (a) and (b) are still to be assigned between alexey and ilyaarch.
+- **Matcher exactly-once.** Kafka transactions (preferred) or match-id dedup, decided at M1.
+- **Team split** (proposed by alexey/claude): (a) ingest + matcher + dedup/aggregator, (b) delivery: router, delivery_jobs, channel mocks, escalation/approvals, runbooks, (c) UI + playground + rule builder. (a) also owns the load-test harness. **alexey takes (a), erop-laptop takes (c); ilyaarch takes (b), to be confirmed.**
 - **LLM in the demo:** off by default, synthetic data only, stated in the video.
 
 ---
 
 ## 13. Cut line: what we build vs. what we claim
 
-The review pushed toward production-grade guarantees. For the hackathon, judges score a working demo and measured numbers above design depth, so the order is: **get M0 working end to end first.** Kafka transactions, dedup generations, action leases and the router come only after that.
+The review pushed toward production-grade guarantees. For the hackathon, judges score a working demo and measured numbers above design depth, so the order is: **get M0 working end to end first.** Kafka transactions, dedup generations, action leases, throttles and the Kafka recipient router come only after that.
 
 **M0 (walking skeleton) has only these:**
 - webhook + Kafka ingest
@@ -602,13 +590,22 @@ The review pushed toward production-grade guarantees. For the hackathon, judges 
 - Mailpit email
 - the load-test harness running
 
-M0 has none of these: fencing, transactions, generations, throttles, runbooks.
+M0 has none of these: fencing, Kafka transactions, generations, throttles, runbooks.
+
+**M0 data flow (one process).**
+- *Dedup:* a match within `window` of the active alert's `last_seen` bumps `count`. Otherwise the old alert gets `dedup_active = false` (it stays open) and a new alert is inserted.
+- The aggregator writes the alert and its outbox rows (`alert_update`; plus `notify` for a new alert) in one PG transaction.
+- A relay publishes `alert_update` rows to `alerts.updates` for SSE and marks them processed.
+- The `notify` row carries `{alert_id, rule_id, route, notify_seq}`, with the route unexpanded; `notify_seq` is incremented under the alert row lock when the row is written.
+- The router (`beacon-delivery`) claims `notify` rows with `SKIP LOCKED`, expands the row's `route` into users from the YAML config, and, in the same transaction, inserts one email job per user (`delivery_jobs ON CONFLICT DO NOTHING`, keyed with the row's `notify_seq`) and marks the row processed. An email worker sends to Mailpit.
+- People and teams are read from `config/people` and `config/teams` at startup.
 
 **Build and demo (must work):**
 - fenced aggregator checkpoints
 - the SSE snapshot protocol
 - the delivery-job queue with retries and fallback
 - the unknown-schema → rule flow
+- manual *Suggest change* proposals on an alert, accepted by the rule owner (§6.5)
 - all 4 seed rules
 - the Appendix B YAML runbook with one HTTP action and UI + SMS approval
 - load scenarios a–e
@@ -616,7 +613,7 @@ M0 has none of these: fencing, transactions, generations, throttles, runbooks.
 **Build if time allows (M7):**
 - the full recipient-wide throttle (otherwise per-(rule, recipient) only, using the same PG bucket rows)
 - signed email approvals
-- proposals and LLM features
+- auto-suggested proposals, post-incident runbook diffs and LLM features
 - scenarios f–g
 
 **Claim only what we tested:**
