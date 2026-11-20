@@ -7,7 +7,7 @@
 //! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `400 bad_request` (not a manual step); `404` |
 //! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden`; `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
 //! | `GET /api/runbooks` | `200 {items}` | |
-//! | `POST /api/replies` `{from, text}` (fake-gateway callback, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, body))`) | `200 {outcome}` | `401 unauthorized` (bad/missing signature) |
+//! | `POST /api/replies` `{from, text}` (fake-gateway callback, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`), `already_decided`, `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (bad/missing signature) |
 //!
 //! Auth: beacon-api's session/CSRF middleware inserts `Extension(Actor("user:<id>"))` before
 //! these handlers; without it every route except `/api/replies` returns `401 unauthorized`.
@@ -581,6 +581,9 @@ fn reply_json(outcome: ReplyOutcome) -> Value {
         ReplyOutcome::AlreadyDecided => json!({ "outcome": "already_decided" }),
         ReplyOutcome::WrongCode => json!({ "outcome": "wrong_code" }),
         ReplyOutcome::TooManyAttempts => json!({ "outcome": "too_many_attempts" }),
+        ReplyOutcome::Ambiguous => {
+            json!({ "outcome": "ambiguous", "message": "decide in the UI" })
+        }
         ReplyOutcome::Unknown(m) => json!({ "outcome": "unknown", "message": m }),
     }
 }

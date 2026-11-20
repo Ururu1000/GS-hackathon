@@ -7,12 +7,19 @@
 //!   action + params, `eligible` = the alert team's lead + the current on-call person of every
 //!   schedule that team defines (`user:<id>`, deduplicated; the requester may approve only if
 //!   eligible), `expires_at = now() + 15 min`, a random 4-digit code (`0000`–`9999`) stored only
-//!   as `sms_code_hash = hex(sha256(id || ":" || code))`. Then send the prompt: one `sms` job
+//!   as `sms_code_hash = hex(sha256(id || ":" || code))`. The draw is collision-safe: inside the
+//!   same tx, take `pg_advisory_xact_lock(hashtext('approval-code:' || person))` per eligible
+//!   person (persons sorted, so concurrent requests lock in one order and cannot deadlock),
+//!   load the pending, unexpired approvals whose `eligible` overlaps this one's
+//!   (`eligible && $1::text[]`), and redraw while the candidate hashes equal any of their
+//!   `sms_code_hash` (up to 50 tries, then `RequestError::NoFreeCode`): two pending approvals
+//!   that share an eligible person never share a code, so an SMS reply can never decide the
+//!   wrong request. Then send the prompt: one `sms` job
 //!   per eligible person with a phone, via `router::insert_jobs`, `route_info = {"target":
 //!   "approval", "approval": {"id", "code", "step_id", "action"}}` (the code is in the job so
 //!   the SMS can carry it; `GatewayChannel::render` turns it into `... Reply "Y 4821" to
 //!   approve, "N 4821" to reject.` and sets `ProviderRequest.approval_challenge = "Y 4821"`),
-//!   `notify_seq` = the alert's current `notify_seq`, `escalation_step = 200 + n` (unique key).
+//!   `notify_seq` = the alert's current `notify_seq`, `escalation_step` = the person's next free slot >= 200 on this notification (unique key; several approvals on one alert each reach the same person).
 //!   Audit `approval` "requested <action> (step <id>)".
 //!
 //!   The old schema-forced deviation is gone: the unique key now includes `escalation_step`,
@@ -30,8 +37,11 @@
 //!   `Y <code>` | `YES <code>` | `APPROVE <code>` → approve; `N <code>` | `NO <code>` |
 //!   `REJECT <code>` → reject; `ACK` → ack the most recent `open` alert that sent an sms/phone job
 //!   to that number (`AlertOps::transition(Ack)`, audit `acked` via sms). For a code: find the
-//!   pending approvals where that person is eligible; match `sha256(id:code)` against each; on a
-//!   match decide via the same path as the UI (`via = sms`); on no match increment
+//!   pending approvals where that person is eligible; match `sha256(id:code)` against each;
+//!   exactly one match decides via the same path as the UI (`via = sms`); more than one match
+//!   (only rows inserted by hand can force it — the collision-safe draw above refuses to
+//!   create it) is `Ambiguous`: nothing is decided, no attempt is burned, the sender picks
+//!   the request in the UI; on no match increment
 //!   `sms_attempts` of those pending approvals and expire any that reach 5 (`TooManyAttempts`).
 //!   A repeated reply for an already-decided approval returns `AlreadyDecided` (idempotent, no
 //!   side effects); so does a code that matches an approval that is no longer pending
@@ -95,6 +105,17 @@ pub enum DecideError {
     Db(String),
 }
 
+/// `request` fails when the database does, or when no free code is left: with 10,000 codes,
+/// 50 redraws without a hit mean ~9,990 live codes already share an eligible person with
+/// this request.
+#[derive(Debug, thiserror::Error)]
+pub enum RequestError {
+    #[error("no free approval code after 50 tries")]
+    NoFreeCode,
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
 /// The outcome of the decide state machine before it is mapped to the public
 /// [`DecideError`]/[`DecideOutcome`] types. Shared by the UI and SMS paths so both channels
 /// run exactly the same checks and writes inside one transaction.
@@ -147,6 +168,22 @@ fn code_hash(id: Uuid, code: &str) -> String {
     hex::encode(Sha256::digest(format!("{id}:{code}").as_bytes()))
 }
 
+/// How many times `request` redraws before giving up on a code that no live approval of the
+/// same persons already hashes to.
+const MAX_CODE_DRAWS: usize = 50;
+
+/// A random 4-digit code that hashes differently from every `(id, sms_code_hash)` in
+/// `taken` — at most [`MAX_CODE_DRAWS`] draws, then `None` (the caller errors out).
+fn draw_unique_code(taken: &[(Uuid, String)]) -> Option<String> {
+    (0..MAX_CODE_DRAWS)
+        .map(|_| generate_code())
+        .find(|candidate| {
+            !taken
+                .iter()
+                .any(|(id, hash)| code_hash(*id, candidate) == *hash)
+        })
+}
+
 /// Create (or return the pending) approval request; returns its id. See module doc.
 pub async fn request(
     tx: &mut Transaction<'static, Postgres>,
@@ -156,7 +193,7 @@ pub async fn request(
     action: &str,
     params: &Value,
     requested_by: &str,
-) -> Result<Uuid, sqlx::Error> {
+) -> Result<Uuid, RequestError> {
     // Idempotent per (alert, step): the pending request is returned as-is, no new SMS.
     if let Some((existing,)) = sqlx::query_as(
         "SELECT id FROM approvals WHERE alert_id = $1 AND step_id = $2 AND state = 'pending'",
@@ -175,12 +212,35 @@ pub async fn request(
             .fetch_optional(&mut **tx)
             .await?;
     let Some((team, notify_seq)) = row else {
-        return Err(sqlx::Error::RowNotFound);
+        return Err(sqlx::Error::RowNotFound.into());
     };
 
     let eligible = eligible_ids(dir, &team);
     let id = Uuid::new_v4();
-    let code = generate_code();
+
+    // One live code per eligible person: the transaction-scoped advisory lock per person
+    // (persons sorted, so concurrent requests always take them in the same order and
+    // cannot deadlock) serializes the collision check below.
+    let mut lock_order = eligible.clone();
+    lock_order.sort_unstable();
+    for person in &lock_order {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('approval-code:' || $1))")
+            .bind(person)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    // The codes those persons may already be holding: every pending, unexpired approval
+    // whose eligible set overlaps this one's.
+    let taken: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, sms_code_hash FROM approvals \
+         WHERE state = 'pending' AND expires_at > now() AND eligible && $1::text[]",
+    )
+    .bind(&eligible)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let code = draw_unique_code(&taken).ok_or(RequestError::NoFreeCode)?;
     let hash = code_hash(id, &code);
 
     sqlx::query(
@@ -204,7 +264,6 @@ pub async fn request(
 
     // The SMS prompt: one sms job per eligible person with a phone. The code travels in the
     // job (the SMS must carry it); the table keeps only its hash.
-    let mut n = 0i32;
     for who in &eligible {
         let Some(person_id) = who.strip_prefix("user:") else {
             continue;
@@ -215,6 +274,20 @@ pub async fn request(
         let Some(phone) = person.contact.phone.clone() else {
             continue;
         };
+        // Next free prompt slot for this person on this notification: several approvals on one
+        // alert (different steps) each page the same person, so the slot is per person, not
+        // per request. The per-person advisory lock taken above makes the count race-free.
+        let (taken,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM delivery_jobs \
+             WHERE alert_id = $1 AND recipient_id = $2 AND channel = 'sms' \
+               AND notify_seq = $3 AND escalation_step >= 200",
+        )
+        .bind(alert_id)
+        .bind(person_id)
+        .bind(notify_seq)
+        .fetch_one(&mut **tx)
+        .await?;
+        let slot = 200 + i32::try_from(taken).unwrap_or(i32::MAX - 200);
         let route_info = json!({
             "target": "approval",
             "approval": {
@@ -234,10 +307,9 @@ pub async fn request(
                 address: phone,
                 route_info,
             }],
-            Some(200 + n),
+            Some(slot),
         )
         .await?;
-        n += 1;
     }
 
     audit::record(
@@ -445,6 +517,9 @@ pub enum ReplyOutcome {
     AlreadyDecided,
     WrongCode,
     TooManyAttempts,
+    /// The code matches more than one pending approval of this sender: nothing is decided
+    /// and no attempt is burned — the request has to be picked in the UI instead.
+    Ambiguous,
     Unknown(String),
 }
 
@@ -527,7 +602,8 @@ async fn code_decision(
     code: &str,
 ) -> Result<ReplyOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // Lock every pending approval this person may decide; the reply decides exactly one.
+    // Lock every pending approval this person may decide; the reply decides exactly one —
+    // or, when the code matches several of them, none (`Ambiguous`).
     let pendings: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, sms_code_hash FROM approvals \
          WHERE state = 'pending' AND $1 = ANY(eligible) FOR UPDATE",
@@ -536,48 +612,60 @@ async fn code_decision(
     .fetch_all(&mut *tx)
     .await?;
 
-    for (id, hash) in &pendings {
-        if code_hash(*id, code) == *hash {
-            // The same decide path as the UI (`via = sms`), in this transaction.
-            return match decide_in_tx(&mut tx, alert_ops, *id, actor, decision, Via::Sms, None)
-                .await
-            {
-                Ok(Decided::Applied(DecideOutcome::Approved { execution_id })) => {
-                    tx.commit().await?;
-                    Ok(ReplyOutcome::Approved {
-                        approval_id: *id,
-                        execution_id,
-                    })
-                }
-                Ok(Decided::Applied(DecideOutcome::Rejected)) => {
-                    tx.commit().await?;
-                    Ok(ReplyOutcome::Rejected { approval_id: *id })
-                }
-                // Right code, no longer actionable: keep the expired state, report
-                // idempotently (the outcome set has no expired variant).
-                Ok(Decided::Expired) => {
-                    tx.commit().await?;
-                    Ok(ReplyOutcome::AlreadyDecided)
-                }
-                Ok(Decided::NotPending(_)) => {
-                    let _ = tx.rollback().await;
-                    Ok(ReplyOutcome::AlreadyDecided)
-                }
-                Ok(Decided::Invalid(m)) => {
-                    let _ = tx.rollback().await;
-                    Ok(ReplyOutcome::Unknown(m))
-                }
-                // Unreachable: the row was selected as this person's pending approval.
-                Ok(Decided::NotFound | Decided::Forbidden) => {
-                    let _ = tx.rollback().await;
-                    Ok(ReplyOutcome::WrongCode)
-                }
-                Err(e) => {
-                    let _ = tx.rollback().await;
-                    Err(e)
-                }
-            };
-        }
+    // The pending approvals this code unlocks for the sender.
+    let matching: Vec<Uuid> = pendings
+        .iter()
+        .filter(|(id, hash)| code_hash(*id, code) == *hash)
+        .map(|(id, _)| *id)
+        .collect();
+
+    // A code that matches more than one pending approval of this sender would decide an
+    // arbitrary request: decide nothing, burn no attempt, tell the sender to pick in the
+    // UI. (`request`'s collision-safe draw makes this unreachable for rows it creates;
+    // direct inserts can still force it.)
+    if matching.len() > 1 {
+        let _ = tx.rollback().await;
+        return Ok(ReplyOutcome::Ambiguous);
+    }
+
+    if let Some(id) = matching.first() {
+        // The same decide path as the UI (`via = sms`), in this transaction.
+        return match decide_in_tx(&mut tx, alert_ops, *id, actor, decision, Via::Sms, None).await {
+            Ok(Decided::Applied(DecideOutcome::Approved { execution_id })) => {
+                tx.commit().await?;
+                Ok(ReplyOutcome::Approved {
+                    approval_id: *id,
+                    execution_id,
+                })
+            }
+            Ok(Decided::Applied(DecideOutcome::Rejected)) => {
+                tx.commit().await?;
+                Ok(ReplyOutcome::Rejected { approval_id: *id })
+            }
+            // Right code, no longer actionable: keep the expired state, report
+            // idempotently (the outcome set has no expired variant).
+            Ok(Decided::Expired) => {
+                tx.commit().await?;
+                Ok(ReplyOutcome::AlreadyDecided)
+            }
+            Ok(Decided::NotPending(_)) => {
+                let _ = tx.rollback().await;
+                Ok(ReplyOutcome::AlreadyDecided)
+            }
+            Ok(Decided::Invalid(m)) => {
+                let _ = tx.rollback().await;
+                Ok(ReplyOutcome::Unknown(m))
+            }
+            // Unreachable: the row was selected as this person's pending approval.
+            Ok(Decided::NotFound | Decided::Forbidden) => {
+                let _ = tx.rollback().await;
+                Ok(ReplyOutcome::WrongCode)
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                Err(e)
+            }
+        };
     }
 
     // No pending match: a code belonging to an already-decided (or expired) approval is

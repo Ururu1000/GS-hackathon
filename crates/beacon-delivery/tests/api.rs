@@ -23,7 +23,7 @@ use beacon_delivery::gateway::{self, GatewayState};
 use beacon_delivery::runbook::{Condition, Format, RenderedStep, Runbook, StepDef, StepKind};
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -940,6 +940,68 @@ async fn replies_reject_everything_but_a_valid_signature(pool: PgPool) {
     let bad_sig = hmac_signature(&secret, &bad);
     let (status, _) = post_raw(&url, bad, &[("x-beacon-signature", bad_sig)]).await;
     assert_eq!(status, 400, "missing text field");
+}
+
+/// `hex(sha256("<approval id>:<code>"))` — what the approvals table stores for a code.
+fn expected_hash(id: Uuid, code: &str) -> String {
+    hex::encode(Sha256::digest(format!("{id}:{code}").as_bytes()))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn replies_answer_an_ambiguous_code_with_decide_in_the_ui(pool: PgPool) {
+    let secret = b"reply-secret".to_vec();
+    let state = api_state(&pool, Some(secret.clone()));
+    let base = serve_api_as(state, "user:bob").await;
+
+    // Two pending approvals eligible for carol, hashed for the same code: forced by
+    // direct inserts (`approvals::request` refuses to hand out a code another live approval
+    // of the same person already uses).
+    let alert = common::insert_alert(&pool, "open", "Ambiguous code alert").await;
+    let code = "4821";
+    let mut ambiguous = Vec::new();
+    for step in ["s1", "s2"] {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO approvals \
+                (id, alert_id, step_id, action, params, eligible, state, requested_by, \
+                 expires_at, sms_code_hash) \
+             VALUES ($1, $2, $3, 'escalate', '{}', ARRAY['user:carol'], 'pending', \
+                     'user:anna', now() + interval '15 minutes', $4)",
+        )
+        .bind(id)
+        .bind(alert)
+        .bind(step)
+        .bind(expected_hash(id, code))
+        .execute(&pool)
+        .await
+        .expect("insert approval");
+        ambiguous.push(id);
+    }
+
+    // The reply is a 200 that decides nothing and points at the UI.
+    let payload = json!({ "from": "+44 7700 900125", "text": format!("Y {code}") }).to_string();
+    let sig = hmac_signature(&secret, &payload);
+    let (status, body) = post_raw(
+        &format!("{base}/api/replies"),
+        payload,
+        &[("x-beacon-signature", sig)],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], json!("ambiguous"), "{body}");
+    assert_eq!(body["message"], json!("decide in the UI"), "{body}");
+
+    // Both requests are still pending and no attempt was burned on either.
+    for id in ambiguous {
+        let (state_str, attempts): (String, i32) =
+            sqlx::query_as("SELECT state, sms_attempts FROM approvals WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("approval row");
+        assert_eq!(state_str, "pending", "{id}");
+        assert_eq!(attempts, 0, "{id}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

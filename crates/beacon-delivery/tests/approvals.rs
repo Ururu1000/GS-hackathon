@@ -207,11 +207,9 @@ async fn request_creates_one_pending_row_and_one_prompt_job_per_phone(pool: PgPo
     // One prompt sms job per eligible person WITH a phone: carol and bob, not erin.
     let jobs = prompt_jobs(&pool, alert).await;
     assert_eq!(jobs.len(), 2, "prompt jobs: {jobs:?}");
+    // Each person's first prompt slot on this notification is 200.
     let steps: Vec<_> = jobs.iter().map(|j| j.escalation_step).collect();
-    assert!(
-        steps.contains(&Some(200)) && steps.contains(&Some(201)),
-        "{steps:?}"
-    );
+    assert_eq!(steps, vec![Some(200), Some(200)], "{steps:?}");
     for job in &jobs {
         assert_eq!(job.channel, "sms");
         assert_eq!(job.route_info["target"], json!("approval"));
@@ -308,7 +306,7 @@ async fn prompt_reuses_the_alerts_seq_and_a_renotify_still_pages(pool: PgPool) {
         .find(|j| j.recipient_id == "bob")
         .expect("bob prompt");
     assert_eq!(bob.notify_seq, 1, "the alert's current notify_seq");
-    assert_eq!(bob.escalation_step, Some(201));
+    assert_eq!(bob.escalation_step, Some(200));
     let carol_sms: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM delivery_jobs \
          WHERE alert_id = $1 AND recipient_id = 'carol' AND channel = 'sms'",
@@ -358,6 +356,32 @@ async fn prompt_reuses_the_alerts_seq_and_a_renotify_still_pages(pool: PgPool) {
     .expect("carol's renotify jobs");
     assert_eq!(renotify.len(), 1, "{renotify:?}");
     assert_eq!(renotify[0].escalation_step, Some(0), "a plain job");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn many_pending_approvals_sharing_a_person_never_share_a_code(pool: PgPool) {
+    let dir = approvals_dir();
+
+    // 30 pending approvals, one per alert: every one shares carol, erin and bob as its
+    // eligible set, so no two of them may page anyone with the same code. (One alert per
+    // request: a second approval of the SAME alert reuses its current notify_seq, so the
+    // router's unique job key would swallow the later prompts.)
+    let mut seen: HashMap<String, Uuid> = HashMap::new();
+    for step in 0..30 {
+        let alert = insert_alert(&pool, "open").await;
+        let approval = request_approval(&pool, &dir, alert, &format!("s{step}")).await;
+        // The prompt job is the only place the plaintext code exists.
+        let code = prompt_code(&pool, alert, "carol").await;
+        if let Some(other) = seen.insert(code.clone(), approval) {
+            panic!("approvals {other} and {approval} share the code {code} for carol");
+        }
+    }
+    // An SMS reply "Y <code>" from carol names exactly one request.
+    assert_eq!(
+        seen.len(),
+        30,
+        "every approval paged carol with its own code"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -778,6 +802,69 @@ async fn wrong_codes_burn_attempts_and_the_fifth_expires(pool: PgPool) {
     assert_eq!(outcome, ReplyOutcome::WrongCode);
 }
 
+/// A pending approval row inserted directly with a chosen code (and a non-zero attempt
+/// count), bypassing `request`'s collision-safe draw — the only way to force the states
+/// `request` refuses to create.
+async fn insert_pending_with_code(pool: &PgPool, alert: Uuid, step: &str, code: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO approvals \
+            (id, alert_id, step_id, action, params, eligible, state, requested_by, \
+             expires_at, sms_code_hash, sms_attempts) \
+         VALUES ($1, $2, $3, 'escalate', '{}', \
+                 ARRAY['user:carol','user:erin','user:bob'], 'pending', 'user:anna', \
+                 now() + interval '15 minutes', $4, 2)",
+    )
+    .bind(id)
+    .bind(alert)
+    .bind(step)
+    .bind(expected_hash(id, code))
+    .execute(pool)
+    .await
+    .expect("insert pending approval");
+    id
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_code_matching_two_pending_approvals_is_ambiguous_and_decides_nothing(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+    // Two pending approvals eligible for carol, hashed for the SAME code: only direct
+    // inserts can force this — `request` refuses to draw a taken code.
+    let code = "4821";
+    let first = insert_pending_with_code(&pool, alert, "s1", code).await;
+    let second = insert_pending_with_code(&pool, alert, "s2", code).await;
+
+    let outcome = approvals::handle_reply(
+        &pool,
+        &dir,
+        &SqlAlertOps,
+        "+44 7700 900125",
+        &format!("Y {code}"),
+    )
+    .await
+    .expect("reply");
+    assert_eq!(outcome, ReplyOutcome::Ambiguous);
+
+    // Neither request was decided, no attempt was burned, nothing was executed or audited.
+    for id in [first, second] {
+        let row = approval_row(&pool, id).await;
+        assert_eq!(row.state, "pending", "approval {id}");
+        assert_eq!(row.sms_attempts, 2, "no attempt burned on {id}");
+    }
+    let executions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM action_executions WHERE alert_id = $1")
+            .bind(alert)
+            .fetch_one(&pool)
+            .await
+            .expect("count executions");
+    assert_eq!(executions, 0);
+    assert!(
+        audit_messages(&pool, alert).await.is_empty(),
+        "no decision was audited"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_reply_from_an_unknown_number_is_unknown(pool: PgPool) {
     let dir = approvals_dir();
@@ -1022,4 +1109,32 @@ async fn timeline_entries_merge_audit_rows_escalations_and_digests(pool: PgPool)
             .is_empty(),
         "an alert with no history has an empty timeline"
     );
+}
+
+/// Two approvals on ONE alert (different steps) both reach the same people: each person gets
+/// the next free prompt slot (200, 201), so the second prompt is never swallowed by the
+/// delivery-job idempotency key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_approvals_on_one_alert_both_prompt_the_same_people(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+    let first = request_approval(&pool, &dir, alert, "s3").await;
+    let second = request_approval(&pool, &dir, alert, "s4").await;
+    assert_ne!(first, second);
+
+    let jobs = prompt_jobs(&pool, alert).await;
+    for who in ["carol", "bob"] {
+        let mut slots: Vec<_> = jobs
+            .iter()
+            .filter(|j| j.recipient_id == who)
+            .map(|j| j.escalation_step)
+            .collect();
+        slots.sort();
+        assert_eq!(slots, vec![Some(200), Some(201)], "{who}: {jobs:?}");
+    }
+    let ids: std::collections::HashSet<_> = jobs
+        .iter()
+        .map(|j| j.route_info["approval"]["id"].clone())
+        .collect();
+    assert_eq!(ids.len(), 2, "both approvals prompted: {ids:?}");
 }
