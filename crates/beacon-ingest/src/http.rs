@@ -58,10 +58,14 @@ impl<S: Sink> IngestState<S> {
 }
 
 pub fn router<S: Sink>(state: Arc<IngestState<S>>) -> Router {
+    ingest_routes(state).route("/ready", get(|| async { "ok" }))
+}
+
+/// Only the `/ingest/...` routes, for mounting next to another app.
+pub fn ingest_routes<S: Sink>(state: Arc<IngestState<S>>) -> Router {
     Router::new()
         .route("/ingest/{source}", post(ingest_one::<S>))
         .route("/ingest/{source}/batch", post(ingest_batch::<S>))
-        .route("/ready", get(|| async { "ok" }))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }

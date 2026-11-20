@@ -253,7 +253,13 @@ async fn main() -> Result<()> {
                 let schemas = std::sync::Arc::new(beacon_engine::config_store::load_schemas(&config_dir)?);
                 let sources = std::sync::Arc::new(beacon_ingest::kafka_source::load_sources(&config_dir.join("sources"))?);
                 let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, schemas, sources };
-                let app = beacon_api::router(state, ui_dir.clone());
+                // Same-origin ingest for the UI's sample replay (CSRF-gated).
+                let same_origin_ingest = {
+                    let publisher = beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
+                    let max_inflight = workers("INGEST_MAX_INFLIGHT", "20000")?;
+                    beacon_ingest::http::ingest_routes(beacon_ingest::http::IngestState::new(publisher, max_inflight))
+                };
+                let app = beacon_api::router_with(state, ui_dir.clone(), Some(same_origin_ingest));
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("binding {addr}"))?;

@@ -370,3 +370,17 @@ async fn concurrent_creates_of_one_id_conflict(pool: PgPool) {
         beacon_engine::config_store::delete(&pool, "race", cur.revision, "user:a").await.unwrap().unwrap();
     }
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn same_origin_ingest_needs_csrf(pool: PgPool) {
+    let session = Arc::new(Session::demo(&root().join("config"), "anna").unwrap());
+    let (updates, _) = broadcast::channel(8);
+    let (_r, ready) = watch::channel(true);
+    let csrf = session.csrf_token.clone();
+    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]) };
+    let ingest = Router::new().route("/ingest/{source}", axum::routing::post(|| async { (StatusCode::ACCEPTED, "{\"id\":\"x\"}") }));
+    let app = beacon_api::router_with(state, None, Some(ingest));
+    assert_eq!(post(&app, "/ingest/demo", None, json!({})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post(&app, "/ingest/demo", Some(&csrf), json!({})).await.0, StatusCode::ACCEPTED);
+    assert_eq!(get(&app, "/ready").await.0, StatusCode::OK, "no route clash with the API's /ready");
+}

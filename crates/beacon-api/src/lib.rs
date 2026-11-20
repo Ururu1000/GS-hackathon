@@ -45,7 +45,16 @@ pub struct ApiState {
 }
 
 pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
-    let api = Router::new()
+    router_with(state, ui_dir, None)
+}
+
+/// Like [`router`], optionally mounting the webhook ingest routes
+/// (`/ingest/{source}[/batch]`) on the same origin for the UI's playground
+/// and sample replay. There they require the session's `X-CSRF-Token`, so a
+/// third-party page can't make a browser inject events.
+pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Router>) -> Router {
+    let session = state.session.clone();
+    let mut api = Router::new()
         .route("/api/session", get(session::get_session))
         .route("/api/alerts", get(alerts::list))
         .route("/api/alerts/{id}", get(alerts::detail))
@@ -64,6 +73,19 @@ pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
         .route("/api/{*rest}", axum::routing::any(api_not_found))
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
+    if let Some(ingest) = ingest {
+        let gated = ingest.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let session = session.clone();
+            async move {
+                if req.method() != axum::http::Method::GET
+                    && let Err(e) = session.check_csrf(req.headers()) {
+                        return axum::response::IntoResponse::into_response(e);
+                    }
+                next.run(req).await
+            }
+        }));
+        api = api.merge(gated);
+    }
     match ui_dir {
         // The built UI (ui/dist) is served from the same origin, so the
         // session cookie and EventSource work without CORS.
