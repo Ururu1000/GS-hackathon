@@ -10,6 +10,7 @@
 
 pub mod aggregator;
 pub mod alerts;
+pub mod config_store;
 pub mod feed;
 pub mod matcher;
 pub mod relay;

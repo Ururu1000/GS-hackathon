@@ -15,6 +15,7 @@
 pub mod alerts;
 pub mod error;
 pub mod feed;
+pub mod rules;
 pub mod session;
 pub mod stream;
 
@@ -37,6 +38,10 @@ pub struct ApiState {
     /// True once this replica's `alerts.updates` consumer has partitions.
     pub ready: watch::Receiver<bool>,
     pub session: Arc<Session>,
+    /// Schema mappings (config/schemas) for the rule test panel and listing.
+    pub schemas: Arc<Vec<beacon_core::mapping::SchemaMappingSpec>>,
+    /// Configured Kafka sources (config/sources).
+    pub sources: Arc<Vec<beacon_ingest::kafka_source::SourceSpec>>,
 }
 
 pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
@@ -47,6 +52,13 @@ pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
         .route("/api/alerts/{id}/ack", post(alerts::ack))
         .route("/api/alerts/{id}/resolve", post(alerts::resolve))
         .route("/api/stream", get(stream::stream))
+        .route("/api/rules", get(rules::list).post(rules::create))
+        .route("/api/rules/test", post(rules::test))
+        .route("/api/rules/{id}", get(rules::get).put(rules::update).delete(rules::delete))
+        .route("/api/events/recent", get(rules::recent_events))
+        .route("/api/schemas", get(rules::schemas))
+        .route("/api/schemas/discovered", get(rules::discovered))
+        .route("/api/sources", get(rules::sources))
         .route("/ready", get(ready))
         // Unknown API paths are JSON 404s, never the UI's index.html.
         .route("/api/{*rest}", axum::routing::any(api_not_found))

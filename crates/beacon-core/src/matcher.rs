@@ -70,7 +70,9 @@ fn bounded(v: Value) -> Value {
     bounded_to(v, MAX_PROJECTED_VALUE)
 }
 
-fn bounded_to(v: Value, max: usize) -> Value {
+/// Cap a JSON value at `max` serialized bytes, replacing it with a truncated
+/// string preview when larger.
+pub fn bounded_to(v: Value, max: usize) -> Value {
     let text = match &v {
         Value::String(s) if s.len() <= max => return v,
         Value::String(s) => s.clone(),
