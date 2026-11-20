@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -92,6 +92,15 @@ fn event_id(headers: &HeaderMap, source: &str) -> Result<String, Response> {
     }
 }
 
+/// Read the body only after an in-flight permit is held, so saturation is
+/// answered with 429 before any request body is buffered or parsed.
+#[allow(clippy::result_large_err)] // the Err is a ready-made HTTP response
+async fn read_body(body: Body) -> Result<Bytes, Response> {
+    axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|_| error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", format!("body exceeds {MAX_BODY} bytes")))
+}
+
 fn map_publish_error(e: PublishError) -> Response {
     match e {
         PublishError::Saturated => error(StatusCode::TOO_MANY_REQUESTS, "saturated", "broker queue full, retry"),
@@ -104,11 +113,18 @@ async fn ingest_one<S: Sink>(
     State(state): State<Arc<IngestState<S>>>,
     Path(source): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if !valid_source(&source) {
         return error(StatusCode::BAD_REQUEST, "bad_source", "source must match [A-Za-z0-9-_.]{1,64}");
     }
+    let Ok(_permit) = state.inflight.try_acquire() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "saturated", "too many in-flight events");
+    };
+    let body = match read_body(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_json", e.to_string()),
@@ -116,9 +132,6 @@ async fn ingest_one<S: Sink>(
     let id = match event_id(&headers, &source) {
         Ok(id) => id,
         Err(r) => return r,
-    };
-    let Ok(_permit) = state.inflight.try_acquire() else {
-        return error(StatusCode::TOO_MANY_REQUESTS, "saturated", "too many in-flight events");
     };
     let event = Event::new(id.clone(), format!("http:{source}"), raw);
     match state.sink.publish(event).await {
@@ -133,11 +146,18 @@ async fn ingest_batch<S: Sink>(
     State(state): State<Arc<IngestState<S>>>,
     Path(source): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     if !valid_source(&source) {
         return error(StatusCode::BAD_REQUEST, "bad_source", "source must match [A-Za-z0-9-_.]{1,64}");
     }
+    let Ok(_first) = state.inflight.try_acquire() else {
+        return error(StatusCode::TOO_MANY_REQUESTS, "saturated", "too many in-flight events");
+    };
+    let body = match read_body(body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let items: Vec<Value> = match serde_json::from_slice(&body) {
         Ok(Value::Array(items)) => items,
         Ok(_) => return error(StatusCode::BAD_REQUEST, "not_an_array", "batch body must be a JSON array"),
@@ -153,9 +173,14 @@ async fn ingest_batch<S: Sink>(
         },
         None => None,
     };
-    let n = items.len() as u32;
-    let Ok(_permit) = state.inflight.try_acquire_many(n.max(1)) else {
-        return error(StatusCode::TOO_MANY_REQUESTS, "saturated", "too many in-flight events");
+    // One permit is already held for the body; take one more per extra event.
+    let extra = (items.len() as u32).saturating_sub(1);
+    let _rest = match extra {
+        0 => None,
+        n => match state.inflight.try_acquire_many(n) {
+            Ok(p) => Some(p),
+            Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "saturated", "too many in-flight events"),
+        },
     };
     let src = format!("http:{source}");
     let events: Vec<Event> = items
@@ -262,6 +287,14 @@ mod tests {
         let down = Arc::new(Mem { fail: Some(|| PublishError::Broker("down".into())), ..Default::default() });
         let (s, _) = call(router(IngestState::new(down, 10)), post("/ingest/x", "{}")).await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn saturation_is_checked_before_the_body() {
+        let mem = Arc::new(Mem::default());
+        let app = router(IngestState::new(mem, 0));
+        // Invalid JSON would be a 400 if the body were read first.
+        assert_eq!(call(app, post("/ingest/x", "{nope")).await.0, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

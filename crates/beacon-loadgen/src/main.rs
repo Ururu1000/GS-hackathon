@@ -44,7 +44,7 @@ struct Args {
     /// Seconds to send for.
     #[arg(long, default_value_t = 20)]
     duration: u64,
-    /// Events per HTTP request (1 = single-event endpoint).
+    /// Events per HTTP request (always sent to `POST /ingest/{source}/batch`).
     #[arg(long, default_value_t = 100)]
     batch: usize,
     /// Distinct incident keys per event type: fewer keys = more duplicates.
@@ -138,16 +138,17 @@ async fn main() -> Result<()> {
                 let now = Instant::now();
                 updates_seen.fetch_add(1, Ordering::Relaxed);
                 let first_update = alerts_seen.lock().unwrap().insert(a.id);
+                if first_update {
+                    // Opening latency on the server clock: ingest receipt (first_seen)
+                    // to the first update observed for this alert. Unaffected by the
+                    // relay coalescing the opening with later duplicates.
+                    let open_us = (chrono::Utc::now() - a.first_seen).num_microseconds().unwrap_or(0);
+                    let _ = first_alert.lock().unwrap().record(open_us.max(1) as u64);
+                }
                 let Some(eid) = a.last_event_id.as_deref() else { continue };
                 if let Some(t0) = sent_at.lock().unwrap().get(eid).copied() {
                     let us = now.duration_since(t0).as_micros() as u64;
                     let _ = latency.lock().unwrap().record(us.max(1));
-                    // First update seen for this alert. If the relay coalesced the
-                    // opening with later duplicates, this times the newest folded
-                    // event, so it is a lower bound for that alert.
-                    if first_update {
-                        let _ = first_alert.lock().unwrap().record(us.max(1));
-                    }
                 }
             }
         })
@@ -360,7 +361,7 @@ impl Report {
         s.push_str("## Latency (ms), intended send → alert on `alerts.updates`\n\n");
         s.push_str("| Measure | Samples | p50 | p90 | p99 | max |\n|---|---|---|---|---|---|\n");
         s.push_str(&row("Any update (count bump or new alert)", &self.latency));
-        s.push_str(&row("First alert (new incident)", &self.first_alert));
+        s.push_str(&row("First alert: ingest receipt → first update (server clock)", &self.first_alert));
         s.push_str("\nSamples are the events whose id is the alert's `last_event_id` when an update is published; duplicates folded into the same batch are not individually timed.\n");
         s
     }

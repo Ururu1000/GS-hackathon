@@ -66,9 +66,7 @@ pub async fn run_matcher(
                         matched += matches.len() as u64;
                         for rec in matches {
                             let payload = serde_json::to_vec(&rec)?;
-                            if let Some(f) = send(&producer, &rec.fingerprint, payload).await {
-                                pending.push(f);
-                            }
+                            pending.push(send(&producer, &rec.fingerprint, payload).await?);
                         }
                     }
                     Some(Err(e)) => error!(offset = m.offset(), error = %e, "undecodable event in events.raw; skipped"),
@@ -86,21 +84,19 @@ pub async fn run_matcher(
     Ok(())
 }
 
-/// Enqueue without blocking; if the local queue is full, wait and retry.
-/// A permanent rejection (e.g. a match over the record size limit) is logged
-/// and dropped rather than retried forever.
-async fn send(producer: &FutureProducer, key: &str, payload: Vec<u8>) -> Option<DeliveryFuture> {
+/// Enqueue without blocking; if the local queue is full, wait and retry. Any
+/// other producer error fails the role, so the supervisor restarts it from the
+/// last stored offset. (Match size is bounded in beacon-core, so a size
+/// rejection cannot be caused by a valid event.)
+async fn send(producer: &FutureProducer, key: &str, payload: Vec<u8>) -> Result<DeliveryFuture> {
     loop {
         match producer.send_result(FutureRecord::to(ALERTS_MATCHES).key(key).payload(&payload)) {
-            Ok(f) => return Some(f),
+            Ok(f) => return Ok(f),
             Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) => {
                 warn!("producer queue full; backing off");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            Err((e, _)) => {
-                error!(fingerprint = key, bytes = payload.len(), error = %e, "match rejected by producer; dropped");
-                return None;
-            }
+            Err((e, _)) => anyhow::bail!("producing match {key} ({} bytes): {e}", payload.len()),
         }
     }
 }

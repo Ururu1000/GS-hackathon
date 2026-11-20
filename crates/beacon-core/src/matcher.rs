@@ -55,6 +55,31 @@ pub struct MatchRecord {
     pub diagnostics: Vec<String>,
 }
 
+/// Values copied from the event into a match (dedup key values, card fields)
+/// are capped so a match always fits a Kafka record, whatever the event holds.
+pub const MAX_PROJECTED_VALUE: usize = 4096;
+
+/// Replace an oversized value with a truncated string preview.
+fn bounded(v: Value) -> Value {
+    let text = match &v {
+        Value::String(s) if s.len() <= MAX_PROJECTED_VALUE => return v,
+        Value::String(s) => s.clone(),
+        Value::Array(_) | Value::Object(_) => {
+            let t = v.to_string();
+            if t.len() <= MAX_PROJECTED_VALUE {
+                return v;
+            }
+            t
+        }
+        _ => return v,
+    };
+    let mut cut = MAX_PROJECTED_VALUE;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Value::String(format!("{}…", &text[..cut]))
+}
+
 /// Pre-index: rules whose condition requires `path == value` for some top-level
 /// conjunct are only evaluated when the event has that value. Everything else
 /// is in the fallback bucket. The full predicate always runs on candidates, so
@@ -243,6 +268,7 @@ impl ConfigSnapshot {
             }
         }
         let fingerprint = fingerprint(rule.id(), &key, missing.then_some(event.id.as_str()));
+        let key: Vec<Value> = key.into_iter().map(bounded).collect();
         let severity = rule
             .spec
             .severity
@@ -259,7 +285,7 @@ impl ConfigSnapshot {
                     p.resolve(event).map(|v| AlertField {
                         path: p.to_string(),
                         label: label.clone(),
-                        value: v.into_owned(),
+                        value: bounded(v.into_owned()),
                     })
                 })
                 .collect();
@@ -312,4 +338,20 @@ pub fn fingerprint(rule_id: &str, key: &[Value], unique: Option<&str>) -> String
         h.update(u.as_bytes());
     }
     hex::encode(&h.finalize()[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn projected_values_are_bounded() {
+        assert_eq!(bounded(json!("short")), json!("short"));
+        assert_eq!(bounded(json!(42)), json!(42));
+        let big = bounded(json!("x".repeat(100_000)));
+        assert!(big.as_str().unwrap().len() <= MAX_PROJECTED_VALUE + 4);
+        let obj = bounded(json!({"blob": "y".repeat(100_000)}));
+        assert!(obj.is_string(), "large objects become a truncated preview");
+    }
 }
