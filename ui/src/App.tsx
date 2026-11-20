@@ -107,7 +107,7 @@ export function App() {
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [team, setTeam] = useState<string | null>(loadTeam)
   const [filters, setFilters] = useState<Filters>(loadFilters)
-  const [route, go] = useRoute()
+  const [route, go, setRouteDirty] = useRoute()
   const selectedId = route.view === 'alerts' ? route.id : null
   const select = useCallback((id: string | null) => go({ view: 'alerts', id }, { replace: true }), [go])
   const navigate = useCallback((hash: string) => go(hash), [go])
@@ -238,7 +238,7 @@ export function App() {
             ))}
           </select>
         </label>
-        <Nav route={route} pendingProposals={pendingProposals} />
+        <Nav route={route} pendingProposals={pendingProposals} onNavigate={navigate} />
         {route.view === 'alerts' && <FilterChips filters={filters} counts={counts} onChange={changeFilters} />}
         <div className="spacer" />
         {/* Shown only when the stream is down: a live feed needs no badge. */}
@@ -271,10 +271,10 @@ export function App() {
         </div>
       </header>
 
-      <Suspense fallback={screenFallback}>
+      <Suspense key={route.view} fallback={screenFallback}>
       {route.view === 'rules' && (
         route.id ? (
-          <RuleEditor key={`${route.id}:${route.from ?? ''}`} id={route.id} from={route.from} team={team} onNavigate={navigate} onToast={push} />
+          <RuleEditor key={JSON.stringify([route.id, route.from])} id={route.id} from={route.from} team={team} onNavigate={navigate} onDirtyChange={setRouteDirty} onToast={push} />
         ) : (
           <RulesList team={team} teamName={teamName} onNavigate={navigate} />
         )
@@ -369,11 +369,15 @@ const NAV: { view: Route['view']; label: string; hash: string }[] = [
   { view: 'proposals', label: 'Proposals', hash: '#/proposals' },
 ]
 
-function Nav({ route, pendingProposals }: { route: Route; pendingProposals: number }) {
+function Nav({ route, pendingProposals, onNavigate }: { route: Route; pendingProposals: number; onNavigate: (hash: string) => void }) {
   return (
     <nav className="nav" aria-label="Sections">
       {NAV.map((n) => (
-        <a key={n.view} href={n.hash} className="nav-link" aria-current={route.view === n.view ? 'page' : undefined}>
+        <a key={n.view} href={n.hash} className="nav-link" aria-current={route.view === n.view ? 'page' : undefined} onClick={(e) => {
+          if (e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return
+          e.preventDefault()
+          onNavigate(n.hash)
+        }}>
           {n.label}
           {n.view === 'proposals' && pendingProposals > 0 && (
             <span className="nav-badge" aria-label={`${pendingProposals} waiting for review`}>{pendingProposals}</span>

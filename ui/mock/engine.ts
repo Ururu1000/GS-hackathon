@@ -14,10 +14,10 @@ import type {
   Scalar,
   Severity,
 } from '../src/api/types.ts'
+import { parseRuleStructure } from '../src/rules/structure.ts'
 
 const SEVERITIES: readonly Severity[] = ['critical', 'error', 'warning', 'info']
 const COLORS: readonly ColorToken[] = ['red', 'orange', 'amber', 'yellow', 'green', 'blue', 'purple', 'grey']
-const OPS = ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'not_in', 'contains', 'starts_with', 'regex', 'exists', 'not_exists']
 const CHANNELS = ['phone', 'sms', 'email', 'ui']
 
 export const MISSING: unique symbol = Symbol('missing')
@@ -270,9 +270,9 @@ function applyFilter(v: unknown, f: string): unknown {
     case 'money':
       return typeof v === 'number' ? v.toLocaleString('en-US') : v
     case 'upper':
-      return show(v).toUpperCase()
+      return v === MISSING ? MISSING : show(v).toUpperCase()
     case 'lower':
-      return show(v).toLowerCase()
+      return v === MISSING ? MISSING : show(v).toLowerCase()
     case 'round':
       return typeof v === 'number' ? Math.round(v) : v
     case 'default':
@@ -287,9 +287,14 @@ export function templateErrors(t: string): string[] {
   return stripped.includes('{{') || stripped.includes('}}') ? ['unbalanced or malformed {{ … }}'] : []
 }
 
-export function render(t: string, ctx: Ctx, warnings: string[] = []): string {
+export function render(t: string, ctx: Ctx, warnings: string[] = [], { requireScalar = false } = {}): string {
   return t.replace(TAG, (_all, path: string, filters: string) => {
-    let v: unknown = lookup(ctx, path.trim())
+    const name = path.trim()
+    let v: unknown = lookup(ctx, name)
+    if (requireScalar && (v === null || typeof v === 'object')) {
+      warnings.push(`${name} must be a non-null scalar`)
+      return ''
+    }
     const fs = filters
       .split('|')
       .map((s) => s.trim())
@@ -300,7 +305,7 @@ export function render(t: string, ctx: Ctx, warnings: string[] = []): string {
       warnings.push((e as Error).message)
     }
     if (v === MISSING) {
-      warnings.push(`${path.trim()} is missing in this event`)
+      warnings.push(`${name} is missing in this event`)
       return ''
     }
     return show(v)
@@ -321,22 +326,19 @@ export function fieldSpecs(rule: RuleSpec): { path: string; label: string }[] {
 const DURATION = /^\d+(ms|s|m|h|d)$/
 const PATH = /^(raw(\.[^.\s]+)*|fields\.[^.\s]+(\.[^.\s]+)*|source|schema)$/
 
-function validateCond(c: unknown, at: string, out: { path: string; message: string }[], depth = 0) {
-  if (depth > 12) return out.push({ path: at, message: 'nested too deeply' })
-  if (!isObj(c)) return out.push({ path: at, message: 'must be a condition object' })
+function validateCond(c: Condition, at: string, out: { path: string; message: string }[]) {
   if ('all' in c || 'any' in c) {
-    const k = 'all' in c ? 'all' : 'any'
-    if (!Array.isArray(c[k])) return out.push({ path: `${at}.${k}`, message: 'must be a list' })
-    if (c[k].length === 0) out.push({ path: `${at}.${k}`, message: 'needs at least one condition' })
-    c[k].forEach((x: unknown, i: number) => validateCond(x, `${at}.${k}.${i}`, out, depth + 1))
+    const kind = 'all' in c ? 'all' : 'any'
+    const children = 'all' in c ? c.all : c.any
+    if (!children.length) out.push({ path: `${at}.${kind}`, message: 'needs at least one condition' })
+    children.forEach((child, i) => validateCond(child, `${at}.${kind}.${i}`, out))
     return
   }
-  if ('not' in c) return validateCond(c.not, `${at}.not`, out, depth + 1)
-  if (typeof c.path !== 'string' || !PATH.test(c.path))
+  if ('not' in c) return validateCond(c.not, `${at}.not`, out)
+  if (!PATH.test(c.path))
     out.push({ path: `${at}.path`, message: 'path must start with raw., fields., or be source/schema' })
-  if (!OPS.includes(c.op)) return out.push({ path: `${at}.op`, message: `unknown operator "${String(c.op)}"` })
-  if (['exists', 'not_exists'].includes(c.op)) return
-  if (!('value' in c)) return out.push({ path: `${at}.value`, message: 'value is required' })
+  if (c.op === 'exists' || c.op === 'not_exists') return
+  if (c.value === undefined) return out.push({ path: `${at}.value`, message: 'value is required' })
   if (['in', 'not_in'].includes(c.op) && (!Array.isArray(c.value) || c.value.length === 0))
     out.push({ path: `${at}.value`, message: 'needs a non-empty list' })
   if (['gt', 'gte', 'lt', 'lte'].includes(c.op) && typeof c.value !== 'number' && typeof c.value !== 'string')
@@ -363,31 +365,33 @@ function checkForbiddenKeys(v: unknown, at: string, out: { path: string; message
 }
 
 export function validateRule(rule: unknown): { path: string; message: string }[] {
+  const parsed = parseRuleStructure(rule)
+  if ('problem' in parsed) return [parsed.problem]
+  return validateRuleSemantics(parsed.rule)
+}
+
+function validateRuleSemantics(r: RuleSpec): { path: string; message: string }[] {
   const out: { path: string; message: string }[] = []
-  if (!isObj(rule)) return [{ path: '', message: 'rule must be an object' }]
-  checkForbiddenKeys(rule, '', out)
-  const r = rule as RuleSpec
-  if (typeof r.id !== 'string' || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(r.id))
+  checkForbiddenKeys(r, '', out)
+  if (!/^[a-z0-9][a-z0-9-]{1,62}$/.test(r.id))
     out.push({ path: 'id', message: 'lower-case letters, digits and dashes, 2–63 characters' })
-  if (typeof r.team !== 'string' || !r.team) out.push({ path: 'team', message: 'team is required' })
-  if (r.severity !== undefined && !SEVERITIES.includes(r.severity)) out.push({ path: 'severity', message: `one of ${SEVERITIES.join(', ')}` })
+  if (!r.team) out.push({ path: 'team', message: 'team is required' })
   validateCond(r.when, 'when', out)
-  if (!Array.isArray(r.route) || r.route.length === 0) out.push({ path: 'route', message: 'add at least one recipient' })
+  if (r.route.length === 0) out.push({ path: 'route', message: 'add at least one recipient' })
   else
     r.route.forEach((rt, i) => {
-      if (typeof rt?.to !== 'string' || !/^(team|user|oncall):[\w-]+$/.test(rt.to))
+      if (!/^(team|user|oncall):[\w-]+$/.test(rt.to))
         out.push({ path: `route.${i}.to`, message: 'team:<id>, user:<id> or oncall:<schedule>' })
-      for (const ch of rt?.channels ?? []) if (!CHANNELS.includes(ch)) out.push({ path: `route.${i}.channels`, message: `unknown channel "${ch}"` })
+      for (const ch of rt.channels ?? []) if (!CHANNELS.includes(ch)) out.push({ path: `route.${i}.channels`, message: `unknown channel "${ch}"` })
     })
-  if (!isObj(r.present) || typeof r.present.title !== 'string' || !r.present.title.trim())
+  if (!r.present.title.trim())
     out.push({ path: 'present.title', message: 'a title template is required' })
   else {
     for (const m of templateErrors(r.present.title)) out.push({ path: 'present.title', message: m })
     for (const m of templateErrors(r.present.body ?? '')) out.push({ path: 'present.body', message: m })
-    if (r.present.color !== undefined && !COLORS.includes(r.present.color)) out.push({ path: 'present.color', message: `one of ${COLORS.join(', ')}` })
     ;(r.present.fields ?? []).forEach((f, i) => {
-      const p = typeof f === 'string' ? f : f?.path
-      if (typeof p !== 'string' || !PATH.test(p)) out.push({ path: `present.fields.${i}`, message: 'invalid path' })
+      const p = typeof f === 'string' ? f : f.path
+      if (!PATH.test(p)) out.push({ path: `present.fields.${i}`, message: 'invalid path' })
     })
   }
   if (r.dedup) {
@@ -404,7 +408,6 @@ export function validateRule(rule: unknown): { path: string; message: string }[]
 }
 
 export interface Applied {
-  key: string
   severity: Severity
   color: ColorToken
   title: string
@@ -429,7 +432,7 @@ function present(rule: RuleSpec, ctx: Ctx, warnings: string[]): Applied {
   const fsev = ctx.fields.severity as Severity
   const severity = rule.severity ?? (SEVERITIES.includes(fsev) ? fsev : 'warning')
   const color = rule.present.color && COLORS.includes(rule.present.color) ? rule.present.color : 'grey'
-  return { key: dedup_key.length ? dedup_key.join('|') : title, severity, color, title, body, fields, dedup_key }
+  return { severity, color, title, body, fields, dedup_key }
 }
 
 /** Dedup identity only (no rendering): used to route recovery signals. */
@@ -460,17 +463,21 @@ export function recovers(rule: RuleSpec, ctx: Ctx): boolean {
 }
 
 /** `POST /api/rules/test`: zero writes, zero dispatches. */
-export function testRule(rule: RuleSpec, event: unknown, source = 'http:test'): RuleTestResult {
+export function testRule(rule: unknown, event: unknown, source = 'http:test'): RuleTestResult {
   const ctx = context(event, source)
-  const errors = validateRule(rule)
+  const parsed = parseRuleStructure(rule)
+  if ('problem' in parsed)
+    return { matched: false, schema: ctx.schema, fields: ctx.fields, nodes: [], card: null, warnings: [], errors: [parsed.problem] }
+  const draft = parsed.rule
+  const errors = validateRuleSemantics(draft)
   const nodes: NodeDiagnostic[] = []
   const warnings: string[] = []
   let matched = false
   let card: RuleTestResult['card'] = null
   const condOk = !errors.some((e) => e.path === 'when' || e.path.startsWith('when.'))
-  if (condOk) matched = evaluate(rule.when, ctx, '', nodes)
-  if (isObj(rule.present) && typeof rule.present.title === 'string') {
-    const a = present(rule, ctx, warnings)
+  if (condOk) matched = evaluate(draft.when, ctx, '', nodes)
+  if (!errors.some((e) => e.path.startsWith('present.'))) {
+    const a = present(draft, ctx, warnings)
     card = { title: a.title, body: a.body, severity: a.severity, color: a.color, fields: a.fields, dedup_key: a.dedup_key }
   }
   return { matched, schema: ctx.schema, fields: ctx.fields, nodes, card, warnings: [...new Set(warnings)], errors }

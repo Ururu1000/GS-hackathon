@@ -219,7 +219,7 @@ export function NoiseEditor({ rule, onChange, env }: { rule: RuleSpec; onChange:
     <div className="stack">
       <div className="form-field">
         <span className="label">Same alert when these match</span>
-        <PathList value={dedup.key} onChange={(key) => onChange({ ...rule, dedup: { ...dedup, key } })} env={env} label="Dedup key" />
+        <PathList value={dedup.key ?? []} onChange={(key) => onChange({ ...rule, dedup: { ...dedup, key } })} env={env} label="Dedup key" />
         <div className="inline">
           <span className="small muted">and it happened again within</span>
           <input className="input w-sm" value={dedup.window} onChange={(e) => onChange({ ...rule, dedup: { ...dedup, window: e.target.value } })} aria-label="Dedup window" placeholder="10m" />
@@ -234,10 +234,10 @@ export function NoiseEditor({ rule, onChange, env }: { rule: RuleSpec; onChange:
         </label>
         {rule.group && (
           <div className="stack tight indent">
-            <PathList value={rule.group.by} onChange={(by) => onChange({ ...rule, group: { ...rule.group!, by } })} env={env} label="Group by" />
+            <PathList value={rule.group.by ?? []} onChange={(by) => onChange({ ...rule, group: { ...rule.group!, by } })} env={env} label="Group by" />
             <div className="inline">
               <span className="small muted">every</span>
-              <input className="input w-sm" value={String(rule.group.window)} onChange={(e) => onChange({ ...rule, group: { ...rule.group!, window: e.target.value } })} aria-label="Digest window" />
+              <input className="input w-sm" value={String(rule.group.window ?? 0)} onChange={(e) => onChange({ ...rule, group: { ...rule.group!, window: e.target.value } })} aria-label="Digest window" />
             </div>
           </div>
         )}

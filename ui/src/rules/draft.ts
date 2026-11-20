@@ -1,8 +1,9 @@
 // Pure helpers for the rule editor: condition-tree edits by node address, YAML
 // round-tripping, path suggestions, starting templates and sample events.
 
-import { Document, isScalar, parseDocument, visit, YAMLMap, YAMLSeq } from 'yaml'
+import { Document, isScalar, LineCounter, parseDocument, visit, YAMLMap, YAMLSeq } from 'yaml'
 import type { Condition, CondOp, Leaf, RuleSpec, Scalar } from '../api/types'
+import { parseRuleStructure } from './structure'
 
 // ---- condition tree ----------------------------------------------------------
 
@@ -180,46 +181,35 @@ function hasForbiddenKey(v: unknown, depth = 0): string | null {
   return null
 }
 
-function isConditionShape(c: unknown, depth = 0): boolean {
-  if (depth > 12 || c === null || typeof c !== 'object' || Array.isArray(c)) return false
-  const o = c as Record<string, unknown>
-  if ('all' in o) return Array.isArray(o.all) && o.all.every((x) => isConditionShape(x, depth + 1))
-  if ('any' in o) return Array.isArray(o.any) && o.any.every((x) => isConditionShape(x, depth + 1))
-  if ('not' in o) return isConditionShape(o.not, depth + 1)
-  return typeof o.path === 'string' && typeof o.op === 'string'
-}
-
 export function fromYaml(text: string): YamlResult {
   if (text.length > MAX_YAML_CHARS)
     return { ok: false, message: `YAML is too large (max ${MAX_YAML_CHARS} bytes)`, line: 1, col: 1 }
-  const doc = parseDocument(text, { prettyErrors: true, uniqueKeys: true })
+  const lineCounter = new LineCounter()
+  const doc = parseDocument(text, { prettyErrors: true, uniqueKeys: true, lineCounter })
   const e = doc.errors[0]
   if (e) {
     const pos = e.linePos?.[0]
     return { ok: false, message: e.message.split('\n')[0]!.replace(/ at line \d+, column \d+:?$/, ''), line: pos?.line ?? null, col: pos?.col ?? null }
   }
-  let v: unknown
+  let value: unknown
   try {
-    v = doc.toJS({ maxAliasCount: 50 }) as unknown
-  } catch (err) {
-    return { ok: false, message: err instanceof Error ? err.message : 'Invalid YAML', line: 1, col: 1 }
+    value = doc.toJS({ maxAliasCount: 50 })
+    JSON.stringify(value)
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Could not read YAML'
+    return { ok: false, message, line: null, col: null }
   }
-  if (v === null || typeof v !== 'object' || Array.isArray(v))
-    return { ok: false, message: 'A rule is a mapping (id:, team:, when:, …)', line: 1, col: 1 }
-  const badKey = hasForbiddenKey(v)
+  const badKey = hasForbiddenKey(value)
   if (badKey) return { ok: false, message: `Forbidden key \`${badKey}\``, line: null, col: null }
-  const r = v as Partial<RuleSpec>
-  for (const k of ['id', 'team', 'when', 'route', 'present'] as const)
-    if (r[k] === undefined) return { ok: false, message: `Missing \`${k}:\``, line: null, col: null }
-  if (typeof r.id !== 'string' || typeof r.team !== 'string')
-    return { ok: false, message: '`id` and `team` must be strings', line: null, col: null }
-  if (!isConditionShape(r.when))
-    return { ok: false, message: '`when` must be a condition object (all/any/not or path+op)', line: null, col: null }
-  if (!Array.isArray(r.route) || !r.route.every((x) => x !== null && typeof x === 'object' && typeof (x as { to?: unknown }).to === 'string'))
-    return { ok: false, message: '`route` must be a list of { to: ... } entries', line: null, col: null }
-  if (r.present === null || typeof r.present !== 'object' || Array.isArray(r.present) || typeof (r.present as { title?: unknown }).title !== 'string')
-    return { ok: false, message: '`present` must be an object with a `title` string', line: null, col: null }
-  return { ok: true, rule: r as RuleSpec }
+  const parsed = parseRuleStructure(value)
+  if ('rule' in parsed) return { ok: true, rule: parsed.rule }
+  const { path, message } = parsed.problem
+  if (path === '') return { ok: false, message: 'A rule is a mapping (id:, team:, when:, …)', line: 1, col: 1 }
+  const segments = path.split('.').map((segment) => /^\d+$/.test(segment) ? Number(segment) : segment)
+  const node = doc.getIn(segments, true) ?? doc.getIn(segments.slice(0, -1), true)
+  const offset = node instanceof Object && 'range' in node && Array.isArray(node.range) ? node.range[0] : null
+  const pos = typeof offset === 'number' ? lineCounter.linePos(offset) : null
+  return { ok: false, message: `${path} ${message}`, line: pos?.line ?? null, col: pos?.col ?? null }
 }
 
 // ---- misc ------------------------------------------------------------------------------

@@ -46,26 +46,32 @@ export function TestPanel({ rule, team, initialSample, onResult, onToast }: Prop
   }
   const eventKey = parsed.ok ? JSON.stringify(parsed.value) : null
   const ruleKey = JSON.stringify(rule)
+  const eventSource = source || 'http:playground'
+  const wouldAlert = rule.enabled !== false && result?.matched === true
 
   useEffect(() => {
     recentEvents(20, team).then(setRecent, () => setRecent([]))
   }, [team])
 
   useEffect(() => {
+    const my = ++seq.current
     if (eventKey === null) {
+      setBusy(false)
+      setResult(null)
+      setFailure(null)
       onResult(null, null)
       return
     }
     const ctl = new AbortController()
-    const my = ++seq.current
     setBusy(true)
     const t = setTimeout(() => {
-      testRule(rule, JSON.parse(eventKey), ctl.signal)
+      const event: unknown = JSON.parse(eventKey)
+      testRule({ rule, event, source: eventSource }, ctl.signal)
         .then((r) => {
           if (my !== seq.current) return
           setResult(r)
           setFailure(null)
-          onResult(r, JSON.parse(eventKey))
+          onResult(r, event)
         })
         .catch((e: unknown) => {
           if (ctl.signal.aborted || my !== seq.current) return
@@ -78,7 +84,7 @@ export function TestPanel({ rule, team, initialSample, onResult, onToast }: Prop
       ctl.abort()
     }
     // `rule` is covered by ruleKey; onResult is stable in the editor.
-  }, [ruleKey, eventKey])
+  }, [ruleKey, eventKey, eventSource, onResult])
 
   const pick = (v: string) => {
     setPicked(v)
@@ -98,11 +104,10 @@ export function TestPanel({ rule, team, initialSample, onResult, onToast }: Prop
   }
 
   const send = async () => {
-    if (!parsed.ok) return
-    const targetSource = ALLOWED_SOURCES.includes(source) ? source : 'http:playground'
+    if (!parsed.ok || !ALLOWED_SOURCES.includes(eventSource)) return
     setSending(true)
     try {
-      const r = await ingest(targetSource, parsed.value)
+      const r = await ingest(eventSource, parsed.value)
       onToast(r.matched_alerts.length ? 'ok' : 'warn', r.matched_alerts.length ? `Sent. It reached ${r.matched_alerts.length} alert${r.matched_alerts.length === 1 ? '' : 's'} in the feed.` : 'Sent. No published rule matched it.')
     } catch (e) {
       onToast('error', errorText(e))
@@ -154,15 +159,17 @@ export function TestPanel({ rule, team, initialSample, onResult, onToast }: Prop
 
       {parsed.ok && result && (
         <div className="test-result" aria-live="polite">
-          <div className={`verdict ${result.matched ? 'is-match' : 'is-miss'}`}>
-            <strong>{result.matched ? 'This rule would raise an alert' : 'No alert: the conditions don’t match'}</strong>
+          <div className={`verdict ${wouldAlert ? 'is-match' : 'is-miss'}`}>
+            <strong>{rule.enabled === false
+              ? 'No alert: this rule is disabled'
+              : wouldAlert ? 'This rule would raise an alert' : 'No alert: the conditions don’t match'}</strong>
             <span className="muted small">
               Detected as <code>{result.schema}</code>
             </span>
           </div>
 
           {result.card && (
-            <div className={`card-preview tok-${colorToken(result.card.color)} ${result.matched ? '' : 'is-dim'}`}>
+            <div className={`card-preview tok-${colorToken(result.card.color)} ${wouldAlert ? '' : 'is-dim'}`}>
               <div className="card-preview-top">
                 <SeverityBadge severity={result.card.severity} withLabel />
               </div>
@@ -224,12 +231,13 @@ export function TestPanel({ rule, team, initialSample, onResult, onToast }: Prop
       )}
 
       <div className="inline send-row">
-        <select className="select mono grow" value={ALLOWED_SOURCES.includes(source) ? source : 'http:playground'} onChange={(e) => setSource(e.target.value)} aria-label="Source" title="Allowed playground source">
+        <select className="select mono grow" value={eventSource} onChange={(e) => setSource(e.target.value)} aria-label="Source" title="Allowed playground source">
+          {!ALLOWED_SOURCES.includes(eventSource) && <option value={eventSource} disabled>{eventSource} (test only)</option>}
           {ALLOWED_SOURCES.map((s) => (
             <option key={s} value={s}>{s}</option>
           ))}
         </select>
-        <button type="button" className="btn" disabled={!parsed.ok || sending} onClick={() => void send()} title="Ingest this event for real (uses the published rules, not this draft)">
+        <button type="button" className="btn" disabled={!parsed.ok || sending || !ALLOWED_SOURCES.includes(eventSource)} onClick={() => void send()} title="Ingest this event for real (uses the published rules, not this draft)">
           {sending ? 'Sending…' : 'Send to the feed'}
         </button>
       </div>

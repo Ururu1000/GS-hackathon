@@ -11,6 +11,7 @@ import type {
   RecentEvent,
   RuleItem,
   RuleSpec,
+  RuleTestRequest,
   RuleTestResult,
   RunbookSummary,
   Session,
@@ -160,8 +161,8 @@ export const updateRule = (rule: RuleSpec, expectedRevision: number) =>
   put<RuleItem>(`/api/rules/${enc(rule.id)}`, { rule, expected_revision: expectedRevision })
 export const deleteRule = (id: string, expectedRevision: number) =>
   request<{ deleted: string }>(`/api/rules/${enc(id)}?expected_revision=${expectedRevision}`, { method: 'DELETE' })
-export const testRule = (rule: RuleSpec, event: unknown, signal?: AbortSignal) =>
-  post<RuleTestResult>('/api/rules/test', { rule, event }, signal)
+export const testRule = (body: RuleTestRequest, signal?: AbortSignal) =>
+  post<RuleTestResult>('/api/rules/test', body, signal)
 export const listRunbooks = () => request<{ items: RunbookSummary[] }>('/api/runbooks').then((r) => r.items)
 export const recentEvents = (limit = 20, team?: string | null) => {
   const qs = new URLSearchParams({ limit: String(limit) })

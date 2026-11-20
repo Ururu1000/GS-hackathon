@@ -98,7 +98,7 @@ export function Runbook({ runbook: rb, alert, now, onChanged, onToast }: Props) 
   )
 }
 
-const RUN_TEXT: Record<Execution['state'], string> = { queued: 'Queued', running: 'Running…', ok: 'Done', failed: 'Failed', uncertain: 'Outcome unknown' }
+const RUN_TEXT: Record<Execution['state'], string> = { queued: 'Queued', running: 'Running…', ok: 'Done', failed: 'Failed', uncertain: 'Outcome unknown', cancelled: 'Cancelled' }
 
 function Step({ step: s, n, now, closed, busy, onRun, onCheck, onDecide }: {
   step: RunbookStep

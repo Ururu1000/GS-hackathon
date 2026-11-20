@@ -5,7 +5,7 @@
 
 import type { ApprovalRequest, Execution, RunbookStep, RunbookView, StepState } from '../src/api/types.ts'
 import { isSensitiveKey, redactText } from '../src/lib/redact.ts'
-import { render, type Ctx } from './engine.ts'
+import { render, templateErrors, type Ctx } from './engine.ts'
 import type { RunbookDef, RunbookStepDef } from './scenario.ts'
 
 export interface StepRuntime {
@@ -68,22 +68,32 @@ export function stepState(def: RunbookStepDef, rt: RunbookRuntime, now: number):
   return { state: 'idle', disabled_reason }
 }
 
+export function renderActionParams(d: RunbookStepDef, ctx: Ctx) {
+  const invalidParams: string[] = []
+  const params = Object.fromEntries(Object.entries(d.action?.params ?? {}).map(([key, template]) => {
+    const warnings = templateErrors(template)
+    const value = render(template, ctx, warnings, { requireScalar: true })
+    if (warnings.length || !value.trim()) invalidParams.push(key)
+    return [key, value]
+  }))
+  return { params, invalidParams }
+}
+
 export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewer: string, now = Date.now()): RunbookView {
   const steps: RunbookStep[] = def.steps.map((d) => {
     const s = rt.get(d.id)
     const { state, disabled_reason } = stepState(d, rt, now)
+    const { params, invalidParams } = renderActionParams(d, ctx)
     const last = s?.approvals.length ? expire(s.approvals[s.approvals.length - 1]!, now) : null
     return {
       id: d.id,
       kind: d.kind,
       text: render(d.text, ctx),
       hint: d.hint ?? null,
-      action: d.action
-        ? { ...d.action, params: Object.fromEntries(Object.entries(d.action.params).map(([k, v]) => [k, sanitizeParam(k, render(v, ctx))])) }
-        : null,
+      action: d.action ? { ...d.action, params: Object.fromEntries(Object.entries(params).map(([key, value]) => [key, sanitizeParam(key, value)])) } : null,
       approval: d.approval ?? 'none',
       state,
-      disabled_reason,
+      disabled_reason: invalidParams.length ? `Missing or invalid action parameters: ${invalidParams.join(', ')}` : disabled_reason,
       done_by: s?.done_by ?? null,
       done_at: s?.done_at ?? null,
       runs: s?.runs ?? [],

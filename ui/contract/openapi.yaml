@@ -57,7 +57,8 @@ info:
     ## Config writes (rules, preferences, teams)
     Every config object carries a `revision`. Writes send it back as
     `expected_revision` and get `409 revision_conflict` (with `error.current`,
-    the object as it is now) if someone else saved first. Validation failures
+    the object as it is now) if someone else saved first. A recreated rule
+    gets a higher revision than the deleted rule with the same ID. Validation failures
     are `422 invalid` with `error.details: [{path, message}]`, where `path` is
     a dotted path into the submitted object (`when.all.0.value`). Spec §4.6:
     API edits and YAML imports go through one validator. Until config moves to
@@ -660,7 +661,7 @@ components:
                 params: { type: object, additionalProperties: { type: string }, description: Rendered, secrets redacted }
                 risk: { type: string, enum: [low, high] }
         approval: { type: string, enum: [none, required] }
-        state: { type: string, examples: [idle, done, queued, running, ok, failed, uncertain, awaiting_approval, rejected] }
+        state: { type: string, examples: [idle, done, queued, running, ok, failed, uncertain, cancelled, awaiting_approval, rejected] }
         disabled_reason: { type: [string, 'null'], examples: ['Available after 2 failed retries (1 so far)'] }
         done_by: { type: [string, 'null'] }
         done_at: { oneOf: [ { $ref: '#/components/schemas/Timestamp' }, { type: 'null' } ] }
@@ -671,7 +672,7 @@ components:
       required: [id, state, requested_by, started_at, finished_at, output]
       properties:
         id: { type: string }
-        state: { type: string, enum: [queued, running, ok, failed, uncertain] }
+        state: { type: string, enum: [queued, running, ok, failed, uncertain, cancelled] }
         requested_by: { type: string }
         started_at: { type: [string, 'null'] }
         finished_at: { type: [string, 'null'] }

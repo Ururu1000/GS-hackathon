@@ -105,7 +105,7 @@ export interface TimelineEntry {
 export type RunbookFormat = 'yaml' | 'markdown' | 'link' | 'text'
 
 /** Where a step is. `idle` = not started; `done` = manual step ticked;
- * `queued`/`running`/`ok`/`failed`/`uncertain` follow the latest execution;
+ * `queued`/`running`/`ok`/`failed`/`uncertain`/`cancelled` follow the latest execution;
  * `awaiting_approval`/`rejected` follow the latest approval request. */
 export type StepState =
   | 'idle'
@@ -115,6 +115,7 @@ export type StepState =
   | 'ok'
   | 'failed'
   | 'uncertain'
+  | 'cancelled'
   | 'awaiting_approval'
   | 'rejected'
 
@@ -131,7 +132,7 @@ export interface StepAction {
 
 export interface Execution {
   id: string
-  state: 'queued' | 'running' | 'ok' | 'failed' | 'uncertain'
+  state: 'queued' | 'running' | 'ok' | 'failed' | 'uncertain' | 'cancelled'
   requested_by: string
   started_at: string | null
   finished_at: string | null
@@ -339,8 +340,8 @@ export interface RuleSpec {
     fields?: (FieldSpec | string)[]
     color?: ColorToken
   }
-  dedup?: { key: string[]; window: string }
-  group?: { by: string[]; window: string | number }
+  dedup?: { key?: string[]; window: string }
+  group?: { by?: string[]; window?: string | number }
   throttle?: { max: number; per: string }
   runbook?: string
   auto_resolve?: { recover_when?: Condition; quiet_for?: string }

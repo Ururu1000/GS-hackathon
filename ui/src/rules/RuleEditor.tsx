@@ -2,7 +2,7 @@
 // with the live test panel next to it. Saving is a compare-and-set on the
 // rule's revision.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createRule, deleteRule, errorText, getRule, HttpError, isConflict, listDirectory, listRunbooks, listTeams, updateRule } from '../api/client'
 import { SEVERITIES, type NodeDiagnostic, type PersonDirectoryEntry, type RuleItem, type RuleSpec, type RuleTestResult, type RunbookSummary, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
@@ -17,6 +17,7 @@ interface Props {
   from: string | null
   team: string | null
   onNavigate: (hash: string) => void
+  onDirtyChange: (dirty: boolean) => void
   onToast: (kind: 'ok' | 'warn' | 'error', text: string) => void
 }
 
@@ -24,8 +25,8 @@ type Tab = 'builder' | 'yaml'
 
 const FORMAT_LABEL: Record<string, string> = { yaml: 'steps', markdown: 'Markdown page', link: 'wiki link', text: 'notes' }
 
-export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
-  const isNew = id === 'new'
+export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast }: Props) {
+  const isNew = id === 'new' && from !== null
   const [item, setItem] = useState<RuleItem | null>(null)
   const [draft, setDraft] = useState<RuleSpec | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -33,7 +34,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
   const [people, setPeople] = useState<PersonDirectoryEntry[]>([])
   const [runbooks, setRunbooks] = useState<RunbookSummary[]>([])
   const [tab, setTab] = useState<Tab>('builder')
-  const [yamlText, setYamlText] = useState('')
+  const [yamlText, setYamlText] = useState<string | null>(null)
   const [yamlError, setYamlError] = useState<{ message: string; line: number | null; col: number | null } | null>(null)
   const [test, setTest] = useState<RuleTestResult | null>(null)
   const [testEvent, setTestEvent] = useState<unknown>(null)
@@ -42,6 +43,11 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
   const [saveProblems, setSaveProblems] = useState<{ path: string; message: string }[]>([])
   const [confirmDelete, setConfirmDelete] = useState(false)
   const idTouched = useRef(!isNew)
+  const mounted = useRef(false)
+  useLayoutEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
   // The team scope only seeds a new rule; changing it later doesn't reset the draft.
   const teamRef = useRef(team)
   const template = TEMPLATES.find((t) => t.id === from) ?? TEMPLATES[0]!
@@ -71,13 +77,13 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
     )
   }, [id, isNew, template])
 
-  const dirty = !!draft && (isNew || (item !== null && !ruleEquals(draft, item.rule)))
-  useEffect(() => {
-    if (!dirty) return
-    const on = (e: BeforeUnloadEvent) => e.preventDefault()
-    addEventListener('beforeunload', on)
-    return () => removeEventListener('beforeunload', on)
-  }, [dirty])
+  const savedYaml = useMemo(() => item === null ? null : toYaml(item.rule), [item])
+  const dirty = draft !== null && (isNew || (item !== null &&
+    (!ruleEquals(draft, item.rule) || (yamlText !== null && yamlText !== savedYaml))))
+  useLayoutEffect(() => {
+    onDirtyChange(dirty)
+    return () => onDirtyChange(false)
+  }, [dirty, onDirtyChange])
 
   const onResult = useCallback((r: RuleTestResult | null, ev: unknown) => {
     setTest(r)
@@ -107,13 +113,12 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
     setSaveProblems([])
     if (isNew && !idTouched.current && r.name !== draft.name) r = { ...r, id: slugify(r.name ?? '') || r.id }
     setDraft(r)
+    setYamlText(null)
+    setYamlError(null)
   }
 
   const openTab = (t: Tab) => {
-    if (t === 'yaml') {
-      setYamlText(toYaml(draft))
-      setYamlError(null)
-    }
+    if (t === 'yaml' && yamlText === null) setYamlText(toYaml(draft))
     setTab(t)
   }
 
@@ -126,20 +131,30 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
     } else setYamlError({ message: r.message, line: r.line, col: r.col })
   }
 
+  const loadVersion = (version: RuleItem) => {
+    setItem(version)
+    setDraft(version.rule)
+    setYamlText(toYaml(version.rule))
+    setYamlError(null)
+    setSaveProblems([])
+    setConflict(null)
+  }
+
   const save = async (overwrite?: RuleItem) => {
+    if (yamlError) return
     setSaving(true)
     setSaveProblems([])
     try {
       if (isNew) {
         const created = await createRule(draft)
         onToast('ok', `Created “${created.rule.name || created.rule.id}”. New events are matched right away.`)
-        setItem(created)
-        onNavigate(`#/rules/${encodeURIComponent(created.rule.id)}`)
+        if (mounted.current) {
+          onDirtyChange(false)
+          onNavigate(`#/rules/${encodeURIComponent(created.rule.id)}`)
+        }
       } else {
         const saved = await updateRule(draft, (overwrite ?? item!).revision)
-        setItem(saved)
-        setDraft(saved.rule)
-        setConflict(null)
+        loadVersion(saved)
         onToast('ok', `Saved revision ${saved.revision}. It applies to new events now.`)
       }
     } catch (e) {
@@ -158,16 +173,14 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
     try {
       await deleteRule(item.rule.id, item.revision)
       onToast('ok', `Deleted “${item.rule.name || item.rule.id}”. Its open alerts stay in the feed.`)
-      onNavigate('#/rules')
+      if (mounted.current) {
+        onDirtyChange(false)
+        onNavigate('#/rules')
+      }
     } catch (e) {
       onToast('error', errorText(e))
       setConfirmDelete(false)
     }
-  }
-
-  const back = () => {
-    if (dirty && !confirm('Leave without saving your changes?')) return
-    onNavigate('#/rules')
   }
 
   const blocking = problems.length > 0 || yamlError !== null
@@ -177,7 +190,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
   return (
     <div className="screen rule-editor">
       <header className="screen-head">
-        <button className="btn btn-ghost" onClick={back}>← Rules</button>
+        <button className="btn btn-ghost" onClick={() => onNavigate('#/rules')}>← Rules</button>
         <div className="screen-title">
           <h1>{draft.name || (isNew ? 'New rule' : draft.id)}</h1>
           <span className="muted small">
@@ -200,8 +213,8 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
         <div className="notice notice-warn banner" role="alert">
           <strong>{conflict.updated_by.replace(/^user:/, '')} saved this rule while you were editing (revision {conflict.revision}).</strong>
           <div className="inline">
-            <button className="btn btn-sm" onClick={() => { setItem(conflict); setDraft(conflict.rule); setConflict(null) }}>Load their version</button>
-            <button className="btn btn-sm" onClick={() => void save(conflict)}>Keep mine and overwrite</button>
+            <button className="btn btn-sm" onClick={() => loadVersion(conflict)}>Load their version</button>
+            <button className="btn btn-sm" disabled={saving || blocking} onClick={() => void save(conflict)}>Keep mine and overwrite</button>
           </div>
         </div>
       )}
@@ -215,7 +228,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
 
           {tab === 'yaml' ? (
             <div className="yaml-pane">
-              <textarea className="input mono yaml-input" value={yamlText} onChange={(e) => onYaml(e.target.value)} spellCheck={false} aria-label="Rule as YAML" aria-invalid={!!yamlError || undefined} />
+              <textarea className="input mono yaml-input" value={yamlText ?? ''} onChange={(e) => onYaml(e.target.value)} spellCheck={false} aria-label="Rule as YAML" aria-invalid={!!yamlError || undefined} />
               {yamlError ? (
                 <p className="problems-inline" role="alert">
                   {yamlError.line !== null && <>Line {yamlError.line}{yamlError.col !== null ? `, column ${yamlError.col}` : ''}: </>}
@@ -317,7 +330,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
           {readOnly ? 'Read-only for your account' : !dirty ? 'No unsaved changes' : blocking ? `${problems.length + (yamlError ? 1 : 0)} problem${problems.length + (yamlError ? 1 : 0) === 1 ? '' : 's'} to fix before saving` : 'Unsaved changes'}
         </span>
         <span className="spacer" />
-        {dirty && !isNew && <button className="btn" onClick={() => { setDraft(item!.rule); setYamlText(toYaml(item!.rule)); setYamlError(null) }}>Discard</button>}
+        {dirty && !isNew && !readOnly && <button className="btn" onClick={() => loadVersion(item!)}>Discard</button>}
         <button className="btn btn-primary" disabled={readOnly || !dirty || saving || blocking} onClick={() => void save()}>
           {saving ? 'Saving…' : isNew ? 'Create rule' : 'Save'}
         </button>

@@ -25,8 +25,10 @@ const KINDS: { id: ProposalKind; hint: string }[] = [
 
 export function autoSummary(kind: ProposalKind, base: RuleSpec, next: RuleSpec): string {
   if (kind === 'noisy') {
-    if (next.group && JSON.stringify(next.group) !== JSON.stringify(base.group))
-      return `Send a digest${next.group.by.length ? ` per ${next.group.by.map((p) => p.split('.').pop()).join(', ')}` : ''} every ${next.group.window}`
+    if (next.group && JSON.stringify(next.group) !== JSON.stringify(base.group)) {
+      const groupBy = next.group.by ?? []
+      return `Send a digest${groupBy.length ? ` per ${groupBy.map((p) => p.split('.').pop()).join(', ')}` : ''} every ${next.group.window ?? 0}`
+    }
     if (next.throttle && JSON.stringify(next.throttle) !== JSON.stringify(base.throttle)) return `At most ${next.throttle.max} notifications per ${next.throttle.per} per person`
     if (next.dedup?.window !== base.dedup?.window && next.dedup) return `Merge repeats within ${next.dedup.window}`
     if (JSON.stringify(next.dedup?.key) !== JSON.stringify(base.dedup?.key)) return 'Change what counts as the same alert'

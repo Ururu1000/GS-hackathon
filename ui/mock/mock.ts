@@ -48,12 +48,12 @@ import type {
 import { redactText, redactValue } from '../src/lib/redact.ts'
 import { inWindow, parseWindow, resolveChannels } from '../src/prefs/resolve.ts'
 import { applyRule, context, dedupKey, parseDuration, recovers, testRule, validateRule, type Ctx } from './engine.ts'
-import { failedRuns, runtimeOf, viewRunbook, type RunbookRuntime, type StoredApproval } from './runbooks.ts'
+import { failedRuns, renderActionParams, runtimeOf, viewRunbook, type RunbookRuntime, type StoredApproval } from './runbooks.ts'
 import { deliveriesFor, PEOPLE, randomEvent, RULES, RUNBOOKS, TEAMS, type DeliveryPlan } from './scenario.ts'
 
 interface MockAlert {
   feed: FeedAlert
-  key: string
+  key: string | null
   /** Pinned event context of the opening event (runbook templates use it). */
   ctx: Ctx
   plan: DeliveryPlan
@@ -85,8 +85,6 @@ const env = (k: string, d: number) => {
   return Number.isFinite(v) && process.env[k] !== '' && process.env[k] !== undefined ? v : d
 }
 
-const ME_ID = 'erop'
-const ME = `user:${ME_ID}`
 const SNAPSHOT_LIMIT = 5000
 const MAX_SAMPLES_HEAD = 3
 const RECENT_MAX = 50
@@ -113,7 +111,11 @@ interface StoredRecent {
   teams: Set<string>
 }
 
-export function createMock() {
+export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}) {
+  const demoUser = PEOPLE.find((person) => person.id === demoUserId)
+  if (!demoUser) throw new Error(`Unknown mock user "${demoUserId}"`)
+  const { id: ME_ID, name: demoUserName } = demoUser
+  const ME = `user:${ME_ID}`
   const csrf = process.env.MOCK_CSRF_TOKEN || randomBytes(24).toString('base64url')
   const seed = env('MOCK_SEED', 60)
   const rate = env('MOCK_RATE', 2)
@@ -126,6 +128,7 @@ export function createMock() {
   const active = new Map<string, string>()
   const clients = new Set<Client>()
   const rules = new Map<string, RuleRec>()
+  const deletedRuleRevisions = new Map<string, number>()
   const people = new Map<string, PersonView>(PEOPLE.map((p) => [p.id, clone(p)]))
   const teams = new Map<string, TeamView>(TEAMS.map((t) => [t.id, clone(t)]))
   const proposals = new Map<string, Proposal>()
@@ -201,10 +204,11 @@ export function createMock() {
     for (const rec of rules.values()) {
       const rule = rec.rule
       if (rule.enabled === false) continue
+      const key = dedupKey(rule, ctx)
+      const k = key === null ? null : `${rule.id}|${key}`
       if (recovers(rule, ctx)) {
         matchedTeams.add(rule.team)
-        const k = `${rule.id}|${dedupKey(rule, ctx)}`
-        const a = alerts.get(active.get(k) ?? '')
+        const a = k === null ? undefined : alerts.get(active.get(k) ?? '')
         if (a && a.feed.status !== 'resolved') {
           const prev = transition(a, 'resolved', 'system', 'recovered', at)
           touched.push(a.feed.id)
@@ -217,8 +221,7 @@ export function createMock() {
       matchedTeams.add(rule.team)
       const hour = Math.floor(at.getTime() / HOUR)
       rec.fires.set(hour, (rec.fires.get(hour) ?? 0) + 1)
-      const k = `${rule.id}|${m.key}`
-      const existing = alerts.get(active.get(k) ?? '')
+      const existing = k === null ? undefined : alerts.get(active.get(k) ?? '')
       const window = parseDuration(rule.dedup?.window) ?? 10 * 60_000
       if (existing && at.getTime() - Date.parse(existing.feed.last_seen) <= window) {
         const prev = existing.feed
@@ -234,7 +237,7 @@ export function createMock() {
         continue
       }
       // Outside the window the old alert retires from dedup but stays open.
-      if (existing) active.delete(k)
+      if (k !== null && existing) active.delete(k)
       const id = newId(at.getTime())
       const feed: FeedAlert = {
         id,
@@ -271,7 +274,7 @@ export function createMock() {
         lastDedupNote: at.getTime(),
       }
       alerts.set(id, a)
-      active.set(k, id)
+      if (k !== null) active.set(k, id)
       touched.push(id)
       if (broadcast) publish(a, null)
     }
@@ -285,7 +288,7 @@ export function createMock() {
     if (to === 'acked') Object.assign(next, { acked_by: actor, acked_at: iso })
     if (to === 'resolved') {
       Object.assign(next, { resolved_by: actor, resolved_at: iso, resolved_reason: reason })
-      if (active.get(a.key) === prev.id) active.delete(a.key)
+      if (a.key !== null && active.get(a.key) === prev.id) active.delete(a.key)
     }
     a.feed = next
     a.statusVersion = next.version
@@ -295,7 +298,7 @@ export function createMock() {
 
   function remove(a: MockAlert, reason: RemoveEvent['reason']) {
     alerts.delete(a.feed.id)
-    if (active.get(a.key) === a.feed.id) active.delete(a.key)
+    if (a.key !== null && active.get(a.key) === a.feed.id) active.delete(a.key)
     const rm: RemoveEvent = { id: a.feed.id, version: a.feed.version + 1, reason }
     for (const c of clients) if (visible(c.team, a.feed)) send(c.res, 'alert.remove', rm)
   }
@@ -325,17 +328,25 @@ export function createMock() {
   function execute(a: MockAlert, step: string, actor: string): Execution {
     const d = stepDef(a, step)!
     const rt = runtimeOf(a.runbook, step)
-    const view = viewRunbook(def(a)!, a.ctx, a.runbook, ME).steps.find((s) => s.id === step)!
+    const { params } = renderActionParams(d, a.ctx)
     const ex: Execution = { id: uid('exe'), state: 'queued', requested_by: actor, started_at: null, finished_at: null, output: null }
     rt.runs.push(ex)
     const label = d.action?.label ?? step
     touch(a)
     setTimeout(() => {
+      if (a.feed.status === 'resolved') {
+        ex.state = 'cancelled'
+        ex.finished_at = new Date().toISOString()
+        ex.output = 'Alert resolved before the action started'
+        note(a, 'step_run', 'system', `Cancelled “${label}”: ${ex.output}`)
+        touch(a)
+        return
+      }
       ex.state = 'running'
       ex.started_at = new Date().toISOString()
       touch(a)
       setTimeout(() => {
-        const out = actionOutcome(a, d.action!.name, view.action!.params)
+        const out = actionOutcome(a, d.action!.name, params)
         const safeOut = redactText(out.output, 300)
         ex.state = out.ok ? 'ok' : 'failed'
         ex.output = safeOut
@@ -546,7 +557,7 @@ export function createMock() {
     if (path === '/api/session' && method === 'GET') {
       const allowed = allowedVisibleTeams()
       const session: Session = {
-        user: { id: ME_ID, name: 'erop (demo)' },
+        user: { id: ME_ID, name: demoUserName },
         teams: [...teams.values()].filter((t) => allowed.has(t.id)).map((t) => ({ id: t.id, name: t.name })),
         csrf_token: csrf,
       }
@@ -706,22 +717,25 @@ export function createMock() {
         if (problems.length) return err(res, 422, 'invalid', 'The rule has problems', { details: problems })
         if (!isTeamMember(b.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${b.rule.team}" can create rules for it`)
         if (rules.has(b.rule.id)) return err(res, 409, 'revision_conflict', `A rule with id "${b.rule.id}" already exists`, { current: ruleItem(rules.get(b.rule.id)!) })
-        const rec: RuleRec = { rule: clone(b.rule), revision: 1, updated_at: new Date().toISOString(), updated_by: ME, fires: new Map() }
+        const revision = (deletedRuleRevisions.get(b.rule.id) ?? 0) + 1
+        const rec: RuleRec = { rule: clone(b.rule), revision, updated_at: new Date().toISOString(), updated_by: ME, fires: new Map() }
         rules.set(b.rule.id, rec)
+        deletedRuleRevisions.delete(b.rule.id)
         json(res, 201, ruleItem(rec))
       })
     }
     if ((m = path.match(/^\/api\/rules\/([^/]+)$/))) {
       const id = safeDecode(m[1]!)
       if (id === null) return err(res, 400, 'bad_request', 'Invalid rule id encoding'), true
-      const rec = rules.get(id)
       if (method === 'GET') {
+        const rec = rules.get(id)
         if (!rec) return err(res, 404, 'not_found', 'No such rule'), true
         if (!canSeeTeam(rec.rule.team)) return err(res, 403, 'forbidden', 'You do not have access to this rule'), true
         return json(res, 200, ruleItem(rec)), true
       }
       if (method === 'PUT')
         return write(req, res, (b: RuleWrite) => {
+          const rec = rules.get(id)
           if (!rec) return err(res, 404, 'not_found', 'No such rule')
           if (!isTeamMember(rec.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${rec.rule.team}" can edit this rule`)
           if (b.rule?.id !== id) return err(res, 400, 'bad_request', 'A rule’s id can’t be changed')
@@ -735,11 +749,13 @@ export function createMock() {
         })
       if (method === 'DELETE')
         return write(req, res, () => {
+          const rec = rules.get(id)
           if (!rec) return err(res, 404, 'not_found', 'No such rule')
           if (!isTeamMember(rec.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${rec.rule.team}" can delete this rule`)
           const exp = Number(url.searchParams.get('expected_revision'))
           if (exp !== rec.revision) return err(res, 409, 'revision_conflict', 'This rule changed meanwhile', { current: ruleItem(rec) })
           rules.delete(id)
+          deletedRuleRevisions.set(id, rec.revision)
           json(res, 200, { deleted: id })
         })
     }
@@ -803,10 +819,15 @@ export function createMock() {
           const unknown = members.filter((u) => !people.has(u))
           if (unknown.length) return err(res, 422, 'invalid', `Unknown people: ${unknown.join(', ')}`, { details: [{ path: 'members', message: 'unknown person' }] })
           if (b.lead && !members.includes(b.lead)) return err(res, 422, 'invalid', 'The lead must be a member', { details: [{ path: 'lead', message: 'not a member' }] })
+          const oncall = b.oncall ?? t.oncall
+          const duplicate = Object.keys(oncall).find((schedule) =>
+            [...teams.values()].some((other) => other.id !== t.id && Object.hasOwn(other.oncall, schedule)))
+          if (duplicate !== undefined)
+            return err(res, 422, 'invalid', 'The rotation name is already in use', { details: [{ path: `oncall.${duplicate}`, message: 'belongs to another team' }] })
           Object.assign(t, {
             members,
             lead: b.lead ?? null,
-            oncall: b.oncall ?? t.oncall,
+            oncall,
             default_channels: b.default_channels ?? t.default_channels,
             revision: t.revision + 1,
           })

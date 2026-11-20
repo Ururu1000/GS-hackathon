@@ -68,6 +68,11 @@ describe('YAML', () => {
     if (!r.ok) expect(r.line).not.toBeNull()
   })
 
+  it('keeps malformed nested YAML out of the builder and locates the field', () => {
+    const result = fromYaml('id: example\nteam: sample\nwhen: {path: raw.step, op: exists}\nroute: []\npresent:\n  title: Example\n  fields: raw.step\n')
+    expect(result).toMatchObject({ ok: false, message: 'present.fields must be a list', line: 7 })
+  })
+
   it('rejects documents that are not rules', () => {
     expect(fromYaml('- a\n- b').ok).toBe(false)
     const r = fromYaml('id: x\nteam: y\n')
