@@ -25,7 +25,7 @@ import type {
   TimelineEntry,
   TransitionRequest,
 } from '../src/api/types.ts'
-import { randomEvent, RULES, TEAMS } from './scenario.ts'
+import { deliveriesFor, randomEvent, RULES, TEAMS } from './scenario.ts'
 
 interface MockAlert {
   feed: FeedAlert
@@ -254,7 +254,7 @@ export function createMock() {
     if (m && method === 'GET') {
       const a = alerts.get(decodeURIComponent(m[1]!))
       if (!a) return err(res, 404, 'not_found', 'No such alert'), true
-      const detail: AlertDetail = { ...a.feed, samples: a.samples, runbook: null, deliveries: [], timeline: a.timeline }
+      const detail: AlertDetail = { ...a.feed, samples: a.samples, runbook: null, deliveries: deliveriesFor(a.feed), timeline: a.timeline }
       json(res, 200, detail)
       return true
     }

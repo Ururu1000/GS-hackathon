@@ -109,11 +109,24 @@ export interface RunbookView {
   steps: unknown[]
 }
 
-/** Placeholder until delivery lands (M4). */
+/** `cancelled`: the alert was acked/resolved before the send. Unknown states
+ * render generically. */
+export type DeliveryState = 'pending' | 'in_flight' | 'sent' | 'cancelled' | 'dead'
+
+/** One row of `delivery_jobs` for this alert (proposed by delivery, board #63).
+ * Channels are an open set (`email`, `sms`, `phone`, `ui`, …). */
 export interface DeliveryStatus {
+  /** Delivery job id. */
+  id: string
+  /** `user:<id>` after team/on-call expansion. */
   recipient: string
   channel: string
-  state: string
+  /** Where it was sent: email address, phone number… */
+  address: string
+  state: DeliveryState | (string & {})
+  attempts: number
+  last_error: string | null
+  sent_at: string | null
   updated_at: string
 }
 
@@ -122,7 +135,7 @@ export interface AlertDetail extends FeedAlert {
   samples: EventSample[]
   /** Null until runbooks ship. */
   runbook: RunbookView | null
-  /** Empty until delivery ships. */
+  /** Delivery jobs for this alert, any order; the UI sorts them. */
   deliveries: DeliveryStatus[]
   timeline: TimelineEntry[]
 }

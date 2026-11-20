@@ -238,6 +238,17 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
 .sample summary { padding: 6px 10px; cursor: pointer; }
 .sample pre { margin: 0; padding: 10px; overflow-x: auto; background: var(--bg-2); border-top: 1px solid var(--line); }
 
+.small { font-size: 12px; }
+.err-text { color: var(--err); }
+.deliveries { width: 100%; border-collapse: collapse; font-size: 13px; }
+.deliveries th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+.deliveries td { padding: 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.dstate { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+.dstate-sent { color: var(--ok); }
+.dstate-pending, .dstate-in_flight { color: var(--warn); }
+.dstate-dead { color: var(--err); border-color: var(--err); }
+.dstate-cancelled { color: var(--muted); }
+
 /* ---- toasts / modal --------------------------------------------------------- */
 .toasts { position: fixed; right: 16px; bottom: 40px; display: grid; gap: 8px; z-index: 20; max-width: 420px; }
 .toast {

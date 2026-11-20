@@ -285,12 +285,23 @@ components:
         steps: { type: array, items: {} }
     DeliveryStatus:
       type: object
-      description: Placeholder until M4 (delivery).
-      required: [recipient, channel, state, updated_at]
+      description: |
+        One `delivery_jobs` row for the alert (proposed by delivery, board #63);
+        beacon-api reads them with one SELECT ... WHERE alert_id. `cancelled`
+        means the alert was acked/resolved before the send. Channels and states
+        are open sets; clients render unknown values generically.
+      required: [id, recipient, channel, address, state, attempts, last_error, sent_at, updated_at]
       properties:
-        recipient: { type: string }
-        channel: { type: string }
-        state: { type: string }
+        id: { type: string, description: Delivery job id }
+        recipient: { type: string, examples: ['user:anna'] }
+        channel: { type: string, examples: [email, sms, phone, ui] }
+        address: { type: string, examples: [anna@example.test, '+44 7700 900123'] }
+        state:
+          type: string
+          examples: [pending, in_flight, sent, cancelled, dead]
+        attempts: { type: integer, minimum: 0 }
+        last_error: { type: [string, 'null'] }
+        sent_at: { oneOf: [ { $ref: '#/components/schemas/Timestamp' }, { type: 'null' } ] }
         updated_at: { $ref: '#/components/schemas/Timestamp' }
     AlertDetail:
       allOf:
