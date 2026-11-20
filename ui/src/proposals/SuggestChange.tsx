@@ -2,8 +2,8 @@
 // rule's current revision, for the rule's team to accept or reject.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { createProposal, errorText, getRule, HttpError, listPeople, listTeams } from '../api/client'
-import type { EventSample, FeedAlert, PersonView, ProposalKind, RuleItem, RuleSpec, TeamView } from '../api/types'
+import { createProposal, errorText, getRule, HttpError, listDirectory, listTeams } from '../api/client'
+import type { EventSample, FeedAlert, PersonDirectoryEntry, ProposalKind, RuleItem, RuleSpec, TeamView } from '../api/types'
 import { flattenPaths, ruleEquals, toYaml } from '../rules/draft'
 import { NoiseEditor, PresentEditor, RouteEditor, type EditorEnv } from '../rules/sections'
 import { KIND_LABEL, RuleDiff } from './ProposalsScreen'
@@ -49,7 +49,7 @@ export function SuggestChange({ alert, samples, onClose, onToast, onNavigate }: 
   const [item, setItem] = useState<RuleItem | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [teams, setTeams] = useState<TeamView[]>([])
-  const [people, setPeople] = useState<PersonView[]>([])
+  const [people, setPeople] = useState<PersonDirectoryEntry[]>([])
   const [kind, setKind] = useState<ProposalKind>('noisy')
   const [draft, setDraft] = useState<RuleSpec | null>(null)
   const [summary, setSummary] = useState('')
@@ -67,7 +67,7 @@ export function SuggestChange({ alert, samples, onClose, onToast, onNavigate }: 
       (e: unknown) => setError(errorText(e)),
     )
     listTeams().then(setTeams, () => {})
-    listPeople().then(setPeople, () => {})
+    listDirectory().then(setPeople, () => {})
   }, [alert.rule.id])
 
   useEffect(() => {
@@ -141,11 +141,12 @@ export function SuggestChange({ alert, samples, onClose, onToast, onNavigate }: 
 
             <div className="form-field">
               <label htmlFor="sg-summary">In one line</label>
-              <input id="sg-summary" className="input" value={summary} onChange={(e) => { summaryTouched.current = true; setSummary(e.target.value) }} placeholder="What should change" />
+              <input id="sg-summary" className="input" maxLength={200} value={summary} onChange={(e) => { summaryTouched.current = true; setSummary(e.target.value) }} placeholder="What should change" />
             </div>
             <div className="form-field">
               <label htmlFor="sg-note">Why <span className="muted">(optional{kind === 'other' ? ' if you changed the rule' : ''})</span></label>
-              <textarea id="sg-note" className="input" rows={3} value={note} onChange={(e) => setNote(e.target.value)} placeholder="This fired 30 times during the deploy window and nobody needed to act." />
+              <textarea id="sg-note" className="input" rows={3} maxLength={4000} value={note} onChange={(e) => setNote(e.target.value)} placeholder="This fired 30 times during the deploy window and nobody needed to act." />
+              <p className="hint">Visible to reviewers on the rule’s team. Do not paste personal data or secrets.</p>
             </div>
 
             {changed && (

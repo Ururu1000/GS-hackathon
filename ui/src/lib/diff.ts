@@ -1,12 +1,26 @@
-// Line diff (LCS) for proposal previews. Rules are small, so O(n·m) is fine.
+// Line diff (LCS) for proposal previews. Bounded to prevent O(n·m) DoS on huge inputs.
 
 export type DiffLine = { op: ' ' | '+' | '-'; text: string }
+
+const MAX_LCS_CELLS = 250_000
 
 export function diffLines(a: string, b: string): DiffLine[] {
   const x = a.split('\n')
   const y = b.split('\n')
   const n = x.length
   const m = y.length
+  if (n * m > MAX_LCS_CELLS) {
+    const out: DiffLine[] = []
+    const max = Math.max(n, m)
+    for (let i = 0; i < max; i++) {
+      if (i < n && i < m && x[i] === y[i]) out.push({ op: ' ', text: x[i]! })
+      else {
+        if (i < n) out.push({ op: '-', text: x[i]! })
+        if (i < m) out.push({ op: '+', text: y[i]! })
+      }
+    }
+    return out
+  }
   const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0))
   for (let i = n - 1; i >= 0; i--)
     for (let j = m - 1; j >= 0; j--) lcs[i]![j] = x[i] === y[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!)

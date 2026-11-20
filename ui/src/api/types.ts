@@ -147,10 +147,10 @@ export interface ApprovalRequest {
   expires_at: string
   /** `user:<id>` who may decide. */
   eligible: string[]
-  /** Whether the session user is one of `eligible`. */
+  /** Whether the session user is eligible to decide (and not barred by self-approval). */
   can_decide: boolean
-  /** SMS challenge code if the request was also sent by SMS ("Y 4821"). */
-  sms_code: string | null
+  /** Whether an out-of-band SMS challenge was dispatched to eligible approvers (plaintext code is never returned). */
+  sms_sent?: boolean
   decided_by: string | null
   decided_at: string | null
   note: string | null
@@ -201,7 +201,7 @@ export interface DeliveryStatus {
   /** `user:<id>` after team/on-call expansion. */
   recipient: string
   channel: string
-  /** Where it was sent: email address, phone number… */
+  /** Masked destination (e.g. `a***@example.test`, `+44 •••• ••0123`) to avoid broadcasting personal contact PII. */
   address: string
   state: DeliveryState | (string & {})
   attempts: number
@@ -211,7 +211,7 @@ export interface DeliveryStatus {
 }
 
 export interface AlertDetail extends FeedAlert {
-  /** First N and latest matching events (raw, untouched payloads). */
+  /** First N and latest matching events (secrets and PII redacted server-side). */
   samples: EventSample[]
   /** The runbook selected for this alert, with per-step state, or null. */
   runbook: RunbookView | null
@@ -365,6 +365,8 @@ export interface RuleItem {
   updated_at: string
   updated_by: string
   stats: RuleStats
+  /** Whether the session user may edit or delete this rule. */
+  can_edit?: boolean
 }
 
 export interface RuleWrite {
@@ -448,13 +450,23 @@ export type Preference =
   | { match: PreferenceMatch; channels: string[]; when?: TimeWindow; otherwise?: string[] }
   | { default: string[] }
 
+export interface PersonDirectoryEntry {
+  id: string
+  name: string
+  teams: string[]
+}
+
 export interface PersonView {
   id: string
   name: string
+  /** Omitted or masked for users other than the session user unless authorized. */
   contact: { email?: string; phone?: string }
   teams: string[]
+  /** Empty/redacted for users other than the session user unless authorized. */
   preferences: Preference[]
   revision: number
+  /** Whether the session user may view/edit this person's contact details and preferences. */
+  can_edit?: boolean
 }
 
 export interface TeamView {
@@ -467,6 +479,8 @@ export interface TeamView {
   /** Step 3 of routing precedence; omitted/empty = `[ui]`. */
   default_channels: string[]
   revision: number
+  /** Whether the session user (team lead or admin) may modify this team. */
+  can_edit?: boolean
 }
 
 export const CHANNELS = ['phone', 'sms', 'email', 'ui'] as const
@@ -497,6 +511,8 @@ export interface Proposal {
   state: ProposalState
   decided_by: string | null
   decided_at: string | null
+  /** Whether the session user (owning team member or admin) may accept or reject this proposal. */
+  can_review?: boolean
 }
 
 export interface ProposalCreate {

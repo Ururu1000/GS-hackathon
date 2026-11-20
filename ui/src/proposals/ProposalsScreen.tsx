@@ -50,17 +50,19 @@ export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Pr
   const [show, setShow] = useState<'pending' | 'all'>('pending')
   const [busy, setBusy] = useState<string | null>(null)
 
-  const load = () => listProposals().then(setItems, (e: unknown) => setError(errorText(e)))
+  const load = () => listProposals(team).then(setItems, (e: unknown) => setError(errorText(e)))
   useEffect(() => {
+    setItems(null)
+    setError(null)
     void load()
-  }, [])
+  }, [team])
 
   useEffect(() => {
     if (!id || !items) return
     document.getElementById(`proposal-${id}`)?.scrollIntoView({ block: 'start' })
   }, [id, items])
 
-  const scoped = (items ?? []).filter((p) => !team || p.base_rule.team === team)
+  const scoped = items ?? []
   const shown = scoped.filter((p) => show === 'all' || p.state === 'pending' || p.id === id)
   const pending = scoped.filter((p) => p.state === 'pending').length
 
@@ -120,9 +122,19 @@ export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Pr
             {p.state === 'stale' && <p className="small muted">The rule changed after this was written (it was against revision {p.base_revision}). Suggest it again on the current rule if it still applies.</p>}
             {p.state === 'pending' && (
               <div className="inline end">
-                <button className="btn" disabled={busy === p.id} onClick={() => void decide(p, 'reject')}>Reject</button>
-                <button className="btn" onClick={() => onNavigate(`#/rules/${encodeURIComponent(p.rule_id)}`)}>Open rule</button>
-                <button className="btn btn-primary" disabled={busy === p.id} onClick={() => void decide(p, 'accept')}>{busy === p.id ? 'Publishing…' : 'Accept and publish'}</button>
+                {p.can_review === false ? (
+                  <>
+                    <span className="small muted">Only members of the owning team can review this proposal.</span>
+                    <span className="spacer" />
+                    <button className="btn" onClick={() => onNavigate(`#/rules/${encodeURIComponent(p.rule_id)}`)}>Open rule</button>
+                  </>
+                ) : (
+                  <>
+                    <button className="btn" disabled={busy === p.id} onClick={() => void decide(p, 'reject')}>Reject</button>
+                    <button className="btn" onClick={() => onNavigate(`#/rules/${encodeURIComponent(p.rule_id)}`)}>Open rule</button>
+                    <button className="btn btn-primary" disabled={busy === p.id} onClick={() => void decide(p, 'accept')}>{busy === p.id ? 'Publishing…' : 'Accept and publish'}</button>
+                  </>
+                )}
               </div>
             )}
           </article>

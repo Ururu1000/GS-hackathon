@@ -4,6 +4,7 @@
 // next to the alert they bump.
 
 import type { ApprovalRequest, Execution, RunbookStep, RunbookView, StepState } from '../src/api/types.ts'
+import { isSensitiveKey, redactText } from '../src/lib/redact.ts'
 import { render, type Ctx } from './engine.ts'
 import type { RunbookDef, RunbookStepDef } from './scenario.ts'
 
@@ -11,7 +12,12 @@ export interface StepRuntime {
   done_by: string | null
   done_at: string | null
   runs: Execution[]
-  approvals: ApprovalRequest[]
+  approvals: StoredApproval[]
+}
+
+export interface StoredApproval extends ApprovalRequest {
+  /** SHA-256 hash of the out-of-band SMS challenge (never serialized to API responses). */
+  sms_code_hash?: string | null
 }
 
 export type RunbookRuntime = Map<string, StepRuntime>
@@ -26,8 +32,21 @@ export const failedRuns = (rt: RunbookRuntime, step: string) =>
   (rt.get(step)?.runs ?? []).filter((r) => r.state === 'failed').length
 
 /** Pending requests past their expiry read as expired. */
-export function expire(a: ApprovalRequest, now: number): ApprovalRequest {
+export function expire(a: StoredApproval, now: number): StoredApproval {
   return a.state === 'pending' && Date.parse(a.expires_at) <= now ? { ...a, state: 'expired' } : a
+}
+
+function sanitizeParam(key: string, val: string): string {
+  if (isSensitiveKey(key)) return '[REDACTED]'
+  return redactText(val.replace(/[\r\n]+/g, ' '), 240)
+}
+
+function publicApproval(a: StoredApproval, viewer: string): ApprovalRequest {
+  const { sms_code_hash: _hash, ...rest } = a
+  return {
+    ...rest,
+    can_decide: rest.eligible.includes(viewer) && rest.requested_by !== viewer,
+  }
 }
 
 export function stepState(def: RunbookStepDef, rt: RunbookRuntime, now: number): { state: StepState; disabled_reason: string | null } {
@@ -60,7 +79,7 @@ export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewe
       text: render(d.text, ctx),
       hint: d.hint ?? null,
       action: d.action
-        ? { ...d.action, params: Object.fromEntries(Object.entries(d.action.params).map(([k, v]) => [k, render(v, ctx)])) }
+        ? { ...d.action, params: Object.fromEntries(Object.entries(d.action.params).map(([k, v]) => [k, sanitizeParam(k, render(v, ctx))])) }
         : null,
       approval: d.approval ?? 'none',
       state,
@@ -68,7 +87,7 @@ export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewe
       done_by: s?.done_by ?? null,
       done_at: s?.done_at ?? null,
       runs: s?.runs ?? [],
-      approval_request: last ? { ...last, can_decide: last.eligible.includes(viewer) } : null,
+      approval_request: last ? publicApproval(last, viewer) : null,
     }
   })
   return { id: def.id, revision: 1, title: def.title, format: def.format, url: def.url ?? null, text: def.text ?? null, steps }

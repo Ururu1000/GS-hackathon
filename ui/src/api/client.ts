@@ -2,10 +2,12 @@ import type {
   AlertDetail,
   ApiError,
   FeedAlert,
+  PersonDirectoryEntry,
   PersonView,
   Preference,
   Proposal,
   ProposalCreate,
+  ProposalState,
   RecentEvent,
   RuleItem,
   RuleSpec,
@@ -20,6 +22,12 @@ import type {
 export const API_BASE: string = import.meta.env.VITE_API_BASE ?? ''
 
 let csrfToken: string | null = null
+let sessionPromise: Promise<Session> | null = null
+
+export function resetSessionCache() {
+  csrfToken = null
+  sessionPromise = null
+}
 
 export class HttpError extends Error {
   readonly status: number
@@ -31,8 +39,20 @@ export class HttpError extends Error {
   }
 }
 
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const write = init?.method !== undefined && init.method !== 'GET'
+async function ensureCsrf(): Promise<string | null> {
+  if (csrfToken) return csrfToken
+  try {
+    const s = await getSession()
+    return s.csrf_token
+  } catch {
+    return null
+  }
+}
+
+export async function request<T>(path: string, init?: RequestInit, _retriedCsrf = false): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const write = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS'
+  if (write && !csrfToken && path !== '/api/session') await ensureCsrf()
   const res = await fetch(API_BASE + path, {
     credentials: 'same-origin',
     ...init,
@@ -50,15 +70,29 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* not JSON */
     }
+    if (write && !_retriedCsrf && res.status === 403 && body?.error.code === 'csrf') {
+      resetSessionCache()
+      await ensureCsrf()
+      return request<T>(path, init, true)
+    }
     throw new HttpError(res.status, body)
   }
   return (await res.json()) as T
 }
 
 export async function getSession(): Promise<Session> {
-  const s = await request<Session>('/api/session')
-  csrfToken = s.csrf_token
-  return s
+  if (!sessionPromise) {
+    sessionPromise = request<Session>('/api/session')
+      .then((s) => {
+        csrfToken = s.csrf_token
+        return s
+      })
+      .catch((e) => {
+        sessionPromise = null
+        throw e
+      })
+  }
+  return sessionPromise
 }
 
 export const getAlert = (id: string, signal?: AbortSignal) =>
@@ -95,13 +129,23 @@ const post = <T>(path: string, body: unknown = {}, signal?: AbortSignal) =>
   request<T>(path, { method: 'POST', body: JSON.stringify(body), signal })
 const put = <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
 
-/** Message for a failed call, in the server's words when it sent some. */
+/** Message for a failed call, sanitized so internal 5xx errors never leak server internals. */
 export function errorText(e: unknown): string {
   if (e instanceof HttpError) {
+    if (e.status >= 500 || e.body?.error.code === 'internal') {
+      return 'Something went wrong on the server. Please try again.'
+    }
     const d = e.body?.error.details
-    return d?.length ? `${e.message}: ${d.map((x) => `${x.path || 'rule'} ${x.message}`).join('; ')}` : e.message
+    if (d?.length) {
+      const summary = d
+        .slice(0, 5)
+        .map((x) => `${(x.path || 'rule').slice(0, 80)} ${x.message.slice(0, 160)}`)
+        .join('; ')
+      return `${e.message.slice(0, 200)}: ${summary}`
+    }
+    return e.message.slice(0, 240)
   }
-  return e instanceof Error ? e.message : String(e)
+  return (e instanceof Error ? e.message : String(e)).slice(0, 240)
 }
 
 export const isConflict = (e: unknown): e is HttpError => e instanceof HttpError && e.status === 409
@@ -119,11 +163,17 @@ export const deleteRule = (id: string, expectedRevision: number) =>
 export const testRule = (rule: RuleSpec, event: unknown, signal?: AbortSignal) =>
   post<RuleTestResult>('/api/rules/test', { rule, event }, signal)
 export const listRunbooks = () => request<{ items: RunbookSummary[] }>('/api/runbooks').then((r) => r.items)
-export const recentEvents = (limit = 20) =>
-  request<{ items: RecentEvent[] }>(`/api/events/recent?limit=${limit}`).then((r) => r.items)
+export const recentEvents = (limit = 20, team?: string | null) => {
+  const qs = new URLSearchParams({ limit: String(limit) })
+  if (team) qs.set('team', team)
+  return request<{ items: RecentEvent[] }>(`/api/events/recent?${qs.toString()}`).then((r) => r.items)
+}
 
 // ---- people & teams ------------------------------------------------------------
 
+/** Minimal directory (id, name, teams) for recipient pickers — no contact PII or schedules. */
+export const listDirectory = () =>
+  request<{ items: PersonDirectoryEntry[] }>('/api/people/directory').then((r) => r.items)
 export const listPeople = () => request<{ items: PersonView[] }>('/api/people').then((r) => r.items)
 export const savePreferences = (id: string, preferences: Preference[], expectedRevision: number) =>
   put<PersonView>(`/api/people/${enc(id)}/preferences`, { preferences, expected_revision: expectedRevision })
@@ -139,7 +189,15 @@ export const saveTeam = (t: TeamView) =>
 
 // ---- proposals ---------------------------------------------------------------------
 
-export const listProposals = () => request<{ items: Proposal[] }>('/api/proposals').then((r) => r.items)
+export const listProposals = (team?: string | null, state?: ProposalState) => {
+  const qs = new URLSearchParams()
+  if (team) qs.set('team', team)
+  if (state) qs.set('state', state)
+  const suffix = qs.toString() ? `?${qs.toString()}` : ''
+  return request<{ items: Proposal[] }>(`/api/proposals${suffix}`).then((r) => r.items)
+}
+export const countPendingProposals = (team?: string | null) =>
+  request<{ pending: number }>(`/api/proposals/count${team ? `?team=${enc(team)}` : ''}`).then((r) => r.pending)
 export const createProposal = (p: ProposalCreate) => post<Proposal>('/api/proposals', p)
 export const decideProposal = (id: string, op: 'accept' | 'reject') => post<Proposal>(`/api/proposals/${enc(id)}/${op}`)
 

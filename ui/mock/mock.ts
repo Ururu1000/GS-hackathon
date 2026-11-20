@@ -17,15 +17,16 @@
 //                          (default: retries fail, so "retry fails twice →
 //                          escalate" can be shown); also POST /api/__mock/workflow-engine?ok=1
 
+import { createHash, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type {
   AlertDetail,
   AlertStatus,
   ApiError,
-  ApprovalRequest,
   EventSample,
   Execution,
   FeedAlert,
+  PersonDirectoryEntry,
   PersonView,
   Preference,
   Proposal,
@@ -44,9 +45,10 @@ import type {
   TimelineEntry,
   TransitionRequest,
 } from '../src/api/types.ts'
+import { redactText, redactValue } from '../src/lib/redact.ts'
 import { inWindow, parseWindow, resolveChannels } from '../src/prefs/resolve.ts'
 import { applyRule, context, dedupKey, parseDuration, recovers, testRule, validateRule, type Ctx } from './engine.ts'
-import { failedRuns, runtimeOf, viewRunbook, type RunbookRuntime } from './runbooks.ts'
+import { failedRuns, runtimeOf, viewRunbook, type RunbookRuntime, type StoredApproval } from './runbooks.ts'
 import { deliveriesFor, PEOPLE, randomEvent, RULES, RUNBOOKS, TEAMS, type DeliveryPlan } from './scenario.ts'
 
 interface MockAlert {
@@ -83,15 +85,36 @@ const env = (k: string, d: number) => {
   return Number.isFinite(v) && process.env[k] !== '' && process.env[k] !== undefined ? v : d
 }
 
-const CSRF = 'mock-csrf-token'
-const ME = 'user:erop'
+const ME_ID = 'erop'
+const ME = `user:${ME_ID}`
 const SNAPSHOT_LIMIT = 5000
 const MAX_SAMPLES_HEAD = 3
 const RECENT_MAX = 50
+const MAX_BODY_BYTES = 256 * 1024
+const MAX_BURST = 5_000
+const INGEST_WINDOW_MS = 60_000
+const INGEST_MAX_PER_WINDOW = 120
+const SOURCE_RE = /^[a-z0-9_-]+:[a-z0-9._-]+$/i
 const HOUR = 3_600_000
 const clone = <T>(v: T): T => structuredClone(v)
 
+function safeDecode(s: string): string | null {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return null
+  }
+}
+
+class BodyTooLargeError extends Error {}
+
+interface StoredRecent {
+  event: RecentEvent
+  teams: Set<string>
+}
+
 export function createMock() {
+  const csrf = process.env.MOCK_CSRF_TOKEN || randomBytes(24).toString('base64url')
   const seed = env('MOCK_SEED', 60)
   const rate = env('MOCK_RATE', 2)
   const staleChance = env('MOCK_STALE', 0.03)
@@ -106,7 +129,18 @@ export function createMock() {
   const people = new Map<string, PersonView>(PEOPLE.map((p) => [p.id, clone(p)]))
   const teams = new Map<string, TeamView>(TEAMS.map((t) => [t.id, clone(t)]))
   const proposals = new Map<string, Proposal>()
-  const recent: RecentEvent[] = []
+  const recent: StoredRecent[] = []
+  const ingestHits: number[] = []
+
+  const allowedVisibleTeams = (): Set<string> => {
+    const raw = process.env.MOCK_TEAMS?.trim()
+    if (raw) return new Set(raw.split(',').map((s) => s.trim()).filter((id) => teams.has(id)))
+    return new Set(teams.keys())
+  }
+  const canSeeTeam = (teamId: string | null) => teamId === null || allowedVisibleTeams().has(teamId)
+  const isTeamMember = (teamId: string) => teams.get(teamId)?.members.includes(ME_ID) ?? false
+  const isTeamLead = (teamId: string) => teams.get(teamId)?.lead === ME_ID
+  const canEditPerson = (personId: string) => personId === ME_ID
   let idSeq = 0
   let evSeq = 0
   let seq = 0
@@ -157,15 +191,18 @@ export function createMock() {
 
   function ingest(source: string, raw: unknown, at = new Date(), broadcast = true): string[] {
     const touched: string[] = []
+    const matchedTeams = new Set<string>()
     const eventId = `evt_${at.getTime().toString(36)}${(evSeq++).toString(36)}`
     const sample: EventSample = { event_id: eventId, received_at: at.toISOString(), raw }
     const ctx = context(raw, source)
-    recent.unshift({ ...sample, source, schema: ctx.schema })
+    const storedRecent: StoredRecent = { event: { ...sample, source, schema: ctx.schema }, teams: matchedTeams }
+    recent.unshift(storedRecent)
     if (recent.length > RECENT_MAX) recent.length = RECENT_MAX
     for (const rec of rules.values()) {
       const rule = rec.rule
       if (rule.enabled === false) continue
       if (recovers(rule, ctx)) {
+        matchedTeams.add(rule.team)
         const k = `${rule.id}|${dedupKey(rule, ctx)}`
         const a = alerts.get(active.get(k) ?? '')
         if (a && a.feed.status !== 'resolved') {
@@ -177,6 +214,7 @@ export function createMock() {
       }
       const m = applyRule(rule, ctx)
       if (!m) continue
+      matchedTeams.add(rule.team)
       const hour = Math.floor(at.getTime() / HOUR)
       rec.fires.set(hour, (rec.fires.get(hour) ?? 0) + 1)
       const k = `${rule.id}|${m.key}`
@@ -298,10 +336,11 @@ export function createMock() {
       touch(a)
       setTimeout(() => {
         const out = actionOutcome(a, d.action!.name, view.action!.params)
+        const safeOut = redactText(out.output, 300)
         ex.state = out.ok ? 'ok' : 'failed'
-        ex.output = out.output
+        ex.output = safeOut
         ex.finished_at = new Date().toISOString()
-        note(a, 'step_run', actor, `${out.ok ? 'Ran' : 'Failed'} “${label}”: ${out.output}`)
+        note(a, 'step_run', actor, `${out.ok ? 'Ran' : 'Failed'} “${label}”: ${safeOut}`)
         if (out.ok && d.resolves && a.feed.status !== 'resolved') {
           const prev = transition(a, 'resolved', 'system', 'runbook')
           publish(a, prev)
@@ -313,7 +352,8 @@ export function createMock() {
 
   // ---- SSE -----------------------------------------------------------------
 
-  const visible = (team: string | null, a: FeedAlert) => team === null || a.team === team
+  const visible = (team: string | null, a: FeedAlert) =>
+    allowedVisibleTeams().has(a.team) && (team === null || a.team === team)
 
   function send(res: ServerResponse, event: string, data: unknown) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
@@ -353,6 +393,7 @@ export function createMock() {
 
   function openStream(req: IncomingMessage, res: ServerResponse, url: URL) {
     const team = url.searchParams.get('team') || null
+    if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team')
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -387,11 +428,37 @@ export function createMock() {
         last_fired_at: last === null ? null : new Date(last).toISOString(),
         hourly,
       },
+      can_edit: isTeamMember(rec.rule.team),
     }
   }
 
+  function personTeams(id: string): string[] {
+    return [...teams.values()].filter((t) => t.members.includes(id)).map((t) => t.id)
+  }
+
+  function directoryEntry(p: PersonView): PersonDirectoryEntry {
+    return { id: p.id, name: p.name, teams: personTeams(p.id) }
+  }
+
   function personView(p: PersonView): PersonView {
-    return { ...clone(p), teams: [...teams.values()].filter((t) => t.members.includes(p.id)).map((t) => t.id) }
+    const editable = canEditPerson(p.id)
+    return {
+      id: p.id,
+      name: p.name,
+      contact: editable ? clone(p.contact) : {},
+      teams: personTeams(p.id),
+      preferences: editable ? clone(p.preferences) : [],
+      revision: p.revision,
+      can_edit: editable,
+    }
+  }
+
+  function teamView(t: TeamView): TeamView {
+    return { ...clone(t), can_edit: isTeamLead(t.id) }
+  }
+
+  function proposalView(p: Proposal): Proposal {
+    return { ...clone(p), can_review: isTeamMember(p.base_rule.team) }
   }
 
   function validatePrefs(prefs: unknown): { path: string; message: string }[] {
@@ -431,19 +498,26 @@ export function createMock() {
 
   async function body(req: IncomingMessage): Promise<any> {
     const chunks: Buffer[] = []
-    for await (const c of req) chunks.push(c as Buffer)
+    let total = 0
+    for await (const c of req) {
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c as string)
+      total += buf.length
+      if (total > MAX_BODY_BYTES) throw new BodyTooLargeError(`Body exceeds ${MAX_BODY_BYTES} bytes`)
+      chunks.push(buf)
+    }
     const s = Buffer.concat(chunks).toString()
     return s ? JSON.parse(s) : {}
   }
 
-  /** Async write handler: CSRF check + JSON body, errors mapped to ApiError. */
+  /** Async write handler: CSRF check + bounded JSON body, errors mapped to ApiError. */
   function write(req: IncomingMessage, res: ServerResponse, fn: (b: any) => void) {
     void (async () => {
-      if (req.headers['x-csrf-token'] !== CSRF) return err(res, 403, 'csrf', 'Missing or wrong X-CSRF-Token')
+      if (req.headers['x-csrf-token'] !== csrf) return err(res, 403, 'csrf', 'Missing or wrong X-CSRF-Token')
       let b: any
       try {
         b = await body(req)
-      } catch {
+      } catch (e) {
+        if (e instanceof BodyTooLargeError) return err(res, 413, 'bad_request', e.message)
         return err(res, 400, 'bad_request', 'Body is not JSON')
       }
       fn(b ?? {})
@@ -455,7 +529,7 @@ export function createMock() {
     const rb = def(a)
     return {
       ...a.feed,
-      samples: a.samples,
+      samples: a.samples.map((s) => ({ ...s, raw: redactValue(s.raw) })),
       runbook: rb ? viewRunbook(rb, a.ctx, a.runbook, ME) : null,
       deliveries: deliveriesFor(a.feed, a.plan, people),
       timeline: a.timeline,
@@ -470,25 +544,39 @@ export function createMock() {
     let m: RegExpMatchArray | null
 
     if (path === '/api/session' && method === 'GET') {
-      const session: Session = { user: { id: 'erop', name: 'erop (demo)' }, teams: [...teams.values()].map((t) => ({ id: t.id, name: t.name })), csrf_token: CSRF }
+      const allowed = allowedVisibleTeams()
+      const session: Session = {
+        user: { id: ME_ID, name: 'erop (demo)' },
+        teams: [...teams.values()].filter((t) => allowed.has(t.id)).map((t) => ({ id: t.id, name: t.name })),
+        csrf_token: csrf,
+      }
       return json(res, 200, session), true
     }
     if (path === '/api/stream' && method === 'GET') return openStream(req, res, url), true
-    if (path === '/api/alerts' && method === 'GET') return json(res, 200, page(url.searchParams.get('team') || null, url.searchParams)), true
+    if (path === '/api/alerts' && method === 'GET') {
+      const team = url.searchParams.get('team') || null
+      if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team'), true
+      return json(res, 200, page(team, url.searchParams)), true
+    }
 
     if ((m = path.match(/^\/api\/alerts\/([^/]+)$/)) && method === 'GET') {
-      const a = alerts.get(decodeURIComponent(m[1]!))
+      const id = safeDecode(m[1]!)
+      if (id === null) return err(res, 400, 'bad_request', 'Invalid alert id encoding'), true
+      const a = alerts.get(id)
       if (!a) return err(res, 404, 'not_found', 'No such alert'), true
+      if (!canSeeTeam(a.feed.team)) return err(res, 403, 'forbidden', 'You do not have access to this alert'), true
       return json(res, 200, detail(a)), true
     }
 
     if ((m = path.match(/^\/api\/alerts\/([^/]+)\/(ack|resolve)$/)) && method === 'POST') {
-      const id = decodeURIComponent(m[1]!)
+      const id = safeDecode(m[1]!)
+      if (id === null) return err(res, 400, 'bad_request', 'Invalid alert id encoding'), true
       const op = m[2] as 'ack' | 'resolve'
       return write(req, res, (reqBody: TransitionRequest) => {
         if (typeof reqBody.expected_version !== 'number') return err(res, 400, 'bad_request', 'expected_version is required')
         const a = alerts.get(id)
         if (!a) return err(res, 404, 'not_found', 'No such alert')
+        if (!canSeeTeam(a.feed.team)) return err(res, 403, 'forbidden', 'You do not have access to this alert')
         const target: AlertStatus = op === 'ack' ? 'acked' : 'resolved'
         if (a.feed.status === target) return json(res, 200, a.feed)
         if (op === 'ack' && a.feed.status === 'resolved')
@@ -505,10 +593,14 @@ export function createMock() {
 
     // ---- runbook steps & approvals
     if ((m = path.match(/^\/api\/alerts\/([^/]+)\/steps\/([^/]+)\/(run|check)$/)) && method === 'POST') {
-      const [id, step, op] = [decodeURIComponent(m[1]!), decodeURIComponent(m[2]!), m[3]!]
+      const id = safeDecode(m[1]!)
+      const step = safeDecode(m[2]!)
+      if (id === null || step === null) return err(res, 400, 'bad_request', 'Invalid path encoding'), true
+      const op = m[3]!
       return write(req, res, (b: { done?: boolean }) => {
         const a = alerts.get(id)
         if (!a) return err(res, 404, 'not_found', 'No such alert')
+        if (!isTeamMember(a.feed.team)) return err(res, 403, 'forbidden', 'Only members of the alert’s team can run or check runbook steps')
         const d = stepDef(a, step)
         if (!d) return err(res, 404, 'not_found', 'No such runbook step')
         const rt = runtimeOf(a.runbook, step)
@@ -517,7 +609,8 @@ export function createMock() {
           const done = b.done !== false
           rt.done_by = done ? ME : null
           rt.done_at = done ? new Date().toISOString() : null
-          note(a, 'step_run', ME, `${done ? 'Done' : 'Unticked'}: ${viewRunbook(def(a)!, a.ctx, a.runbook, ME).steps.find((s) => s.id === step)!.text}`)
+          const stepText = redactText(viewRunbook(def(a)!, a.ctx, a.runbook, ME).steps.find((s) => s.id === step)!.text, 200)
+          note(a, 'step_run', ME, `${done ? 'Done' : 'Unticked'}: ${stepText}`)
           touch(a)
           return json(res, 200, { ok: true })
         }
@@ -531,21 +624,25 @@ export function createMock() {
           if (pending) return err(res, 409, 'approval_required', 'Waiting for approval', { approval_id: pending.id })
           const lead = teams.get(a.feed.team)?.lead
           const now = Date.now()
-          const request: ApprovalRequest = {
+          // Separation of duties: eligible approvers exclude the requester.
+          const eligible = lead && lead !== ME_ID ? [`user:${lead}`] : []
+          const rawCode = String(1000 + (randomBytes(2).readUInt16BE(0) % 9000))
+          const request: StoredApproval = {
             id: uid('apr'),
             state: 'pending',
             requested_by: ME,
             requested_at: new Date(now).toISOString(),
             expires_at: new Date(now + 15 * 60_000).toISOString(),
-            eligible: [...new Set([...(lead ? [`user:${lead}`] : []), ME])],
+            eligible,
             can_decide: false,
-            sms_code: String(1000 + Math.floor(Math.random() * 9000)),
+            sms_sent: eligible.length > 0,
+            sms_code_hash: createHash('sha256').update(rawCode).digest('hex'),
             decided_by: null,
             decided_at: null,
             note: null,
           }
           rt.approvals.push(request)
-          note(a, 'approval', ME, `Asked for approval to run “${d.action.label}” (${view.text})`)
+          note(a, 'approval', ME, `Asked for approval to run “${d.action.label}” (${redactText(view.text, 160)})`)
           touch(a)
           return err(res, 409, 'approval_required', 'This step needs approval first', { approval_id: request.id })
         }
@@ -555,22 +652,28 @@ export function createMock() {
     }
 
     if ((m = path.match(/^\/api\/approvals\/([^/]+)\/(approve|reject)$/)) && method === 'POST') {
-      const [id, op] = [decodeURIComponent(m[1]!), m[2]!]
+      const id = safeDecode(m[1]!)
+      if (id === null) return err(res, 400, 'bad_request', 'Invalid approval id encoding'), true
+      const op = m[2]!
       return write(req, res, (b: { note?: string }) => {
+        if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 2000))
+          return err(res, 422, 'invalid', 'Approval note must be at most 2000 characters', { details: [{ path: 'note', message: 'max 2000 chars' }] })
         for (const a of alerts.values())
           for (const [step, rt] of a.runbook) {
             const r = rt.approvals.find((x) => x.id === id)
             if (!r) continue
             if (r.state !== 'pending' || Date.parse(r.expires_at) <= Date.now())
               return err(res, 409, 'invalid_transition', `This request is already ${r.state === 'pending' ? 'expired' : r.state}`)
+            if (r.requested_by === ME) return err(res, 403, 'forbidden', 'Requesters cannot approve or reject their own approval request')
             if (!r.eligible.includes(ME)) return err(res, 403, 'forbidden', 'You are not an approver for this step')
             if (a.feed.status === 'resolved') return err(res, 409, 'invalid_transition', 'The alert was resolved meanwhile')
             r.state = op === 'approve' ? 'approved' : 'rejected'
             r.decided_by = ME
             r.decided_at = new Date().toISOString()
-            r.note = b.note?.trim() || null
+            const safeNote = b.note?.trim() ? redactText(b.note.trim(), 2000) : null
+            r.note = safeNote
             const label = stepDef(a, step)?.action?.label ?? step
-            note(a, 'approval', ME, `${op === 'approve' ? 'Approved' : 'Rejected'} “${label}”${r.note ? `: ${r.note}` : ''}`)
+            note(a, 'approval', ME, `${op === 'approve' ? 'Approved' : 'Rejected'} “${label}”${safeNote ? `: ${redactText(safeNote, 240)}` : ''}`)
             // Approve = consume + audit + execution intent, together.
             if (op === 'approve') return json(res, 200, { execution_id: execute(a, step, r.requested_by).id })
             touch(a)
@@ -582,8 +685,12 @@ export function createMock() {
 
     // ---- rules
     if (path === '/api/rules' && method === 'GET') {
-      const team = url.searchParams.get('team')
-      const items = [...rules.values()].filter((r) => !team || r.rule.team === team).map((r) => ruleItem(r))
+      const team = url.searchParams.get('team') || null
+      if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team'), true
+      const allowed = allowedVisibleTeams()
+      const items = [...rules.values()]
+        .filter((r) => allowed.has(r.rule.team) && (!team || r.rule.team === team))
+        .map((r) => ruleItem(r))
       items.sort((x, y) => x.rule.team.localeCompare(y.rule.team) || (x.rule.name ?? x.rule.id).localeCompare(y.rule.name ?? y.rule.id))
       return json(res, 200, { items }), true
     }
@@ -597,6 +704,7 @@ export function createMock() {
       return write(req, res, (b: RuleWrite) => {
         const problems = validateRule(b.rule)
         if (problems.length) return err(res, 422, 'invalid', 'The rule has problems', { details: problems })
+        if (!isTeamMember(b.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${b.rule.team}" can create rules for it`)
         if (rules.has(b.rule.id)) return err(res, 409, 'revision_conflict', `A rule with id "${b.rule.id}" already exists`, { current: ruleItem(rules.get(b.rule.id)!) })
         const rec: RuleRec = { rule: clone(b.rule), revision: 1, updated_at: new Date().toISOString(), updated_by: ME, fires: new Map() }
         rules.set(b.rule.id, rec)
@@ -604,23 +712,31 @@ export function createMock() {
       })
     }
     if ((m = path.match(/^\/api\/rules\/([^/]+)$/))) {
-      const id = decodeURIComponent(m[1]!)
+      const id = safeDecode(m[1]!)
+      if (id === null) return err(res, 400, 'bad_request', 'Invalid rule id encoding'), true
       const rec = rules.get(id)
-      if (method === 'GET') return rec ? json(res, 200, ruleItem(rec)) : err(res, 404, 'not_found', 'No such rule'), true
+      if (method === 'GET') {
+        if (!rec) return err(res, 404, 'not_found', 'No such rule'), true
+        if (!canSeeTeam(rec.rule.team)) return err(res, 403, 'forbidden', 'You do not have access to this rule'), true
+        return json(res, 200, ruleItem(rec)), true
+      }
       if (method === 'PUT')
         return write(req, res, (b: RuleWrite) => {
           if (!rec) return err(res, 404, 'not_found', 'No such rule')
+          if (!isTeamMember(rec.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${rec.rule.team}" can edit this rule`)
           if (b.rule?.id !== id) return err(res, 400, 'bad_request', 'A rule’s id can’t be changed')
           if (b.expected_revision !== rec.revision)
             return err(res, 409, 'revision_conflict', `${rec.updated_by.replace(/^user:/, '')} changed this rule meanwhile (revision ${rec.revision})`, { current: ruleItem(rec) })
           const problems = validateRule(b.rule)
           if (problems.length) return err(res, 422, 'invalid', 'The rule has problems', { details: problems })
+          if (!isTeamMember(b.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${b.rule.team}" can move a rule to that team`)
           Object.assign(rec, { rule: clone(b.rule), revision: rec.revision + 1, updated_at: new Date().toISOString(), updated_by: ME })
           json(res, 200, ruleItem(rec))
         })
       if (method === 'DELETE')
         return write(req, res, () => {
           if (!rec) return err(res, 404, 'not_found', 'No such rule')
+          if (!isTeamMember(rec.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${rec.rule.team}" can delete this rule`)
           const exp = Number(url.searchParams.get('expected_revision'))
           if (exp !== rec.revision) return err(res, 409, 'revision_conflict', 'This rule changed meanwhile', { current: ruleItem(rec) })
           rules.delete(id)
@@ -628,22 +744,42 @@ export function createMock() {
         })
     }
     if (path === '/api/runbooks' && method === 'GET') {
-      const items: RunbookSummary[] = RUNBOOKS.map((r) => ({ id: r.id, title: r.title, format: r.format, team: r.team, steps: r.steps.length }))
+      const allowed = allowedVisibleTeams()
+      const items: RunbookSummary[] = RUNBOOKS.filter((r) => r.team === null || allowed.has(r.team)).map((r) => ({
+        id: r.id,
+        title: r.title,
+        format: r.format,
+        team: r.team,
+        steps: r.steps.length,
+      }))
       return json(res, 200, { items }), true
     }
     if (path === '/api/events/recent' && method === 'GET') {
-      const limit = Math.min(Number(url.searchParams.get('limit') ?? 20) || 20, RECENT_MAX)
-      return json(res, 200, { items: recent.slice(0, limit) }), true
+      const team = url.searchParams.get('team') || null
+      if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team'), true
+      const allowed = allowedVisibleTeams()
+      const limit = Math.min(Math.max(1, Number(url.searchParams.get('limit') ?? 20) || 20), RECENT_MAX)
+      const items = recent
+        .filter((r) => (team ? r.teams.has(team) : r.teams.size === 0 || [...r.teams].some((t) => allowed.has(t))))
+        .slice(0, limit)
+        .map((r) => ({ ...r.event, raw: redactValue(r.event.raw) }))
+      return json(res, 200, { items }), true
     }
 
     // ---- people & teams
+    if (path === '/api/people/directory' && method === 'GET') {
+      return json(res, 200, { items: [...people.values()].map(directoryEntry) }), true
+    }
     if (path === '/api/people' && method === 'GET') return json(res, 200, { items: [...people.values()].map(personView) }), true
     if ((m = path.match(/^\/api\/people\/([^/]+)(\/preferences)?$/))) {
-      const p = people.get(decodeURIComponent(m[1]!))
+      const personId = safeDecode(m[1]!)
+      if (personId === null) return err(res, 400, 'bad_request', 'Invalid person id encoding'), true
+      const p = people.get(personId)
       if (method === 'GET') return p ? json(res, 200, personView(p)) : err(res, 404, 'not_found', 'No such person'), true
       if (method === 'PUT' && m[2])
         return write(req, res, (b: { preferences: Preference[]; expected_revision: number }) => {
           if (!p) return err(res, 404, 'not_found', 'No such person')
+          if (!canEditPerson(p.id)) return err(res, 403, 'forbidden', 'You can only edit your own preferences')
           if (b.expected_revision !== p.revision) return err(res, 409, 'revision_conflict', 'These preferences changed meanwhile', { current: personView(p) })
           const problems = validatePrefs(b.preferences)
           if (problems.length) return err(res, 422, 'invalid', 'The preferences have problems', { details: problems })
@@ -652,14 +788,17 @@ export function createMock() {
           json(res, 200, personView(p))
         })
     }
-    if (path === '/api/teams' && method === 'GET') return json(res, 200, { items: [...teams.values()].map(clone) }), true
+    if (path === '/api/teams' && method === 'GET') return json(res, 200, { items: [...teams.values()].map(teamView) }), true
     if ((m = path.match(/^\/api\/teams\/([^/]+)$/))) {
-      const t = teams.get(decodeURIComponent(m[1]!))
-      if (method === 'GET') return t ? json(res, 200, t) : err(res, 404, 'not_found', 'No such team'), true
+      const teamId = safeDecode(m[1]!)
+      if (teamId === null) return err(res, 400, 'bad_request', 'Invalid team id encoding'), true
+      const t = teams.get(teamId)
+      if (method === 'GET') return t ? json(res, 200, teamView(t)) : err(res, 404, 'not_found', 'No such team'), true
       if (method === 'PUT')
         return write(req, res, (b: Partial<TeamView> & { expected_revision: number }) => {
           if (!t) return err(res, 404, 'not_found', 'No such team')
-          if (b.expected_revision !== t.revision) return err(res, 409, 'revision_conflict', 'This team changed meanwhile', { current: t })
+          if (!isTeamLead(t.id)) return err(res, 403, 'forbidden', 'Only the team lead or an admin can edit this team')
+          if (b.expected_revision !== t.revision) return err(res, 409, 'revision_conflict', 'This team changed meanwhile', { current: teamView(t) })
           const members = b.members ?? t.members
           const unknown = members.filter((u) => !people.has(u))
           if (unknown.length) return err(res, 422, 'invalid', `Unknown people: ${unknown.join(', ')}`, { details: [{ path: 'members', message: 'unknown person' }] })
@@ -671,22 +810,43 @@ export function createMock() {
             default_channels: b.default_channels ?? t.default_channels,
             revision: t.revision + 1,
           })
-          json(res, 200, t)
+          json(res, 200, teamView(t))
         })
     }
 
     // ---- proposals
+    if (path === '/api/proposals/count' && method === 'GET') {
+      const team = url.searchParams.get('team') || null
+      if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team'), true
+      const allowed = allowedVisibleTeams()
+      const pending = [...proposals.values()].filter(
+        (p) => p.state === 'pending' && allowed.has(p.base_rule.team) && (!team || p.base_rule.team === team),
+      ).length
+      return json(res, 200, { pending }), true
+    }
     if (path === '/api/proposals' && method === 'GET') {
-      const items = [...proposals.values()].sort((x, y) => (x.created_at < y.created_at ? 1 : -1))
+      const team = url.searchParams.get('team') || null
+      const state = url.searchParams.get('state') || null
+      if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team'), true
+      const allowed = allowedVisibleTeams()
+      const items = [...proposals.values()]
+        .filter((p) => allowed.has(p.base_rule.team) && (!team || p.base_rule.team === team) && (!state || p.state === state))
+        .sort((x, y) => (x.created_at < y.created_at ? 1 : -1))
+        .map(proposalView)
       return json(res, 200, { items }), true
     }
     if (path === '/api/proposals' && method === 'POST') {
       return write(req, res, (b: ProposalCreate) => {
         const rec = rules.get(b.rule_id)
         if (!rec) return err(res, 404, 'not_found', 'No such rule')
+        if (!canSeeTeam(rec.rule.team)) return err(res, 403, 'forbidden', 'You do not have access to this rule')
         const problems = validateRule(b.proposed_rule)
         if (problems.length) return err(res, 422, 'invalid', 'The proposed rule has problems', { details: problems })
         if (!b.summary?.trim()) return err(res, 422, 'invalid', 'Say in a line what should change', { details: [{ path: 'summary', message: 'required' }] })
+        if (b.summary.trim().length > 200)
+          return err(res, 422, 'invalid', 'Summary must be at most 200 characters', { details: [{ path: 'summary', message: 'max 200 chars' }] })
+        if (b.note !== undefined && (typeof b.note !== 'string' || b.note.length > 4000))
+          return err(res, 422, 'invalid', 'Note must be at most 4000 characters', { details: [{ path: 'note', message: 'max 4000 chars' }] })
         const base = b.base_revision === rec.revision ? rec.rule : null
         if (!base) return err(res, 409, 'revision_conflict', 'The rule changed while you were writing this', { current: ruleItem(rec) })
         const p: Proposal = {
@@ -694,8 +854,8 @@ export function createMock() {
           rule_id: rec.rule.id,
           rule_name: rec.rule.name ?? rec.rule.id,
           kind: b.kind,
-          summary: b.summary.trim(),
-          note: b.note?.trim() ?? '',
+          summary: redactText(b.summary.trim(), 200),
+          note: redactText(b.note?.trim() ?? '', 4000),
           base_revision: rec.revision,
           base_rule: clone(base),
           proposed_rule: { ...clone(b.proposed_rule), id: rec.rule.id },
@@ -709,22 +869,25 @@ export function createMock() {
         }
         proposals.set(p.id, p)
         const a = b.alert_id ? alerts.get(b.alert_id) : undefined
-        if (a) {
-          note(a, 'comment', ME, `Suggested a change to the rule: ${p.summary}`)
+        if (a && canSeeTeam(a.feed.team)) {
+          note(a, 'comment', ME, `Suggested a change to the rule: ${redactText(p.summary, 160)}`)
           touch(a)
         }
-        json(res, 201, p)
+        json(res, 201, proposalView(p))
       })
     }
     if ((m = path.match(/^\/api\/proposals\/([^/]+)\/(accept|reject)$/)) && method === 'POST') {
-      const [id, op] = [decodeURIComponent(m[1]!), m[2]!]
+      const id = safeDecode(m[1]!)
+      if (id === null) return err(res, 400, 'bad_request', 'Invalid proposal id encoding'), true
+      const op = m[2]!
       return write(req, res, () => {
         const p = proposals.get(id)
         if (!p) return err(res, 404, 'not_found', 'No such proposal')
+        if (!isTeamMember(p.base_rule.team)) return err(res, 403, 'forbidden', `Only members of team "${p.base_rule.team}" can review this proposal`)
         if (p.state !== 'pending') return err(res, 409, 'invalid_transition', `Already ${p.state}`)
         const rec = rules.get(p.rule_id)
         const decide = (state: Proposal['state']) => Object.assign(p, { state, decided_by: ME, decided_at: new Date().toISOString() })
-        if (op === 'reject') return decide('rejected'), json(res, 200, p)
+        if (op === 'reject') return decide('rejected'), json(res, 200, proposalView(p))
         if (!rec) return decide('stale'), err(res, 409, 'revision_conflict', 'The rule was deleted')
         // Accepting is an ordinary publish against the proposal's base revision.
         if (rec.revision !== p.base_revision) {
@@ -733,35 +896,40 @@ export function createMock() {
         }
         Object.assign(rec, { rule: clone(p.proposed_rule), revision: rec.revision + 1, updated_at: new Date().toISOString(), updated_by: ME })
         decide('accepted')
-        json(res, 200, p)
+        json(res, 200, proposalView(p))
       })
     }
 
-    // ---- ingest & mock controls
+    // ---- ingest & mock controls (CSRF-protected + bounded, dev mock only)
     if ((m = path.match(/^\/ingest\/([^/]+)$/)) && method === 'POST') {
-      const source = decodeURIComponent(m[1]!)
-      void (async () => {
-        try {
-          const raw = await body(req)
-          const touched = ingest(source, raw)
-          json(res, 202, { id: `evt_${Date.now().toString(36)}`, matched_alerts: touched })
-        } catch {
-          err(res, 400, 'bad_request', 'Body is not JSON')
-        }
-      })()
-      return true
+      const source = safeDecode(m[1]!)
+      if (source === null || source.length > 64 || !SOURCE_RE.test(source))
+        return err(res, 400, 'bad_request', 'Invalid ingest source name'), true
+      return write(req, res, (raw: unknown) => {
+        const now = Date.now()
+        while (ingestHits.length && now - ingestHits[0]! > INGEST_WINDOW_MS) ingestHits.shift()
+        if (ingestHits.length >= INGEST_MAX_PER_WINDOW)
+          return err(res, 429, 'rate_limited', 'Ingest rate limit exceeded; try again shortly')
+        ingestHits.push(now)
+        const touched = ingest(source, raw)
+        json(res, 202, { id: `evt_${now.toString(36)}`, matched_alerts: touched })
+      })
     }
     if (path === '/api/__mock/burst' && method === 'POST') {
-      const n = Math.min(Number(url.searchParams.get('n') ?? 200) || 200, 20_000)
-      for (let i = 0; i < n; i++) {
-        const e = randomEvent(new Date())
-        ingest(e.source, e.raw)
-      }
-      return json(res, 200, { ingested: n, alerts: alerts.size }), true
+      return write(req, res, () => {
+        const n = Math.min(Math.max(1, Number(url.searchParams.get('n') ?? 200) || 200), MAX_BURST)
+        for (let i = 0; i < n; i++) {
+          const e = randomEvent(new Date())
+          ingest(e.source, e.raw)
+        }
+        json(res, 200, { ingested: n, alerts: alerts.size })
+      })
     }
     if (path === '/api/__mock/workflow-engine' && method === 'POST') {
-      retryOk = url.searchParams.get('ok') === '1'
-      return json(res, 200, { retry_ok: retryOk }), true
+      return write(req, res, () => {
+        retryOk = url.searchParams.get('ok') === '1'
+        json(res, 200, { retry_ok: retryOk })
+      })
     }
     if (path.startsWith('/api/') || path.startsWith('/ingest/')) {
       err(res, 404, 'not_found', `No mock route for ${method} ${path}`)

@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getSession, listProposals, transition, type TransitionOp } from './api/client'
+import { countPendingProposals, getSession, transition, type TransitionOp } from './api/client'
 import type { FeedAlert, Session } from './api/types'
 import { AlertDetail } from './alert/AlertDetail'
 import { FeedList } from './feed/FeedList'
@@ -36,12 +36,12 @@ function useToasts() {
   return { toasts, push }
 }
 
-// ---- persisted team scope & theme --------------------------------------------
+// ---- persisted team scope (tab session) & theme ------------------------------
 
 const TEAM_KEY = 'beacon.team'
 function loadTeam(): string | null {
   try {
-    return localStorage.getItem(TEAM_KEY) || null
+    return sessionStorage.getItem(TEAM_KEY) || null
   } catch {
     return null
   }
@@ -113,8 +113,8 @@ export function App() {
   const navigate = useCallback((hash: string) => go(hash), [go])
   const [pendingProposals, setPendingProposals] = useState(0)
   const refreshProposals = useCallback(() => {
-    listProposals().then((ps) => setPendingProposals(ps.filter((p) => p.state === 'pending').length), () => {})
-  }, [])
+    countPendingProposals(team).then(setPendingProposals, () => {})
+  }, [team])
   useEffect(refreshProposals, [refreshProposals, route.view])
   const [pending, setPending] = useState<{ id: string; op: TransitionOp } | null>(null)
   const [help, setHelp] = useState(false)
@@ -132,8 +132,8 @@ export function App() {
   const changeTeam = (t: string | null) => {
     setTeam(t)
     try {
-      if (t) localStorage.setItem(TEAM_KEY, t)
-      else localStorage.removeItem(TEAM_KEY)
+      if (t) sessionStorage.setItem(TEAM_KEY, t)
+      else sessionStorage.removeItem(TEAM_KEY)
     } catch {
       /* ignore */
     }

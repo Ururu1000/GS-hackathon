@@ -11,14 +11,17 @@ import { SAMPLES } from './draft'
 
 interface Props {
   rule: RuleSpec
+  team?: string | null
   initialSample?: string
   onResult: (r: RuleTestResult | null, event: unknown) => void
   onToast: (kind: 'ok' | 'warn' | 'error', text: string) => void
 }
 
 const DEBOUNCE_MS = 300
+const MAX_EVENT_CHARS = 64 * 1024
+const ALLOWED_SOURCES = [...new Set([...SAMPLES.map((s) => s.source), 'http:playground'])]
 
-export function TestPanel({ rule, initialSample, onResult, onToast }: Props) {
+export function TestPanel({ rule, team, initialSample, onResult, onToast }: Props) {
   const first = SAMPLES.find((s) => s.id === initialSample) ?? SAMPLES[0]!
   const [text, setText] = useState(() => JSON.stringify(first.event, null, 2))
   const [source, setSource] = useState(first.source)
@@ -30,18 +33,23 @@ export function TestPanel({ rule, initialSample, onResult, onToast }: Props) {
   const [sending, setSending] = useState(false)
   const seq = useRef(0)
 
+  const tooLarge = text.length > MAX_EVENT_CHARS
   let parsed: { ok: true; value: unknown } | { ok: false; message: string }
-  try {
-    parsed = { ok: true, value: JSON.parse(text) }
-  } catch (e) {
-    parsed = { ok: false, message: (e as Error).message }
+  if (tooLarge) {
+    parsed = { ok: false, message: `Event JSON exceeds ${MAX_EVENT_CHARS} bytes` }
+  } else {
+    try {
+      parsed = { ok: true, value: JSON.parse(text) }
+    } catch (e) {
+      parsed = { ok: false, message: (e as Error).message }
+    }
   }
   const eventKey = parsed.ok ? JSON.stringify(parsed.value) : null
   const ruleKey = JSON.stringify(rule)
 
   useEffect(() => {
-    recentEvents(20).then(setRecent, () => setRecent([]))
-  }, [])
+    recentEvents(20, team).then(setRecent, () => setRecent([]))
+  }, [team])
 
   useEffect(() => {
     if (eventKey === null) {
@@ -91,9 +99,10 @@ export function TestPanel({ rule, initialSample, onResult, onToast }: Props) {
 
   const send = async () => {
     if (!parsed.ok) return
+    const targetSource = ALLOWED_SOURCES.includes(source) ? source : 'http:playground'
     setSending(true)
     try {
-      const r = await ingest(source || 'http:playground', parsed.value)
+      const r = await ingest(targetSource, parsed.value)
       onToast(r.matched_alerts.length ? 'ok' : 'warn', r.matched_alerts.length ? `Sent. It reached ${r.matched_alerts.length} alert${r.matched_alerts.length === 1 ? '' : 's'} in the feed.` : 'Sent. No published rule matched it.')
     } catch (e) {
       onToast('error', errorText(e))
@@ -215,12 +224,16 @@ export function TestPanel({ rule, initialSample, onResult, onToast }: Props) {
       )}
 
       <div className="inline send-row">
-        <input className="input mono grow" value={source} onChange={(e) => setSource(e.target.value)} aria-label="Source" title="Source the event is sent on" />
+        <select className="select mono grow" value={ALLOWED_SOURCES.includes(source) ? source : 'http:playground'} onChange={(e) => setSource(e.target.value)} aria-label="Source" title="Allowed playground source">
+          {ALLOWED_SOURCES.map((s) => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </select>
         <button type="button" className="btn" disabled={!parsed.ok || sending} onClick={() => void send()} title="Ingest this event for real (uses the published rules, not this draft)">
           {sending ? 'Sending…' : 'Send to the feed'}
         </button>
       </div>
-      <p className="hint">Testing never creates alerts or sends anything. “Send to the feed” does, using the published rules.</p>
+      <p className="hint">Testing never creates alerts or sends anything. Avoid pasting real PII or secrets; “Send to the feed” dispatches real alerts under published rules.</p>
     </section>
   )
 }

@@ -186,11 +186,21 @@ function Approval({ req, now, busy, stepId, closed, onDecide }: { req: ApprovalR
       <p className="small">
         <strong>Waiting for approval.</strong> {actorName(req.requested_by)} asked <span title={absTime(req.requested_at)}>{relTime(req.requested_at, now)}</span>; expires in {expiresIn} min.
         <br />
-        <span className="muted">Approvers: {req.eligible.map(actorName).join(', ')}{req.sms_code && <> · or reply <code>Y {req.sms_code}</code> to the SMS</>}</span>
+        <span className="muted">
+          Approvers: {req.eligible.length > 0 ? req.eligible.map(actorName).join(', ') : 'none configured'}
+          {req.can_decide && req.sms_sent && <> · or reply to the SMS sent to your phone</>}
+        </span>
       </p>
       {req.can_decide ? (
         <div className="inline wrap">
-          <input className="input input-sm grow" value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (optional)" aria-label="Approval note" />
+          <input
+            className="input input-sm grow"
+            value={note}
+            maxLength={2000}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="Note (optional — logged in audit trail; avoid PII/secrets)"
+            aria-label="Approval note"
+          />
           <button className="btn btn-sm" disabled={busy !== null || closed} onClick={() => onDecide('reject', note)}>{busy === `${stepId}:reject` ? 'Rejecting…' : 'Reject'}</button>
           <button className="btn btn-sm btn-primary" disabled={busy !== null || closed} onClick={() => onDecide('approve', note)}>{busy === `${stepId}:approve` ? 'Approving…' : 'Approve and run'}</button>
         </div>

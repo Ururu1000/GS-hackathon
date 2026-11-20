@@ -49,15 +49,19 @@ function compact(o: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined))
 }
 
+const MAX_SIG_DEPTH = 16
+const MAX_SIG_PATHS = 500
+
 /** Structural signature for unknown shapes: sorted paths, values ignored. */
 function signature(raw: unknown): string {
   const paths: string[] = []
-  const walk = (v: unknown, p: string) => {
-    if (Array.isArray(v)) v.slice(0, 1).forEach((x) => walk(x, `${p}[]`))
-    else if (isObj(v)) for (const k of Object.keys(v)) walk(v[k], p ? `${p}.${k}` : k)
+  const walk = (v: unknown, p: string, depth: number) => {
+    if (depth > MAX_SIG_DEPTH || paths.length >= MAX_SIG_PATHS) return
+    if (Array.isArray(v)) v.slice(0, 1).forEach((x) => walk(x, `${p}[]`, depth + 1))
+    else if (isObj(v)) for (const k of Object.keys(v)) walk(v[k], p ? `${p}.${k}` : k, depth + 1)
     else paths.push(p)
   }
-  walk(raw, '')
+  walk(raw, '', 0)
   const h = [...paths.sort().join('|')].reduce((h, c) => (h * 33 + c.charCodeAt(0)) >>> 0, 5381)
   return `unknown:${h.toString(16).padStart(8, '0')}`
 }
@@ -135,6 +139,23 @@ function lookup(ctx: Ctx, path: string): Value {
 
 export const isLeaf = (c: Condition): c is Leaf => typeof (c as Leaf).op === 'string'
 
+const MAX_REGEX_LEN = 256
+const MAX_REGEX_INPUT = 4096
+const NESTED_QUANTIFIER_RE = /\((?:[^()\\]|\\.)*[+*?](?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,?\d*\})/
+const BACKREF_RE = /\\[1-9]/
+
+/** Compile a regex with basic ReDoS guards (production engine uses linear-time RE2/Rust regex). */
+export function compileSafeRegex(pattern: string): { ok: true; re: RegExp } | { ok: false; error: string } {
+  if (pattern.length > MAX_REGEX_LEN) return { ok: false, error: `regex too long (max ${MAX_REGEX_LEN} chars)` }
+  if (BACKREF_RE.test(pattern)) return { ok: false, error: 'backreferences are not allowed in regex' }
+  if (NESTED_QUANTIFIER_RE.test(pattern)) return { ok: false, error: 'nested quantifiers are not allowed (ReDoS risk)' }
+  try {
+    return { ok: true, re: new RegExp(pattern) }
+  } catch (e) {
+    return { ok: false, error: (e as Error).message }
+  }
+}
+
 function cmp(a: unknown, b: unknown): number | null {
   if (typeof a === 'number' && typeof b === 'number') return a - b
   if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0
@@ -173,13 +194,12 @@ function evalLeaf(l: Leaf, actual: Value): { ok: boolean; error?: string } {
       return { ok: false }
     case 'starts_with':
       return { ok: typeof actual === 'string' && typeof v === 'string' && actual.startsWith(v) }
-    case 'regex':
+    case 'regex': {
       if (typeof actual !== 'string') return { ok: false }
-      try {
-        return { ok: new RegExp(String(v)).test(actual) }
-      } catch (e) {
-        return { ok: false, error: `bad regex: ${(e as Error).message}` }
-      }
+      const compiled = compileSafeRegex(String(v))
+      if (!compiled.ok) return { ok: false, error: `bad regex: ${compiled.error}` }
+      return { ok: compiled.re.test(actual.slice(0, MAX_REGEX_INPUT)) }
+    }
     default:
       return { ok: false, error: `unknown operator ${String(l.op)}` }
   }
@@ -322,17 +342,30 @@ function validateCond(c: unknown, at: string, out: { path: string; message: stri
   if (['gt', 'gte', 'lt', 'lte'].includes(c.op) && typeof c.value !== 'number' && typeof c.value !== 'string')
     out.push({ path: `${at}.value`, message: 'needs a number (or a string to compare as text)' })
   if (c.op === 'regex') {
-    try {
-      new RegExp(String(c.value))
-    } catch (e) {
-      out.push({ path: `${at}.value`, message: `invalid regex: ${(e as Error).message}` })
-    }
+    const compiled = compileSafeRegex(String(c.value))
+    if (!compiled.ok) out.push({ path: `${at}.value`, message: `invalid regex: ${compiled.error}` })
+  }
+}
+
+const FORBIDDEN_RULE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function checkForbiddenKeys(v: unknown, at: string, out: { path: string; message: string }[], depth = 0) {
+  if (depth > 16 || v === null || typeof v !== 'object') return
+  if (Array.isArray(v)) {
+    v.forEach((x, i) => checkForbiddenKeys(x, `${at}.${i}`, out, depth + 1))
+    return
+  }
+  for (const k of Object.keys(v as Record<string, unknown>)) {
+    const next = at ? `${at}.${k}` : k
+    if (FORBIDDEN_RULE_KEYS.has(k)) out.push({ path: next, message: `forbidden key "${k}"` })
+    else checkForbiddenKeys((v as Record<string, unknown>)[k], next, out, depth + 1)
   }
 }
 
 export function validateRule(rule: unknown): { path: string; message: string }[] {
   const out: { path: string; message: string }[] = []
   if (!isObj(rule)) return [{ path: '', message: 'rule must be an object' }]
+  checkForbiddenKeys(rule, '', out)
   const r = rule as RuleSpec
   if (typeof r.id !== 'string' || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(r.id))
     out.push({ path: 'id', message: 'lower-case letters, digits and dashes, 2–63 characters' })

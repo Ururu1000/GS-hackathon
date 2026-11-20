@@ -12,7 +12,14 @@ export type Route =
   | { view: 'preferences'; kind: 'person' | 'team' | null; id: string | null }
   | { view: 'proposals'; id: string | null }
 
-const dec = (s: string | undefined) => (s === undefined ? null : decodeURIComponent(s))
+const dec = (s: string | undefined): string | null => {
+  if (s === undefined) return null
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return null
+  }
+}
 
 export function parseHash(hash: string): Route {
   const [path = '', query = ''] = hash.replace(/^#/, '').split('?')

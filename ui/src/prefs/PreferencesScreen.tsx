@@ -6,6 +6,7 @@ import { errorText, HttpError, isConflict, listPeople, listTeams, savePreference
 import { SEVERITIES, type PersonView, type Preference, type Severity, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
 import { CloseIcon } from '../lib/icons'
+import { maskAddress } from '../lib/redact'
 import { ChannelPicker, CHANNEL_NAME } from '../rules/sections'
 import { parseWindow, resolveChannels } from './resolve'
 
@@ -71,6 +72,7 @@ export function PreferencesScreen({ kind, id, me, onNavigate, onToast }: Props) 
             <PersonEditor
               key={`${person.id}:${person.revision}`}
               person={person}
+              me={me}
               teams={teams}
               onSaved={(p) => setPeople((ps) => ps?.map((x) => (x.id === p.id ? p : x)) ?? null)}
               onToast={onToast}
@@ -80,6 +82,7 @@ export function PreferencesScreen({ kind, id, me, onNavigate, onToast }: Props) 
             <TeamEditor
               key={`${team.id}:${team.revision}`}
               team={team}
+              me={me}
               people={people}
               onSaved={(t) => setTeams((ts) => ts?.map((x) => (x.id === t.id ? t : x)) ?? null)}
               onNavigate={onNavigate}
@@ -194,18 +197,19 @@ function localInput(d: Date): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-function PersonEditor({ person, teams, onSaved, onToast }: { person: PersonView; teams: TeamView[]; onSaved: (p: PersonView) => void; onToast: Props['onToast'] }) {
+function PersonEditor({ person, me, teams, onSaved, onToast }: { person: PersonView; me: string | null; teams: TeamView[]; onSaved: (p: PersonView) => void; onToast: Props['onToast'] }) {
   const split = (prefs: Preference[]) => ({
     lines: prefs.filter((p): p is Line => 'match' in p),
     fallback: (prefs.find((p) => 'default' in p) as { default: string[] } | undefined)?.default ?? null,
   })
+  const readOnly = person.can_edit === false || (person.can_edit === undefined && me !== null && person.id !== me)
   const initial = split(person.preferences)
   const [lines, setLines] = useState<Line[]>(initial.lines)
   const [fallback, setFallback] = useState<string[] | null>(initial.fallback)
   const [saving, setSaving] = useState(false)
   const [problem, setProblem] = useState<string | null>(null)
   const prefs: Preference[] = useMemo(() => [...lines, ...(fallback ? [{ default: fallback }] : [])], [lines, fallback])
-  const dirty = JSON.stringify(prefs) !== JSON.stringify(person.preferences)
+  const dirty = !readOnly && JSON.stringify(prefs) !== JSON.stringify(person.preferences)
 
   // "Try it"
   const memberOf = teams.filter((t) => t.members.includes(person.id))
@@ -218,6 +222,7 @@ function PersonEditor({ person, teams, onSaved, onToast }: { person: PersonView;
   const res = Number.isNaN(at.getTime()) ? null : resolveChannels(prefs, { severity: trySev, service: tryService || undefined, team: tryTeam || undefined }, at, teamDefault)
 
   const save = async () => {
+    if (readOnly) return
     setSaving(true)
     setProblem(null)
     try {
@@ -241,105 +246,119 @@ function PersonEditor({ person, teams, onSaved, onToast }: { person: PersonView;
       return next
     })
 
+  const contactBits = [
+    person.contact.email ? (readOnly ? maskAddress('email', person.contact.email) : person.contact.email) : null,
+    person.contact.phone ? (readOnly ? maskAddress('phone', person.contact.phone) : person.contact.phone) : null,
+  ].filter(Boolean)
+
   return (
     <div className="pref-editor">
       <div className="pref-head">
         <h2>{person.name}</h2>
         <span className="muted small">
-          {[person.contact.email, person.contact.phone].filter(Boolean).join(' · ')}
-          {memberOf.length > 0 && <> · {memberOf.map((t) => t.name).join(', ')}</>}
+          {contactBits.join(' · ')}
+          {memberOf.length > 0 && <>{contactBits.length > 0 ? ' · ' : ''}{memberOf.map((t) => t.name).join(', ')}</>}
         </span>
       </div>
 
-      <p className="small">Checked from the top; the first line that fits the alert decides.</p>
-      <ol className="pref-lines">
-        {lines.map((l, i) => (
-          <PrefLine
-            key={i}
-            line={l}
-            index={i}
-            count={lines.length}
-            teams={teams}
-            onChange={(next) => setLines((ls) => ls.map((x, j) => (j === i ? next : x)))}
-            onMove={(d) => move(i, d)}
-            onRemove={() => setLines((ls) => ls.filter((_, j) => j !== i))}
-          />
-        ))}
-        <li className="pref-line pref-fallback">
-          <div className="pref-num" aria-hidden="true">{lines.length + 1}</div>
-          <div className="pref-body">
-            <label className="check small">
-              <input type="checkbox" checked={fallback !== null} onChange={(e) => setFallback(e.target.checked ? ['ui'] : null)} />
-              Anything else
-            </label>
-            {fallback !== null ? (
-              <div className="inline wrap">
-                <span className="small">send by</span>
-                <ChannelPicker label="Anything else" value={fallback} onChange={setFallback} />
-              </div>
-            ) : (
-              <p className="hint">Not set: the team’s default channels apply, or in-app only.</p>
-            )}
-          </div>
-        </li>
-      </ol>
-      <div className="inline">
-        <button className="btn btn-sm" onClick={() => setLines((ls) => [...ls, { match: { severity: 'critical' }, channels: ['sms'] }])}>Add a line</button>
-      </div>
-
-      <section className="try-it" aria-label="Try these preferences">
-        <h3>Try it</h3>
-        <div className="inline wrap">
-          <span className="small">A</span>
-          <select className="select" value={trySev} onChange={(e) => setTrySev(e.target.value as Severity)} aria-label="Severity">
-            {SEVERITIES.map((s) => <option key={s} value={s}>{SEVERITY_LABEL[s].toLowerCase()}</option>)}
-          </select>
-          <span className="small">alert from</span>
-          <input className="input w-md" value={tryService} onChange={(e) => setTryService(e.target.value)} aria-label="Service" placeholder="service" />
-          <span className="small">for</span>
-          <select className="select" value={tryTeam} onChange={(e) => setTryTeam(e.target.value)} aria-label="Team">
-            {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-          </select>
-          <span className="small">at</span>
-          <input className="input" type="datetime-local" value={tryAt} onChange={(e) => setTryAt(e.target.value)} aria-label="When" />
+      {readOnly ? (
+        <div className="notice notice-warn banner" role="status">
+          Private: only {person.name} or an admin can view or edit their personal contact details and notification schedule.
         </div>
-        {res && (
-          <p className="try-result" aria-live="polite">
-            → <strong>{channelsText(res.channels)}</strong>{' '}
-            <span className="muted small">
-              {res.via === 'preference'
-                ? `(line ${res.line! + 1}${res.in_window === true ? ', inside its hours' : res.in_window === false ? ', outside its hours' : ''})`
-                : res.via === 'default'
-                  ? '(anything else)'
-                  : res.via === 'team'
-                    ? '(no line fits: the team’s default)'
-                    : '(no line fits and the team has no default: in-app only)'}
-            </span>
-            {res.problem && <span className="err-text small"> {res.problem}</span>}
-          </p>
-        )}
-        <p className="hint">Rules that name channels explicitly override this.</p>
-      </section>
+      ) : (
+        <>
+          <p className="small">Checked from the top; the first line that fits the alert decides.</p>
+          <ol className="pref-lines">
+            {lines.map((l, i) => (
+              <PrefLine
+                key={i}
+                line={l}
+                index={i}
+                count={lines.length}
+                teams={teams}
+                onChange={(next) => setLines((ls) => ls.map((x, j) => (j === i ? next : x)))}
+                onMove={(d) => move(i, d)}
+                onRemove={() => setLines((ls) => ls.filter((_, j) => j !== i))}
+              />
+            ))}
+            <li className="pref-line pref-fallback">
+              <div className="pref-num" aria-hidden="true">{lines.length + 1}</div>
+              <div className="pref-body">
+                <label className="check small">
+                  <input type="checkbox" checked={fallback !== null} onChange={(e) => setFallback(e.target.checked ? ['ui'] : null)} />
+                  Anything else
+                </label>
+                {fallback !== null ? (
+                  <div className="inline wrap">
+                    <span className="small">send by</span>
+                    <ChannelPicker label="Anything else" value={fallback} onChange={setFallback} />
+                  </div>
+                ) : (
+                  <p className="hint">Not set: the team’s default channels apply, or in-app only.</p>
+                )}
+              </div>
+            </li>
+          </ol>
+          <div className="inline">
+            <button className="btn btn-sm" onClick={() => setLines((ls) => [...ls, { match: { severity: 'critical' }, channels: ['sms'] }])}>Add a line</button>
+          </div>
 
-      {problem && <p className="problems-inline" role="alert">{problem}</p>}
-      <footer className={`save-bar ${dirty ? 'is-dirty' : ''}`}>
-        <span className="small">{dirty ? 'Unsaved changes' : 'No unsaved changes'}</span>
-        <span className="spacer" />
-        {dirty && <button className="btn" onClick={() => { const s = split(person.preferences); setLines(s.lines); setFallback(s.fallback) }}>Discard</button>}
-        <button className="btn btn-primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save'}</button>
-      </footer>
+          <section className="try-it" aria-label="Try these preferences">
+            <h3>Try it</h3>
+            <div className="inline wrap">
+              <span className="small">A</span>
+              <select className="select" value={trySev} onChange={(e) => setTrySev(e.target.value as Severity)} aria-label="Severity">
+                {SEVERITIES.map((s) => <option key={s} value={s}>{SEVERITY_LABEL[s].toLowerCase()}</option>)}
+              </select>
+              <span className="small">alert from</span>
+              <input className="input w-md" value={tryService} onChange={(e) => setTryService(e.target.value)} aria-label="Service" placeholder="service" />
+              <span className="small">for</span>
+              <select className="select" value={tryTeam} onChange={(e) => setTryTeam(e.target.value)} aria-label="Team">
+                {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+              <span className="small">at</span>
+              <input className="input" type="datetime-local" value={tryAt} onChange={(e) => setTryAt(e.target.value)} aria-label="When" />
+            </div>
+            {res && (
+              <p className="try-result" aria-live="polite">
+                → <strong>{channelsText(res.channels)}</strong>{' '}
+                <span className="muted small">
+                  {res.via === 'preference'
+                    ? `(line ${res.line! + 1}${res.in_window === true ? ', inside its hours' : res.in_window === false ? ', outside its hours' : ''})`
+                    : res.via === 'default'
+                      ? '(anything else)'
+                      : res.via === 'team'
+                        ? '(no line fits: the team’s default)'
+                        : '(no line fits and the team has no default: in-app only)'}
+                </span>
+                {res.problem && <span className="err-text small"> {res.problem}</span>}
+              </p>
+            )}
+            <p className="hint">Rules that name channels explicitly override this.</p>
+          </section>
+
+          {problem && <p className="problems-inline" role="alert">{problem}</p>}
+          <footer className={`save-bar ${dirty ? 'is-dirty' : ''}`}>
+            <span className="small">{dirty ? 'Unsaved changes' : 'No unsaved changes'}</span>
+            <span className="spacer" />
+            {dirty && <button className="btn" onClick={() => { const s = split(person.preferences); setLines(s.lines); setFallback(s.fallback) }}>Discard</button>}
+            <button className="btn btn-primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save'}</button>
+          </footer>
+        </>
+      )}
     </div>
   )
 }
 
 // ---- team ------------------------------------------------------------------------------
 
-function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: TeamView; people: PersonView[]; onSaved: (t: TeamView) => void; onNavigate: Props['onNavigate']; onToast: Props['onToast'] }) {
+function TeamEditor({ team, me, people, onSaved, onNavigate, onToast }: { team: TeamView; me: string | null; people: PersonView[]; onSaved: (t: TeamView) => void; onNavigate: Props['onNavigate']; onToast: Props['onToast'] }) {
   const [t, setT] = useState<TeamView>(team)
   const [saving, setSaving] = useState(false)
   const [problem, setProblem] = useState<string | null>(null)
   const [newSchedule, setNewSchedule] = useState('')
-  const dirty = JSON.stringify(t) !== JSON.stringify(team)
+  const readOnly = team.can_edit === false || (team.can_edit === undefined && me !== null && team.lead !== me)
+  const dirty = !readOnly && JSON.stringify(t) !== JSON.stringify(team)
   const name = (id: string) => people.find((p) => p.id === id)?.name ?? id
   const nonMembers = people.filter((p) => !t.members.includes(p.id))
 
@@ -350,6 +369,7 @@ function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: Team
   }
 
   const save = async () => {
+    if (readOnly) return
     setSaving(true)
     setProblem(null)
     try {
@@ -373,6 +393,12 @@ function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: Team
         <span className="muted small">Team <code>{t.id}</code> · rules route here with <code>team:{t.id}</code></span>
       </div>
 
+      {readOnly && (
+        <div className="notice notice-warn banner" role="status">
+          Read-only: only the team lead or an admin can change team membership, lead, or on-call rotations.
+        </div>
+      )}
+
       <section className="editor-section">
         <h3>Members</h3>
         <ul className="member-list">
@@ -381,12 +407,12 @@ function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: Team
               <a href={`#/preferences/person/${encodeURIComponent(m)}`} onClick={(e) => { e.preventDefault(); onNavigate(`#/preferences/person/${encodeURIComponent(m)}`) }}>{name(m)}</a>
               {t.lead === m && <span className="pill">Lead</span>}
               <span className="spacer" />
-              {t.lead !== m && <button className="btn btn-xs" onClick={() => setT({ ...t, lead: m })}>Make lead</button>}
-              <button className="icon-btn sm" onClick={() => removeMember(m)} aria-label={`Remove ${name(m)}`} title="Remove from team"><CloseIcon size={13} /></button>
+              {!readOnly && t.lead !== m && <button className="btn btn-xs" onClick={() => setT({ ...t, lead: m })}>Make lead</button>}
+              {!readOnly && <button className="icon-btn sm" onClick={() => removeMember(m)} aria-label={`Remove ${name(m)}`} title="Remove from team"><CloseIcon size={13} /></button>}
             </li>
           ))}
         </ul>
-        {nonMembers.length > 0 && (
+        {!readOnly && nonMembers.length > 0 && (
           <select className="select" value="" onChange={(e) => e.target.value && setT({ ...t, members: [...t.members, e.target.value] })} aria-label="Add a member">
             <option value="">Add a member…</option>
             {nonMembers.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
@@ -403,7 +429,7 @@ function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: Team
             <div className="inline">
               <strong className="mono small">oncall:{s}</strong>
               <span className="spacer" />
-              <button className="btn btn-xs" onClick={() => { const { [s]: _d, ...rest } = t.oncall; setT({ ...t, oncall: rest }) }}>Remove rotation</button>
+              {!readOnly && <button className="btn btn-xs" onClick={() => { const { [s]: _d, ...rest } = t.oncall; setT({ ...t, oncall: rest }) }}>Remove rotation</button>}
             </div>
             <ol className="rotation-list">
               {list.map((u, i) => (
@@ -412,13 +438,17 @@ function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: Team
                   {i === 0 && <span className="pill pill-live">On call now</span>}
                   {i === 1 && <span className="muted small">next, if nobody acknowledges</span>}
                   <span className="spacer" />
-                  <button className="icon-btn sm" disabled={i === 0} onClick={() => { const n = [...list]; [n[i - 1], n[i]] = [n[i]!, n[i - 1]!]; setRotation(s, n) }} aria-label="Earlier" title="Earlier">↑</button>
-                  <button className="icon-btn sm" disabled={i === list.length - 1} onClick={() => { const n = [...list]; [n[i + 1], n[i]] = [n[i]!, n[i + 1]!]; setRotation(s, n) }} aria-label="Later" title="Later">↓</button>
-                  <button className="icon-btn sm" onClick={() => setRotation(s, list.filter((x) => x !== u))} aria-label={`Take ${name(u)} off the rotation`} title="Remove"><CloseIcon size={13} /></button>
+                  {!readOnly && (
+                    <>
+                      <button className="icon-btn sm" disabled={i === 0} onClick={() => { const n = [...list]; [n[i - 1], n[i]] = [n[i]!, n[i - 1]!]; setRotation(s, n) }} aria-label="Earlier" title="Earlier">↑</button>
+                      <button className="icon-btn sm" disabled={i === list.length - 1} onClick={() => { const n = [...list]; [n[i + 1], n[i]] = [n[i]!, n[i + 1]!]; setRotation(s, n) }} aria-label="Later" title="Later">↓</button>
+                      <button className="icon-btn sm" onClick={() => setRotation(s, list.filter((x) => x !== u))} aria-label={`Take ${name(u)} off the rotation`} title="Remove"><CloseIcon size={13} /></button>
+                    </>
+                  )}
                 </li>
               ))}
             </ol>
-            {t.members.some((m) => !list.includes(m)) && (
+            {!readOnly && t.members.some((m) => !list.includes(m)) && (
               <select className="select select-sm" value="" onChange={(e) => e.target.value && setRotation(s, [...list, e.target.value])} aria-label="Add to rotation">
                 <option value="">Add to rotation…</option>
                 {t.members.filter((m) => !list.includes(m)).map((m) => <option key={m} value={m}>{name(m)}</option>)}
@@ -426,25 +456,33 @@ function TeamEditor({ team, people, onSaved, onNavigate, onToast }: { team: Team
             )}
           </div>
         ))}
-        <div className="inline">
-          <input className="input w-md mono" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value.replace(/[^\w-]/g, ''))} placeholder={t.id} aria-label="New rotation name" />
-          <button className="btn btn-sm" disabled={!newSchedule || newSchedule in t.oncall} onClick={() => { setRotation(newSchedule, []); setNewSchedule('') }}>Add rotation</button>
-        </div>
+        {!readOnly && (
+          <div className="inline">
+            <input className="input w-md mono" value={newSchedule} onChange={(e) => setNewSchedule(e.target.value.replace(/[^\w-]/g, ''))} placeholder={t.id} aria-label="New rotation name" />
+            <button className="btn btn-sm" disabled={!newSchedule || newSchedule in t.oncall} onClick={() => { setRotation(newSchedule, []); setNewSchedule('') }}>Add rotation</button>
+          </div>
+        )}
       </section>
 
       <section className="editor-section">
         <h3>Default channels</h3>
-        <ChannelPicker label="Default channels" value={t.default_channels} onChange={(default_channels) => setT({ ...t, default_channels })} />
+        {readOnly ? (
+          <p className="small">{channelsText(t.default_channels)}</p>
+        ) : (
+          <ChannelPicker label="Default channels" value={t.default_channels} onChange={(default_channels) => setT({ ...t, default_channels })} />
+        )}
         <p className="hint">Used for members with no matching preference of their own. Empty means in-app only.</p>
       </section>
 
       {problem && <p className="problems-inline" role="alert">{problem}</p>}
-      <footer className={`save-bar ${dirty ? 'is-dirty' : ''}`}>
-        <span className="small">{dirty ? 'Unsaved changes' : 'No unsaved changes'}</span>
-        <span className="spacer" />
-        {dirty && <button className="btn" onClick={() => setT(team)}>Discard</button>}
-        <button className="btn btn-primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save'}</button>
-      </footer>
+      {!readOnly && (
+        <footer className={`save-bar ${dirty ? 'is-dirty' : ''}`}>
+          <span className="small">{dirty ? 'Unsaved changes' : 'No unsaved changes'}</span>
+          <span className="spacer" />
+          {dirty && <button className="btn" onClick={() => setT(team)}>Discard</button>}
+          <button className="btn btn-primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save'}</button>
+        </footer>
+      )}
     </div>
   )
 }

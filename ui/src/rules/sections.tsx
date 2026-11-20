@@ -2,12 +2,12 @@
 // presentation, and noise controls (dedup, grouping, throttle).
 
 import { useId } from 'react'
-import { CHANNELS, COLOR_TOKENS, type ColorToken, type FieldSpec, type PersonView, type RouteSpec, type RuleSpec, type TeamView } from '../api/types'
+import { CHANNELS, COLOR_TOKENS, type ColorToken, type FieldSpec, type PersonDirectoryEntry, type RouteSpec, type RuleSpec, type TeamView } from '../api/types'
 import { CloseIcon } from '../lib/icons'
 
 export interface EditorEnv {
   teams: TeamView[]
-  people: PersonView[]
+  people: PersonDirectoryEntry[]
   /** Paths from the current test event, for suggestions. */
   paths: { path: string; value: unknown }[]
   problems: { path: string; message: string }[]

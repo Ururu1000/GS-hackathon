@@ -3,8 +3,8 @@
 // rule's revision.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { createRule, deleteRule, errorText, getRule, HttpError, isConflict, listPeople, listRunbooks, listTeams, updateRule } from '../api/client'
-import { SEVERITIES, type NodeDiagnostic, type PersonView, type RuleItem, type RuleSpec, type RuleTestResult, type RunbookSummary, type TeamView } from '../api/types'
+import { createRule, deleteRule, errorText, getRule, HttpError, isConflict, listDirectory, listRunbooks, listTeams, updateRule } from '../api/client'
+import { SEVERITIES, type NodeDiagnostic, type PersonDirectoryEntry, type RuleItem, type RuleSpec, type RuleTestResult, type RunbookSummary, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
 import { relTime } from '../lib/time'
 import { ConditionBuilder } from './ConditionBuilder'
@@ -30,7 +30,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
   const [draft, setDraft] = useState<RuleSpec | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [teams, setTeams] = useState<TeamView[]>([])
-  const [people, setPeople] = useState<PersonView[]>([])
+  const [people, setPeople] = useState<PersonDirectoryEntry[]>([])
   const [runbooks, setRunbooks] = useState<RunbookSummary[]>([])
   const [tab, setTab] = useState<Tab>('builder')
   const [yamlText, setYamlText] = useState('')
@@ -48,7 +48,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
 
   useEffect(() => {
     listTeams().then(setTeams, () => {})
-    listPeople().then(setPeople, () => {})
+    listDirectory().then(setPeople, () => {})
     listRunbooks().then(setRunbooks, () => {})
   }, [])
 
@@ -171,6 +171,7 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
   }
 
   const blocking = problems.length > 0 || yamlError !== null
+  const readOnly = !isNew && item?.can_edit === false
   const ruleTeam = teams.find((t) => t.id === draft.team)
 
   return (
@@ -184,10 +185,16 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
           </span>
         </div>
         <span className="spacer" />
-        {!isNew && item && (
+        {!isNew && item && !readOnly && (
           <button className="btn btn-ghost danger" onClick={() => setConfirmDelete(true)}>Delete</button>
         )}
       </header>
+
+      {readOnly && (
+        <div className="notice notice-warn banner" role="status">
+          Read-only: only members of team <code>{draft.team}</code> can edit or delete this rule. You can still test drafts against sample events.
+        </div>
+      )}
 
       {conflict && (
         <div className="notice notice-warn banner" role="alert">
@@ -301,17 +308,17 @@ export function RuleEditor({ id, from, team, onNavigate, onToast }: Props) {
         </div>
 
         <aside className="editor-side">
-          <TestPanel rule={draft} initialSample={isNew ? template.sample : guessSample(draft)} onResult={onResult} onToast={onToast} />
+          <TestPanel rule={draft} team={draft.team} initialSample={isNew ? template.sample : guessSample(draft)} onResult={onResult} onToast={onToast} />
         </aside>
       </div>
 
-      <footer className={`save-bar ${dirty ? 'is-dirty' : ''}`}>
+      <footer className={`save-bar ${dirty && !readOnly ? 'is-dirty' : ''}`}>
         <span className="small">
-          {!dirty ? 'No unsaved changes' : blocking ? `${problems.length + (yamlError ? 1 : 0)} problem${problems.length + (yamlError ? 1 : 0) === 1 ? '' : 's'} to fix before saving` : 'Unsaved changes'}
+          {readOnly ? 'Read-only for your account' : !dirty ? 'No unsaved changes' : blocking ? `${problems.length + (yamlError ? 1 : 0)} problem${problems.length + (yamlError ? 1 : 0) === 1 ? '' : 's'} to fix before saving` : 'Unsaved changes'}
         </span>
         <span className="spacer" />
         {dirty && !isNew && <button className="btn" onClick={() => { setDraft(item!.rule); setYamlText(toYaml(item!.rule)); setYamlError(null) }}>Discard</button>}
-        <button className="btn btn-primary" disabled={!dirty || saving || blocking} onClick={() => void save()}>
+        <button className="btn btn-primary" disabled={readOnly || !dirty || saving || blocking} onClick={() => void save()}>
           {saving ? 'Saving…' : isNew ? 'Create rule' : 'Save'}
         </button>
       </footer>
