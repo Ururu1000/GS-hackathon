@@ -16,6 +16,8 @@
 //! | `PUBLIC_URL`         | `http://localhost:5173` (SMS short links) | delivery          |
 //! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
 //! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery |
+//! | `DB_MAX_CONNECTIONS` | sized from the roles (see `pool_size`)    | all               |
+//! | `SHUTDOWN_GRACE_SECS`| `20` (drain time after SIGTERM/SIGINT)    | all               |
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
 //! | `INGEST_ADDR`        | `0.0.0.0:8090`                            | ingest            |
 //! | `INGEST_MAX_INFLIGHT`| `20000` (events in flight before 429)     | ingest            |
@@ -161,8 +163,16 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
     let db_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let max_connections = match std::env::var("DB_MAX_CONNECTIONS") {
+        Ok(v) => v.parse::<u32>().context("DB_MAX_CONNECTIONS")?.max(1),
+        Err(_) => pool_size(&args.roles)?,
+    };
+    info!(max_connections, "connecting to Postgres");
     let pool = PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(max_connections)
+        // A saturated pool surfaces as an error (logged, retried by the loops) instead of
+        // hanging a role forever (QA H4).
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&db_url)
         .await
         .context("connecting to Postgres")?;
@@ -369,25 +379,80 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let terminate = async {
-        #[cfg(unix)]
-        {
-            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing SIGTERM handler");
-            sig.recv().await;
-        }
-        #[cfg(not(unix))]
-        std::future::pending::<()>().await;
-    };
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("shutting down"),
-        // docker stop / kill send SIGTERM: leave consumer groups cleanly.
-        _ = terminate => info!("SIGTERM: shutting down"),
-        Some(res) = tasks.join_next() => {
-            if let Err(e) = res { tracing::error!(error = %e, "role task panicked"); }
-        }
+        sig = shutdown_signal() => info!(signal = sig, "shutting down"),
+        Some(res) = tasks.join_next() => match res {
+            Err(e) => tracing::error!(error = %e, "role task panicked; shutting down"),
+            Ok(()) => tracing::warn!("a role task exited; shutting down"),
+        },
     }
     let _ = shutdown_tx.send(true);
-    while tasks.join_next().await.is_some() {}
+    // Drain: roles stop claiming and finish in-flight work; anything still running after the
+    // grace period is aborted (its leases expire and another replica reclaims the work).
+    let grace: u64 = env_or("SHUTDOWN_GRACE_SECS", "20")
+        .parse()
+        .context("SHUTDOWN_GRACE_SECS")?;
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(grace), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            grace_secs = grace,
+            "shutdown grace period elapsed; aborting remaining tasks"
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM (what `docker stop` / Kubernetes send, QA H6).
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "SIGINT",
+                _ = term.recv() => "SIGTERM",
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install SIGTERM handler; only Ctrl-C stops the process");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+/// Default pool size from the roles in this process (QA H4). Delivery workers hold a
+/// connection only around claims, alert re-reads and finalizes, but up to `concurrency` jobs per
+/// worker can do that at once, so they get the largest share. Override with
+/// `DB_MAX_CONNECTIONS`.
+fn pool_size(roles: &[Role]) -> Result<u32> {
+    let mut n: u32 = 4; // migrations, health, slack
+    for role in roles {
+        n += match role {
+            Role::Delivery => {
+                let workers: u32 = env_or("DELIVERY_WORKERS", "1")
+                    .parse()
+                    .context("DELIVERY_WORKERS")?;
+                let channels = env_or("DELIVERY_CHANNELS", "email,sms,phone")
+                    .split(',')
+                    .filter(|c| !c.trim().is_empty())
+                    .count() as u32;
+                let per_worker = (WorkerConfig::default().concurrency as u32).div_ceil(2) + 2;
+                channels * workers.max(1) * per_worker
+            }
+            Role::Gateway => 4,
+            _ => 4,
+        };
+    }
+    Ok(n.min(200))
 }

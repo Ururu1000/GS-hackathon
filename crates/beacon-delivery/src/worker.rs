@@ -559,11 +559,15 @@ pub async fn work_once(
     }
 
     for job in claimed.jobs {
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore never closed");
+        // The semaphore is never closed today; if it ever is, stop spawning instead of panicking
+        // (a panic here would end `run_worker` and take the whole process down, QA M10). Jobs
+        // claimed but not started keep their lease and are reclaimed when it expires.
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            warn!(
+                "delivery worker semaphore closed; leaving remaining claimed jobs to lease expiry"
+            );
+            break;
+        };
         // Reap finished tasks as we go so results are not held for the whole batch.
         while let Some(res) = set.try_join_next() {
             tally(&mut stats, &mut first_err, res);
@@ -588,8 +592,9 @@ pub async fn work_once(
     }
 }
 
-/// Loop `work_once` until shutdown; poll again at once after a non-empty batch, else sleep
-/// `cfg.poll_interval`. Logs and backs off on DB errors instead of exiting.
+/// Loop `work_once` until shutdown (the value becomes `true` or the sender is dropped); poll
+/// again at once after a non-empty batch, else sleep `cfg.poll_interval`. Logs and backs off on
+/// DB errors instead of exiting.
 pub async fn run_worker(
     pool: PgPool,
     channel: Arc<dyn Channel>,
@@ -605,9 +610,10 @@ pub async fn run_worker(
                 tokio::select! {
                     _ = tokio::time::sleep(cfg.poll_interval) => {}
                     res = shutdown.changed() => {
+                        // Sender dropped: the owner is gone, so stop like the router does
+                        // instead of spinning forever with a pool clone (QA M9).
                         if res.is_err() {
-                            // Sender dropped: nobody can signal shutdown any more; keep polling.
-                            tokio::time::sleep(cfg.poll_interval).await;
+                            break;
                         }
                     }
                 }
@@ -616,7 +622,11 @@ pub async fn run_worker(
                 error!(error = %e, "delivery worker iteration failed");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = shutdown.changed() => {}
+                    res = shutdown.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
