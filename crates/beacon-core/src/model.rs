@@ -44,6 +44,17 @@ pub struct NotifyContext {
     pub schema: Option<String>,
 }
 
+/// The event that opened an alert, pinned for runbook templates such as
+/// `{{workflowId}}` (board #172). `raw` is capped at [`MAX_NOTIFY_RAW`] bytes;
+/// a larger payload becomes a truncated string preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotifyEvent {
+    pub fields: serde_json::Map<String, Value>,
+    pub raw: Value,
+}
+
+pub const MAX_NOTIFY_RAW: usize = 16 * 1024;
+
 /// Payload of an outbox row with `kind = 'notify'` (board #27/#35, spec §13).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotifyPayload {
@@ -60,6 +71,9 @@ pub struct NotifyPayload {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub context: NotifyContext,
+    /// Present on `reason = new` for rules with a runbook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<NotifyEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

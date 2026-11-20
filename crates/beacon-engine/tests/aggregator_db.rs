@@ -41,6 +41,10 @@ fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> Mat
             service: Some("trade-gateway".into()),
             ..Default::default()
         },
+        event: Some(beacon_core::model::NotifyEvent {
+            fields: serde_json::Map::new(),
+            raw: serde_json::json!({"payload": {"tradeId": "T-1"}}),
+        }),
     }
 }
 
@@ -76,6 +80,7 @@ async fn dedup_across_batches(pool: PgPool) {
     assert_eq!(n.route[0].channels.as_deref(), Some(&["email".to_string(), "ui".to_string()][..]));
     assert_eq!(n.context.service.as_deref(), Some("trade-gateway"));
     assert!(notify[0]["context"].get("environment").is_none(), "absent keys are omitted");
+    assert_eq!(n.event.as_ref().unwrap().raw["payload"]["tradeId"], serde_json::json!("T-1"));
 
     let notify_seq: i32 = sqlx::query_scalar("SELECT notify_seq FROM alerts").fetch_one(&pool).await.unwrap();
     assert_eq!(notify_seq, 1);
@@ -132,4 +137,26 @@ async fn nul_bytes_in_match_do_not_poison_batch(pool: PgPool) {
     let feed = load_feed_alerts(&pool, &[rows[0].0]).await.unwrap();
     assert_eq!(feed[0].title, "BadTitle");
     assert_eq!(feed[0].body, "Bodywithnuls");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn shared_transitions_for_delivery(pool: PgPool) {
+    use beacon_engine::alerts::{Transition, TransitionError, touch, transition};
+    apply_batch(&pool, &[rec("a", "fp", MatchKind::Fire, Utc::now())]).await.unwrap();
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM alerts").fetch_one(&pool).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(touch(&mut tx, id).await.unwrap());
+    // A system actor (e.g. SMS "ACK") skips the version check.
+    let a = transition(&mut tx, id, Transition::Ack, "user:bob", None).await.unwrap().unwrap();
+    assert_eq!((a.status.as_str(), a.version), ("acked", 3));
+    let r = transition(&mut tx, id, Transition::Resolve { reason: "runbook".into() }, "system", None).await.unwrap().unwrap();
+    assert_eq!(r.resolved_reason.as_deref(), Some("runbook"));
+    assert!(matches!(
+        transition(&mut tx, id, Transition::Ack, "user:bob", None).await.unwrap(),
+        Err(TransitionError::InvalidTransition(_))
+    ));
+    assert!(!touch(&mut tx, Uuid::now_v7()).await.unwrap());
+    tx.commit().await.unwrap();
+    let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE kind = 'alert_update'").fetch_one(&pool).await.unwrap();
+    assert_eq!(updates, 1 + 3, "aggregator + touch + ack + resolve");
 }

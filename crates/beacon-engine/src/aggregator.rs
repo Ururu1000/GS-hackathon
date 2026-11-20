@@ -233,6 +233,7 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
             route: m.route.clone(),
             created_at: now,
             context: m.context.clone(),
+            event: if reason == NotifyReason::New { m.event.clone() } else { None },
         };
         plan.outbox.push(OutboxRow {
             kind: outbox_kind::NOTIFY,
@@ -621,6 +622,7 @@ mod tests {
             ingested_at: t(at),
             diagnostics: vec![],
             context: Default::default(),
+            event: None,
         }
     }
 

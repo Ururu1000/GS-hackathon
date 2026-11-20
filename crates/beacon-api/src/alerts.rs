@@ -5,8 +5,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use beacon_core::FeedAlert;
-use beacon_core::model::outbox_kind;
-use beacon_engine::OUTBOX_CHANNEL;
+use beacon_engine::alerts as engine_alerts;
 use beacon_engine::feed::{FEED_COLUMNS, row_to_feed};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
@@ -265,65 +264,31 @@ async fn transition(
     Ok(Json(api_alert(&a)))
 }
 
-/// Ack or resolve under the row lock. Conflicts only when the *status* changed
-/// after `expected_version` (count bumps never conflict); repeating the same
-/// transition is idempotent.
+/// Ack or resolve via the shared engine transition (also used by delivery).
+/// Team scoping is checked first; the transition itself takes the row lock.
 pub async fn apply_transition(pool: &PgPool, session: &Session, id: Uuid, expected_version: i64, t: Transition) -> Result<FeedAlert, ApiError> {
-    let mut tx = pool.begin().await?;
-    let row = sqlx::query(&format!("SELECT {FEED_COLUMNS}, status_version FROM alerts WHERE id = $1 FOR UPDATE"))
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
-    let current = row_to_feed(&row)?;
-    if !session.can_see(&current.team) {
-        return Err(ApiError::not_found());
-    }
-    let status_version: i64 = row.try_get("status_version")?;
-    match (t, current.status.as_str()) {
-        (Transition::Ack, "acked") | (Transition::Resolve, "resolved") => return Ok(current),
-        (Transition::Ack, "resolved") => {
-            return Err(ApiError::conflict("invalid_transition", "a resolved alert cannot be acknowledged", api_alert(&current)));
-        }
-        _ if status_version > expected_version => {
-            return Err(ApiError::conflict(
-                "version_conflict",
-                format!("status changed to {} after version {expected_version}", current.status),
-                api_alert(&current),
-            ));
-        }
-        _ => {}
-    }
-    let actor = session.actor();
-    let sql = match t {
-        Transition::Ack => {
-            "UPDATE alerts SET status = 'acked', acked_by = $2, acked_at = now(),
-                version = version + 1, status_version = version + 1
-             WHERE id = $1"
-        }
-        Transition::Resolve => {
-            "UPDATE alerts SET status = 'resolved', resolved_by = $2, resolved_at = now(),
-                resolved_reason = 'user', dedup_active = false,
-                version = version + 1, status_version = version + 1
-             WHERE id = $1"
-        }
+    // Visibility first (team never changes), so other teams' ids don't leak.
+    load_alert(pool, session, id).await?;
+    let engine_t = match t {
+        Transition::Ack => engine_alerts::Transition::Ack,
+        Transition::Resolve => engine_alerts::Transition::Resolve { reason: "user".into() },
     };
-    sqlx::query(sql).bind(id).bind(&actor).execute(&mut *tx).await?;
-    // The relay publishes the new state to alerts.updates, which reaches every
-    // API replica's SSE clients, including this one.
-    sqlx::query("INSERT INTO outbox (kind, alert_id) VALUES ($1, $2)")
-        .bind(outbox_kind::ALERT_UPDATE)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("SELECT pg_notify($1, '')").bind(OUTBOX_CHANNEL).execute(&mut *tx).await?;
-    let row = sqlx::query(&format!("SELECT {FEED_COLUMNS} FROM alerts WHERE id = $1"))
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let updated = row_to_feed(&row)?;
-    tx.commit().await?;
-    Ok(updated)
+    let mut tx = pool.begin().await?;
+    match engine_alerts::transition(&mut tx, id, engine_t, &session.actor(), Some(expected_version)).await? {
+        Ok(a) => {
+            tx.commit().await?;
+            Ok(a)
+        }
+        Err(engine_alerts::TransitionError::NotFound) => Err(ApiError::not_found()),
+        Err(engine_alerts::TransitionError::InvalidTransition(current)) => {
+            Err(ApiError::conflict("invalid_transition", "a resolved alert cannot be acknowledged", api_alert(&current)))
+        }
+        Err(engine_alerts::TransitionError::VersionConflict(current)) => Err(ApiError::conflict(
+            "version_conflict",
+            format!("status changed to {} after version {expected_version}", current.status),
+            api_alert(&current),
+        )),
+    }
 }
 
 #[cfg(test)]

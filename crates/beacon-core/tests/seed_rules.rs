@@ -79,6 +79,13 @@ fn anna_fires_and_recovers_on_same_fingerprint() {
     assert_eq!(fire[0].context.service.as_deref(), Some("payments-api"));
     assert_eq!(fire[0].context.event_type.as_deref(), Some("HighErrorRate"));
     assert_eq!(fire[0].context.schema.as_deref(), Some("prometheus.alert"));
+    // Rules with a runbook pin the opening event for templates.
+    let ev = fire[0].event.as_ref().expect("anna's rule has a runbook");
+    assert_eq!(ev.raw["labels"]["region"], json!("eu-west"));
+    assert_eq!(ev.fields["service"], json!("payments-api"));
+    // Rules without one don't carry it (pricing has no runbook).
+    let (_, p) = run(&cfg, "http:logs", sample("pricing-log-warn.json"));
+    assert!(p[0].event.is_none());
 
     let (_, rec) = run(&cfg, "http:alertmanager", sample("high-error-rate-resolved.json"));
     assert_eq!(rec.len(), 1, "{rec:?}");

@@ -99,6 +99,7 @@ fn encode_bounded(mut rec: beacon_core::MatchRecord) -> Result<(String, Vec<u8>)
     warn!(rule = %rec.rule_id, bytes = payload.len(), "match too large; dropping copied fields");
     rec.fields.clear();
     rec.key.clear();
+    rec.event = None;
     rec.diagnostics = vec![format!("match was {} bytes; card fields dropped", payload.len())];
     let payload = serde_json::to_vec(&rec)?;
     // What is left is ids, two rendered strings capped at 8 KiB and the rule's
