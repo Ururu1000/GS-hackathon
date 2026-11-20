@@ -1,0 +1,13 @@
+# Business events in a {meta, payload} envelope (Appendix A, "Business event").
+# The envelope's own schema name becomes fields.type, so one mapping covers
+# every event type the producer emits.
+schema: envelope.meta-payload
+priority: 40
+detect:
+  all:
+    - { path: meta.schema, op: exists }
+    - { path: payload, op: exists }
+fields:
+  type:        { path: meta.schema }
+  service:     { path: meta.producer }
+  occurred_at: { path: meta.ts, as: epoch_ms }

@@ -1,0 +1,14 @@
+# Workflow engine failures (Appendix A, "Workflow failure", from a message broker).
+schema: workflow.failed
+priority: 50
+detect:
+  all:
+    - { path: type, op: exists }
+    - { path: workflowId, op: exists }
+    - { path: workflowName, op: exists }
+fields:
+  type:        { path: type }
+  severity:    { path: severity, enum: severity }
+  environment: { path: environment, transform: lower }
+  service:     { path: workflowName }
+  occurred_at: { path: timestamp, as: rfc3339 }

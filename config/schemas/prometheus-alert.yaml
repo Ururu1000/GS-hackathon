@@ -1,0 +1,14 @@
+# Prometheus Alertmanager-style webhook (Appendix A, "Metric threshold breach").
+schema: prometheus.alert
+priority: 50
+detect:
+  all:
+    - { path: alertname, op: exists }
+    - { path: status, op: in, value: [firing, resolved] }
+fields:
+  type:        { path: alertname }
+  severity:    { path: labels.severity, transform: lower, enum: severity }
+  service:     { path: labels.service }
+  region:      { path: labels.region }
+  occurred_at: { path: startsAt, as: rfc3339 }
+  resolved:    { path: status, equals: resolved }

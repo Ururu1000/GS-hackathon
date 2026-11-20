@@ -1,0 +1,26 @@
+# Anna (personal): anything critical from payments-api -> SMS between 08:00 and
+# 20:00, otherwise email. The time window lives in config/people/anna.yaml
+# (delivery); this rule only routes to her. A Prometheus `resolved` with the
+# same alertname + service closes the alert.
+id: anna-payments-critical
+name: Critical on payments-api (Anna)
+team: payments
+when:
+  all:
+    - { path: fields.service, op: eq, value: payments-api }
+    - { path: fields.severity, op: eq, value: critical }
+    - { not: { path: fields.resolved, op: eq, value: true } }
+route:
+  - to: user:anna
+present:
+  title: "{{ fields.type }} on {{ fields.service }} ({{ fields.region }})"
+  body: "{{ raw.annotations.summary }}"
+  fields:
+    - { path: fields.region, label: Region }
+    - { path: raw.annotations.summary, label: Summary }
+dedup:
+  key: [fields.type, fields.service, fields.region]
+  window: 30m
+auto_resolve:
+  recover_when: { path: fields.resolved, op: eq, value: true }
+runbook: payments-high-error-rate

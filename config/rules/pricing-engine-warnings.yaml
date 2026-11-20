@@ -1,0 +1,26 @@
+# Team Pricing: log lines from pricing-engine at WARN or above -> UI only;
+# one alert per instrument every 5 minutes.
+# M0 approximates the digest with a 5-minute dedup window keyed by instrument;
+# true time-bucket grouping (group:) lands in M3.
+id: pricing-engine-warnings
+name: Pricing engine warnings
+team: pricing
+when:
+  all:
+    - { path: fields.service, op: eq, value: pricing-engine }
+    - { path: fields.severity_rank, op: gte, value: 2 }
+route:
+  - to: team:pricing
+    channels: [ui]
+present:
+  title: "pricing-engine {{ fields.severity }} on {{ fields.instrument }}"
+  body: "{{ raw.msg }}"
+  fields:
+    - { path: fields.instrument, label: Instrument }
+    - { path: raw.msg, label: Message }
+dedup:
+  key: [fields.instrument]
+  window: 5m
+group:
+  by: [fields.instrument]
+  window: 5m

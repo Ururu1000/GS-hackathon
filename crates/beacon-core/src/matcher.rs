@@ -1,0 +1,316 @@
+//! Normalize + match (spec §5.2). Stateless: a pure function of the config
+//! snapshot and the event, so any matcher replica can handle any event.
+
+use std::collections::{BTreeSet, HashMap};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use crate::condition::{Condition, Op};
+use crate::config::ConfigSnapshot;
+use crate::event::Event;
+use crate::mapping::{Diagnostic, structural_signature};
+use crate::model::AlertField;
+use crate::path::Path;
+use crate::rule::{CompiledRule, RouteSpec};
+use crate::severity::Severity;
+use crate::template;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchKind {
+    /// The rule's `when` matched: open or bump an alert.
+    Fire,
+    /// The rule's `auto_resolve.recover_when` matched: resolve the alert with the same key.
+    Recover,
+}
+
+/// One rule matching one event. Published to `alerts.matches`, keyed by `fingerprint`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchRecord {
+    /// Stable across replays: `(event_id, rule_id)` for fires, plus `:recover` for recoveries.
+    pub match_id: String,
+    pub kind: MatchKind,
+    pub rule_id: String,
+    pub rule_revision: i64,
+    pub rule_name: String,
+    pub team: String,
+    /// Hash of rule id + dedup key values: the incident identity.
+    pub fingerprint: String,
+    pub key: Vec<Value>,
+    pub dedup_window_ms: u64,
+    pub severity: String,
+    pub color: String,
+    pub title: String,
+    pub body: String,
+    pub fields: Vec<AlertField>,
+    pub route: Vec<RouteSpec>,
+    pub event_id: String,
+    pub source: String,
+    pub schema: String,
+    pub ingested_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+/// Pre-index: rules whose condition requires `path == value` for some top-level
+/// conjunct are only evaluated when the event has that value. Everything else
+/// is in the fallback bucket. The full predicate always runs on candidates, so
+/// the index can only skip work, never change results.
+#[derive(Debug, Default, Clone)]
+pub struct RuleIndex {
+    /// path → (canonical value → rule positions)
+    by_path: Vec<(Path, HashMap<String, Vec<usize>>)>,
+    fallback: Vec<usize>,
+}
+
+impl RuleIndex {
+    pub fn build<'a>(conds: impl Iterator<Item = (usize, Option<&'a Condition>)>) -> RuleIndex {
+        let mut idx = RuleIndex::default();
+        for (pos, cond) in conds {
+            let Some(cond) = cond else { continue };
+            match selector(cond) {
+                Some((path, values)) => {
+                    let slot = match idx.by_path.iter().position(|(p, _)| p == path) {
+                        Some(i) => i,
+                        None => {
+                            idx.by_path.push((path.clone(), HashMap::new()));
+                            idx.by_path.len() - 1
+                        }
+                    };
+                    for v in values {
+                        idx.by_path[slot].1.entry(canonical(v)).or_default().push(pos);
+                    }
+                }
+                None => idx.fallback.push(pos),
+            }
+        }
+        idx
+    }
+
+    pub fn candidates(&self, event: &Event) -> BTreeSet<usize> {
+        let mut out: BTreeSet<usize> = self.fallback.iter().copied().collect();
+        for (path, map) in &self.by_path {
+            if let Some(v) = path.resolve(event) {
+                if let Some(rules) = map.get(&canonical(v.as_ref())) {
+                    out.extend(rules.iter().copied());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn indexed_paths(&self) -> usize {
+        self.by_path.len()
+    }
+}
+
+/// A necessary equality: a top-level `eq`/`in` leaf, or one directly under a top-level `all`.
+/// Preference: schema, fields.type, source, then any other path.
+fn selector(cond: &Condition) -> Option<(&Path, Vec<&Value>)> {
+    let leaves: Vec<&crate::condition::Leaf> = match cond {
+        Condition::Leaf(l) => vec![l],
+        Condition::All(cs) => cs
+            .iter()
+            .filter_map(|c| match c {
+                Condition::Leaf(l) => Some(l),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    let usable = |l: &&crate::condition::Leaf| match l.op {
+        // Numbers are excluded: 1 and 1.0 are equal but canonicalize differently.
+        Op::Eq => indexable(&l.value),
+        Op::In => l.value.as_array().is_some_and(|a| !a.is_empty() && a.iter().all(indexable)),
+        _ => false,
+    };
+    let rank = |l: &crate::condition::Leaf| match l.path.as_str() {
+        "schema" => 0,
+        "fields.type" => 1,
+        "source" => 2,
+        _ => 3,
+    };
+    let best = leaves.into_iter().filter(usable).min_by_key(|l| rank(l))?;
+    let values = match best.op {
+        Op::In => best.value.as_array().unwrap().iter().collect(),
+        _ => vec![&best.value],
+    };
+    Some((&best.path, values))
+}
+
+fn indexable(v: &Value) -> bool {
+    matches!(v, Value::String(_) | Value::Bool(_))
+}
+
+fn canonical(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("s:{s}"),
+        Value::Bool(b) => format!("b:{b}"),
+        other => format!("j:{other}"),
+    }
+}
+
+impl ConfigSnapshot {
+    /// Detect the schema and extract canonical fields, in place.
+    ///
+    /// An explicit source-scoped mapping wins. Otherwise the highest-priority
+    /// detector whose tests pass; a tie between different schemas at the top
+    /// priority becomes `unknown` with a diagnostic.
+    pub fn normalize(&self, event: &mut Event) -> Vec<Diagnostic> {
+        let detected: Vec<_> = self.mappings.iter().filter(|m| m.detects(event)).collect();
+        let chosen = if let Some(m) = detected.iter().find(|m| m.is_source_scoped()) {
+            Some(*m)
+        } else if let Some(top) = detected.first() {
+            let tied: Vec<_> = detected
+                .iter()
+                .filter(|m| m.priority == top.priority && m.schema != top.schema)
+                .collect();
+            if tied.is_empty() {
+                Some(*top)
+            } else {
+                let names: Vec<_> = std::iter::once(top.schema.as_str())
+                    .chain(tied.iter().map(|m| m.schema.as_str()))
+                    .collect();
+                event.schema = structural_signature(&event.raw);
+                return vec![Diagnostic {
+                    field: "schema".into(),
+                    message: format!("ambiguous: {} detectors tie at priority {}: {names:?}", names.len(), top.priority),
+                }];
+            }
+        } else {
+            None
+        };
+        match chosen {
+            Some(m) => {
+                event.schema = m.schema.clone();
+                let (fields, diags) = m.extract(event);
+                event.fields = fields;
+                diags
+            }
+            None => {
+                event.schema = structural_signature(&event.raw);
+                vec![]
+            }
+        }
+    }
+
+    /// Evaluate the candidate rules against a normalized event.
+    pub fn match_event(&self, event: &Event) -> Vec<MatchRecord> {
+        let mut out = Vec::new();
+        let recovering: BTreeSet<usize> = self
+            .recover_index
+            .candidates(event)
+            .into_iter()
+            .filter(|&i| {
+                let r = &self.rules[i];
+                r.spec.enabled && r.recover_when.as_ref().is_some_and(|c| c.eval(event))
+            })
+            .collect();
+        for &i in &recovering {
+            out.push(self.record(&self.rules[i], event, MatchKind::Recover));
+        }
+        for i in self.fire_index.candidates(event) {
+            let r = &self.rules[i];
+            // A recovery signal never opens an alert for the same rule.
+            if r.spec.enabled && !recovering.contains(&i) && r.when.eval(event) {
+                out.push(self.record(r, event, MatchKind::Fire));
+            }
+        }
+        out
+    }
+
+    /// Normalize then match; the event is returned with its schema and fields filled.
+    pub fn process(&self, mut event: Event) -> (Event, Vec<MatchRecord>, Vec<Diagnostic>) {
+        let diags = self.normalize(&mut event);
+        let matches = self.match_event(&event);
+        (event, matches, diags)
+    }
+
+    fn record(&self, rule: &CompiledRule, event: &Event, kind: MatchKind) -> MatchRecord {
+        let mut diagnostics = Vec::new();
+        let mut key = Vec::with_capacity(rule.dedup_key.len());
+        let mut missing = false;
+        for p in &rule.dedup_key {
+            match p.resolve(event) {
+                Some(v) => key.push(v.into_owned()),
+                None => {
+                    missing = true;
+                    diagnostics.push(format!("dedup key `{p}` missing; alert not merged"));
+                    key.push(Value::Null);
+                }
+            }
+        }
+        let fingerprint = fingerprint(rule.id(), &key, missing.then_some(event.id.as_str()));
+        let severity = rule
+            .spec
+            .severity
+            .or_else(|| event.fields.get("severity").and_then(Value::as_str).and_then(Severity::normalize))
+            .unwrap_or(Severity::Warning);
+        let (title, body, fields) = if kind == MatchKind::Fire {
+            let ctx = template::context(event);
+            let title = template::render(&self.env, &format!("{}:title", rule.id()), &ctx);
+            let body = template::render(&self.env, &format!("{}:body", rule.id()), &ctx);
+            let fields = rule
+                .fields
+                .iter()
+                .filter_map(|(p, label)| {
+                    p.resolve(event).map(|v| AlertField {
+                        path: p.to_string(),
+                        label: label.clone(),
+                        value: v.into_owned(),
+                    })
+                })
+                .collect();
+            (title, body, fields)
+        } else {
+            (String::new(), String::new(), Vec::new())
+        };
+        MatchRecord {
+            match_id: match kind {
+                MatchKind::Fire => format!("{}:{}", event.id, rule.id()),
+                MatchKind::Recover => format!("{}:{}:recover", event.id, rule.id()),
+            },
+            kind,
+            rule_id: rule.id().to_string(),
+            rule_revision: rule.revision,
+            rule_name: rule.name().to_string(),
+            team: rule.spec.team.clone(),
+            fingerprint,
+            key,
+            dedup_window_ms: rule.spec.dedup.window.as_millis() as u64,
+            severity: severity.as_str().to_string(),
+            color: rule
+                .spec
+                .present
+                .color
+                .clone()
+                .unwrap_or_else(|| severity.default_color().to_string()),
+            title,
+            body,
+            fields,
+            route: rule.spec.route.clone(),
+            event_id: event.id.clone(),
+            source: event.source.clone(),
+            schema: event.schema.clone(),
+            ingested_at: event.ingested_at,
+            diagnostics,
+        }
+    }
+}
+
+/// Incident identity: rule id + dedup key values. When a key field is missing
+/// the event id is mixed in, so unrelated events are never silently merged.
+pub fn fingerprint(rule_id: &str, key: &[Value], unique: Option<&str>) -> String {
+    let mut h = Sha256::new();
+    h.update(rule_id.as_bytes());
+    h.update([0]);
+    h.update(serde_json::to_vec(key).unwrap_or_default());
+    if let Some(u) = unique {
+        h.update([0]);
+        h.update(u.as_bytes());
+    }
+    hex::encode(&h.finalize()[..16])
+}
