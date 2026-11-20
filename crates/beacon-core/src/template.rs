@@ -34,6 +34,9 @@ fn money(v: JValue) -> String {
     } else {
         return v.to_string();
     };
+    if !n.is_finite() || n.abs() > 1e15 {
+        return v.to_string();
+    }
     let neg = n < 0.0;
     // Round to cents first so 1000.999 carries into 1,001 instead of `.100`.
     let cents = (n.abs() * 100.0).round() as u128;
@@ -109,6 +112,8 @@ mod tests {
         assert_eq!(money(JValue::from("1000")), "1,000");
         assert_eq!(money(JValue::from(1000.999)), "1,001");
         assert_eq!(money(JValue::from(-1234567.5)), "-1,234,567.50");
+        assert_eq!(money(JValue::from("NaN")), "NaN");
+        assert_eq!(money(JValue::from("Infinity")), "Infinity");
     }
 
     #[test]

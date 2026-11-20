@@ -20,6 +20,8 @@ use crate::path::{Path, PathError, Root};
 /// Upper bound on tree size, so a pasted rule can't blow up evaluation.
 pub const MAX_NODES: usize = 256;
 pub const MAX_REGEX_LEN: usize = 1024;
+/// Bound compiled NFA/DFA size so short regexes like `(a{50}){50}` cannot blow up memory.
+const MAX_REGEX_SIZE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -246,7 +248,11 @@ fn compile(
                         return Err(ConditionError::RegexTooLong { path: p });
                     }
                     regex = Some(
-                        Regex::new(pat).map_err(|source| ConditionError::Regex { path: p, source })?,
+                        regex::RegexBuilder::new(pat)
+                            .size_limit(MAX_REGEX_SIZE_BYTES)
+                            .dfa_size_limit(MAX_REGEX_SIZE_BYTES)
+                            .build()
+                            .map_err(|source| ConditionError::Regex { path: p, source })?,
                     );
                 }
                 _ => {}
@@ -439,6 +445,7 @@ all:
     fn compile_errors() {
         let bad = |y: &str| Condition::compile(&serde_saphyr::from_str::<ConditionSpec>(y).unwrap()).is_err();
         assert!(bad("{ path: raw.x, op: regex, value: \"(\" }"));
+        assert!(bad("{ path: raw.x, op: regex, value: \"(a{500}){500}\" }"));
         assert!(bad("{ path: raw.x, op: eq }"));
         assert!(bad("{ path: raw.x, op: in, value: 3 }"));
         assert!(bad("{ path: nope.x, op: exists }"));

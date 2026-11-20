@@ -16,7 +16,7 @@
 //!   resolved:    { path: status, equals: resolved }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -294,33 +294,58 @@ pub fn rfc3339(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Bounds on unknown-schema signature traversal so a large or deeply nested
+/// payload cannot amplify into excessive CPU or memory allocation.
+const MAX_SIG_DEPTH: usize = 32;
+const MAX_SIG_NODES: usize = 4096;
+
 /// Structural signature of an unknown payload: sorted escaped paths with array
 /// positions normalized and values ignored. Only used to group samples for
 /// discovery (optional keys split shapes, equal shapes collide).
 pub fn structural_signature(raw: &Value) -> String {
-    let mut paths = Vec::new();
-    fn go(v: &Value, prefix: &str, out: &mut Vec<String>) {
+    let mut paths = BTreeSet::new();
+    let mut remaining = MAX_SIG_NODES;
+    fn go(v: &Value, prefix: &str, depth: usize, remaining: &mut usize, out: &mut BTreeSet<String>) {
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        if depth >= MAX_SIG_DEPTH {
+            out.insert(format!("{prefix}/..."));
+            return;
+        }
         match v {
             Value::Object(m) => {
+                if m.is_empty() {
+                    out.insert(format!("{prefix}/{{}}"));
+                }
                 for (k, v) in m {
+                    if *remaining == 0 {
+                        break;
+                    }
                     let p = format!("{prefix}/{}", k.replace('~', "~0").replace('/', "~1"));
-                    go(v, &p, out);
+                    go(v, &p, depth + 1, remaining, out);
                 }
             }
             Value::Array(items) => {
+                let arr_prefix = format!("{prefix}/[]");
                 if items.is_empty() {
-                    out.push(format!("{prefix}/[]"));
+                    out.insert(arr_prefix);
+                    return;
                 }
                 for v in items {
-                    go(v, &format!("{prefix}/[]"), out);
+                    if *remaining == 0 {
+                        break;
+                    }
+                    go(v, &arr_prefix, depth + 1, remaining, out);
                 }
             }
-            _ => out.push(prefix.to_string()),
+            _ => {
+                out.insert(prefix.to_string());
+            }
         }
     }
-    go(raw, "", &mut paths);
-    paths.sort();
-    paths.dedup();
+    go(raw, "", 0, &mut remaining, &mut paths);
     let mut h = Sha256::new();
     h.update(b"sig-v1\n");
     for p in &paths {
@@ -397,5 +422,17 @@ fields:
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("unknown:"));
+    }
+
+    #[test]
+    fn signature_bounds_large_and_deep_payloads() {
+        let mut deep = json!(1);
+        for _ in 0..80 {
+            deep = json!({"n": deep});
+        }
+        assert!(structural_signature(&deep).starts_with("unknown:"));
+
+        let wide = Value::Array((0..10_000).map(|i| json!({"k": i})).collect());
+        assert!(structural_signature(&wide).starts_with("unknown:"));
     }
 }

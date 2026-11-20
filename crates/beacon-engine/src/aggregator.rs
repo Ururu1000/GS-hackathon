@@ -392,6 +392,46 @@ async fn load_recoveries(tx: &mut sqlx::PgConnection, keys: &[(String, String)])
         .collect()
 }
 
+/// Strip embedded NUL bytes (`\u0000`) from all strings and object keys before
+/// binding to Postgres `jsonb`: valid JSON allows `\u0000`, but Postgres `jsonb`
+/// rejects it, which would otherwise stall the aggregator partition permanently.
+fn strip_nuls(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if s.contains('\0') {
+                s.retain(|c| c != '\0');
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_nuls(item);
+            }
+        }
+        Value::Object(map) => {
+            let has_nul_key = map.keys().any(|k| k.contains('\0'));
+            if has_nul_key {
+                let old = std::mem::take(map);
+                for (mut k, mut val) in old {
+                    k.retain(|c| c != '\0');
+                    strip_nuls(&mut val);
+                    map.insert(k, val);
+                }
+            } else {
+                for val in map.values_mut() {
+                    strip_nuls(val);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitized_json<T: Serialize>(value: &T) -> Result<Value> {
+    let mut v = serde_json::to_value(value)?;
+    strip_nuls(&mut v);
+    Ok(v)
+}
+
 /// Apply one batch in a single transaction. Returns the plan that was written.
 pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
     // Lookup by (rule_id, fingerprint) so the partial unique index is used.
@@ -413,7 +453,7 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
              FROM jsonb_populate_recordset(NULL::alerts, $1) AS u
              WHERE a.id = u.id",
         )
-        .bind(serde_json::to_value(&plan.updates)?)
+        .bind(sanitized_json(&plan.updates)?)
         .execute(&mut *tx)
         .await
         .context("updating alerts")?;
@@ -430,7 +470,7 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
                 last_event_id, resolved_by, resolved_at, resolved_reason
              FROM jsonb_populate_recordset(NULL::alerts, $1)",
         )
-        .bind(serde_json::to_value(&plan.inserts)?)
+        .bind(sanitized_json(&plan.inserts)?)
         .execute(&mut *tx)
         .await
         .context("inserting alerts")?;
@@ -453,16 +493,18 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
         .context("recording recoveries")?;
     }
     if !plan.outbox.is_empty() {
-        let rows: Vec<Value> = plan
-            .outbox
-            .iter()
-            .map(|o| json!({"kind": o.kind, "alert_id": o.alert_id, "payload": o.payload}))
-            .collect();
+        let mut rows = Value::Array(
+            plan.outbox
+                .iter()
+                .map(|o| json!({"kind": o.kind, "alert_id": o.alert_id, "payload": o.payload}))
+                .collect(),
+        );
+        strip_nuls(&mut rows);
         sqlx::query(
             "INSERT INTO outbox (kind, alert_id, payload)
              SELECT kind, alert_id, payload FROM jsonb_to_recordset($1) AS x(kind text, alert_id uuid, payload jsonb)",
         )
-        .bind(Value::Array(rows))
+        .bind(rows)
         .execute(&mut *tx)
         .await
         .context("inserting outbox rows")?;
@@ -739,5 +781,12 @@ mod tests {
         ex.touched = false;
         let p = plan(&[m("r", "fp", 5, MatchKind::Recover, "error")], vec![ex], Recoveries::new(), t(11));
         assert!(p.updates.is_empty() && p.inserts.is_empty());
+    }
+
+    #[test]
+    fn strip_nuls_removes_embedded_nul_bytes() {
+        let mut v = json!({"a\0b": "he\0llo", "arr": ["x\0y", {"nested": "\0"}]});
+        strip_nuls(&mut v);
+        assert_eq!(v, json!({"ab": "hello", "arr": ["xy", {"nested": ""}]}));
     }
 }

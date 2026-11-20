@@ -111,3 +111,19 @@ async fn acked_alerts_keep_counting(pool: PgPool) {
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].1, rows[0].2.as_str()), (2, "acked"));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn nul_bytes_in_match_do_not_poison_batch(pool: PgPool) {
+    let t0 = Utc::now();
+    let mut poisoned = rec("nul-1", "fp-nul", MatchKind::Fire, t0);
+    poisoned.title = "Bad\0Title".into();
+    poisoned.body = "Body\0with\0nuls".into();
+    poisoned.fields[0].value = serde_json::json!({"k\0": "v\0"});
+    apply_batch(&pool, &[poisoned]).await.unwrap();
+
+    let rows = alert_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    let feed = load_feed_alerts(&pool, &[rows[0].0]).await.unwrap();
+    assert_eq!(feed[0].title, "BadTitle");
+    assert_eq!(feed[0].body, "Bodywithnuls");
+}

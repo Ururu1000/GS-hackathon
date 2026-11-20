@@ -28,6 +28,8 @@ use crate::publisher::{EventPublisher, PublishError};
 /// Below the broker's 1 MiB record limit, leaving room for the envelope.
 pub const MAX_BODY: usize = 900 * 1024;
 pub const MAX_BATCH: usize = 1000;
+/// Bound how long a slow client may hold an in-flight permit while streaming a body.
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Abstracts the broker so the handler can be tested without Kafka.
 pub trait Sink: Send + Sync + 'static {
@@ -93,19 +95,38 @@ fn event_id(headers: &HeaderMap, source: &str) -> Result<String, Response> {
 }
 
 /// Read the body only after an in-flight permit is held, so saturation is
-/// answered with 429 before any request body is buffered or parsed.
+/// answered with 429 before any request body is buffered or parsed. Bounded by
+/// `BODY_READ_TIMEOUT` so slow clients cannot hold permits indefinitely.
 #[allow(clippy::result_large_err)] // the Err is a ready-made HTTP response
 async fn read_body(body: Body) -> Result<Bytes, Response> {
-    axum::body::to_bytes(body, MAX_BODY)
-        .await
-        .map_err(|_| error(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", format!("body exceeds {MAX_BODY} bytes")))
+    read_body_with_timeout(body, BODY_READ_TIMEOUT).await
+}
+
+#[allow(clippy::result_large_err)] // the Err is a ready-made HTTP response
+async fn read_body_with_timeout(body: Body, timeout: Duration) -> Result<Bytes, Response> {
+    match tokio::time::timeout(timeout, axum::body::to_bytes(body, MAX_BODY)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(_)) => Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            format!("body exceeds {MAX_BODY} bytes"),
+        )),
+        Err(_) => Err(error(
+            StatusCode::REQUEST_TIMEOUT,
+            "body_timeout",
+            "timed out reading request body",
+        )),
+    }
 }
 
 fn map_publish_error(e: PublishError) -> Response {
     match e {
         PublishError::Saturated => error(StatusCode::TOO_MANY_REQUESTS, "saturated", "broker queue full, retry"),
         PublishError::TooLarge => error(StatusCode::PAYLOAD_TOO_LARGE, "event_too_large", "event exceeds the broker record limit"),
-        PublishError::Broker(m) => error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable", m),
+        PublishError::Broker(m) => {
+            tracing::warn!(error = %m, "broker publish failed");
+            error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable", "broker unavailable, retry")
+        }
     }
 }
 
@@ -284,9 +305,22 @@ mod tests {
         let sat = Arc::new(Mem { fail: Some(|| PublishError::Saturated), ..Default::default() });
         let (s, _) = call(router(IngestState::new(sat, 10)), post("/ingest/x", "{}")).await;
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
-        let down = Arc::new(Mem { fail: Some(|| PublishError::Broker("down".into())), ..Default::default() });
-        let (s, _) = call(router(IngestState::new(down, 10)), post("/ingest/x", "{}")).await;
+        let down = Arc::new(Mem { fail: Some(|| PublishError::Broker("secret-broker:19092".into())), ..Default::default() });
+        let (s, v) = call(router(IngestState::new(down, 10)), post("/ingest/x", "{}")).await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !v["error"]["message"].as_str().unwrap_or("").contains("secret-broker"),
+            "broker internals must not leak in HTTP 503: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_body_times_out_with_408() {
+        let pending_body = Body::from_stream(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let err = read_body_with_timeout(pending_body, Duration::from_millis(20))
+            .await
+            .expect_err("slow body must time out");
+        assert_eq!(err.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[tokio::test]
