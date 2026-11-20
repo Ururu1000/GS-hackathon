@@ -336,12 +336,21 @@ impl ConfigSnapshot {
     }
 }
 
+/// Canonical facts are short identifiers; anything longer is cut at 256 bytes.
 fn field_str(event: &Event, name: &str) -> Option<String> {
-    event.fields.get(name).and_then(|v| match v {
+    let mut s = event.fields.get(name).and_then(|v| match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
         _ => None,
-    })
+    })?;
+    if s.len() > 256 {
+        let mut cut = 256;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+    Some(s)
 }
 
 /// Incident identity: rule id + dedup key values. When a key field is missing

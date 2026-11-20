@@ -76,10 +76,14 @@ impl Session {
 
     pub fn check_csrf(&self, headers: &HeaderMap) -> Result<(), ApiError> {
         match headers.get("x-csrf-token").and_then(|v| v.to_str().ok()) {
-            Some(t) if t == self.csrf_token => Ok(()),
+            Some(t) if constant_time_eq(t.as_bytes(), self.csrf_token.as_bytes()) => Ok(()),
             _ => Err(ApiError::new(axum::http::StatusCode::FORBIDDEN, "csrf", "missing or wrong X-CSRF-Token")),
         }
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub async fn get_session(State(state): State<ApiState>) -> Json<Session> {

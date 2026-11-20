@@ -22,6 +22,19 @@ pub async fn run_feed(
     bootstrap: String,
     updates: broadcast::Sender<FeedAlert>,
     ready: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    // Not ready whenever this consumer is not running: SSE streams close and
+    // new connections wait, so no client sits on a feed nobody fills.
+    let res = consume(bootstrap, updates, &ready, shutdown).await;
+    let _ = ready.send(false);
+    res
+}
+
+async fn consume(
+    bootstrap: String,
+    updates: broadcast::Sender<FeedAlert>,
+    ready: &watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let group = format!("beacon-api-{}", uuid::Uuid::now_v7().simple());
@@ -41,10 +54,11 @@ pub async fn run_feed(
             _ = shutdown.changed() => break,
             m = tokio::time::timeout(Duration::from_millis(200), consumer.recv()) => m,
         };
-        if !assigned && consumer.assignment().map(|a| a.count() > 0).unwrap_or(false) {
-            assigned = true;
-            let _ = ready.send(true);
-            info!("api feed consumer assigned; ready");
+        let now_assigned = consumer.assignment().map(|a| a.count() > 0).unwrap_or(false);
+        if now_assigned != assigned {
+            assigned = now_assigned;
+            let _ = ready.send(assigned);
+            info!(ready = assigned, "api feed consumer assignment changed");
         }
         match msg {
             Err(_) => continue,
@@ -62,6 +76,5 @@ pub async fn run_feed(
             },
         }
     }
-    let _ = ready.send(false);
     Ok(())
 }

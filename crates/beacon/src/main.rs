@@ -17,7 +17,7 @@
 //! | `MATCHER_WORKERS`    | `2` (consumers in the matcher group)      | matcher           |
 //! | `AGGREGATOR_WORKERS` | `2` (consumers in the aggregator group)   | aggregator        |
 //! | `RELAY_WORKERS`      | `1`                                       | relay             |
-//! | `API_ADDR`           | `0.0.0.0:8080`                            | api               |
+//! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
 //! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
 //! | `BEACON_UI_DIR`      | `ui/dist` if it exists (static UI)        | api               |
 
@@ -234,7 +234,8 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Api => {
-                let addr = env_or("API_ADDR", "0.0.0.0:8080");
+                // No real auth yet (demo session), so local-only unless asked.
+                let addr = env_or("API_ADDR", "127.0.0.1:8080");
                 let session = std::sync::Arc::new(
                     beacon_api::Session::demo(&config_dir, &env_or("BEACON_DEMO_USER", "anna"))
                         .context("building the demo session from config/people and config/teams")?,

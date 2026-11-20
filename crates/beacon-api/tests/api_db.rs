@@ -38,16 +38,17 @@ async fn seed(pool: &PgPool, samples: &[&str]) {
 struct Harness {
     app: Router,
     updates: broadcast::Sender<FeedAlert>,
+    ready: watch::Sender<bool>,
     csrf: String,
 }
 
 fn harness(pool: PgPool) -> Harness {
     let session = Arc::new(Session::demo(&root().join("config"), "anna").unwrap());
     let (updates, _) = broadcast::channel(64);
-    let (_ready_tx, ready) = watch::channel(true);
+    let (ready_tx, ready) = watch::channel(true);
     let csrf = session.csrf_token.clone();
     let state = ApiState { pool, updates: updates.clone(), ready, session };
-    Harness { app: router(state, None), updates, csrf }
+    Harness { app: router(state, None), updates, ready: ready_tx, csrf }
 }
 
 async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
@@ -158,6 +159,22 @@ async fn ack_and_resolve_rules(pool: PgPool) {
     assert!(!active);
 
     assert_eq!(post(&h.app, "/api/alerts/not-a-uuid/ack", Some(&h.csrf), json!({"expected_version": 1})).await.0, StatusCode::NOT_FOUND);
+
+    // Body problems use the ApiError shape, and CSRF is checked before parsing.
+    let (s, e) = post(&h.app, &ack, Some(&h.csrf), json!({"nope": 1})).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_request")));
+    let (s, e) = post(&h.app, &ack, None, json!({"nope": 1})).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("csrf")));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn unknown_api_paths_and_methods_are_json_errors(pool: PgPool) {
+    let h = harness(pool);
+    let (s, e) = get(&h.app, "/api/nope").await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("not_found")));
+    let (s, e) = post(&h.app, "/api/alerts", None, json!({})).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::METHOD_NOT_ALLOWED, Some("method_not_allowed")));
+    assert_eq!(get(&h.app, "/api/alerts?team=rates&team=pricing").await.0, StatusCode::BAD_REQUEST);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -233,4 +250,18 @@ async fn stream_snapshot_then_newer_upserts_only(pool: PgPool) {
     let ev = sse_events(&mut body, 1).await;
     assert_eq!(ev[0].0, "alert.upsert");
     assert_eq!((ev[0].1["version"].as_i64(), ev[0].1["count"].as_i64()), (Some(alert.version), Some(7)));
+
+    // The feed consumer losing its partitions closes the stream for resync.
+    h.ready.send(false).unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match body.frame().await {
+                None => return true,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => return true,
+            }
+        }
+    })
+    .await;
+    assert_eq!(end, Ok(true), "stream must end when the feed is not ready");
 }

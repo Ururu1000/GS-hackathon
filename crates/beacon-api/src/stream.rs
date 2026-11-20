@@ -18,7 +18,7 @@ use beacon_core::FeedAlert;
 use chrono::{SecondsFormat, Utc};
 use futures::stream::{self, Stream, StreamExt};
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::ApiState;
@@ -56,7 +56,7 @@ pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> R
         .data(snapshot.to_string());
 
     let visible: Vec<String> = state.session.teams.iter().map(|t| t.id.clone()).collect();
-    let live = upserts(rx, seen, q.team.clone(), visible);
+    let live = upserts(rx, state.ready.clone(), seen, q.team.clone(), visible);
     let events = stream::once(async move { Ok::<_, Infallible>(first) }).chain(live);
 
     let mut resp = Sse::new(events)
@@ -69,18 +69,30 @@ pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> R
 }
 
 /// Live `alert.upsert` events for one client, newest version per alert only.
-/// Ends on lag, so the client reconnects and gets a consistent snapshot.
+/// Ends on lag or when the feed consumer stops being ready (outage,
+/// rebalance), so the client reconnects and gets a consistent snapshot.
 pub fn upserts(
     rx: broadcast::Receiver<FeedAlert>,
+    ready: watch::Receiver<bool>,
     seen: HashMap<Uuid, i64>,
     team: Option<String>,
     visible: Vec<String>,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
-    stream::unfold((rx, seen), move |(mut rx, mut seen)| {
+    stream::unfold((rx, ready, seen), move |(mut rx, mut ready, mut seen)| {
         let (team, visible) = (team.clone(), visible.clone());
         async move {
             loop {
-                match rx.recv().await {
+                let next = tokio::select! {
+                    r = rx.recv() => r,
+                    changed = ready.changed() => {
+                        if changed.is_err() || !*ready.borrow() {
+                            tracing::info!("feed not ready; closing sse stream for resync");
+                            return None;
+                        }
+                        continue;
+                    }
+                };
+                match next {
                     Ok(a) => {
                         let in_scope = visible.contains(&a.team) && team.as_ref().is_none_or(|t| *t == a.team);
                         if !in_scope || seen.get(&a.id).is_some_and(|&v| a.version <= v) {
@@ -88,7 +100,7 @@ pub fn upserts(
                         }
                         seen.insert(a.id, a.version);
                         let ev = Event::default().event("alert.upsert").data(api_alert(&a).to_string());
-                        return Some((Ok(ev), (rx, seen)));
+                        return Some((Ok(ev), (rx, ready, seen)));
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::info!(missed = n, "sse client lagged; closing for resync");

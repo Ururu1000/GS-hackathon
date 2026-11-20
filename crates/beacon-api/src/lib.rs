@@ -48,6 +48,9 @@ pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
         .route("/api/alerts/{id}/resolve", post(alerts::resolve))
         .route("/api/stream", get(stream::stream))
         .route("/ready", get(ready))
+        // Unknown API paths are JSON 404s, never the UI's index.html.
+        .route("/api/{*rest}", axum::routing::any(api_not_found))
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
     match ui_dir {
         // The built UI (ui/dist) is served from the same origin, so the
@@ -58,6 +61,14 @@ pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
         }
         None => api,
     }
+}
+
+async fn api_not_found() -> error::ApiError {
+    error::ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found", "no such API endpoint")
+}
+
+async fn method_not_allowed() -> error::ApiError {
+    error::ApiError::new(axum::http::StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "method not allowed")
 }
 
 async fn ready(axum::extract::State(state): axum::extract::State<ApiState>) -> axum::http::StatusCode {

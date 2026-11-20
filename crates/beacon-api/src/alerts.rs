@@ -1,6 +1,7 @@
 //! Feed, detail and status transitions.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use beacon_core::FeedAlert;
@@ -69,6 +70,7 @@ impl FeedQuery {
         for (k, v) in form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
             let v = v.into_owned();
             match k.as_ref() {
+                "team" if q.team.is_some() => return Err(ApiError::bad_request("team may be given once")),
                 "team" if !v.is_empty() => q.team = Some(v),
                 "status" if STATUSES.contains(&v.as_str()) => q.status.push(v),
                 "status" => return Err(ApiError::bad_request(format!("unknown status `{v}`"))),
@@ -235,22 +237,26 @@ pub enum Transition {
     Resolve,
 }
 
-pub async fn ack(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Json<TransitionRequest>) -> Result<Json<Value>, ApiError> {
+pub async fn ack(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Bytes) -> Result<Json<Value>, ApiError> {
     transition(state, headers, id, body, Transition::Ack).await
 }
 
-pub async fn resolve(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Json<TransitionRequest>) -> Result<Json<Value>, ApiError> {
+pub async fn resolve(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Bytes) -> Result<Json<Value>, ApiError> {
     transition(state, headers, id, body, Transition::Resolve).await
 }
 
+/// CSRF is checked before the body is parsed, and every body problem is an
+/// `ApiError` (the contract's error shape), not a framework rejection.
 async fn transition(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(req): Json<TransitionRequest>,
+    body: Bytes,
     t: Transition,
 ) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
+    let req: TransitionRequest =
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("body must be {{\"expected_version\": <int>}}: {e}")))?;
     if req.note.as_ref().is_some_and(|n| n.chars().count() > 2000) {
         return Err(ApiError::bad_request("note is longer than 2000 characters"));
     }
