@@ -20,7 +20,7 @@ Last updated: 2026-11-21.
 | REST + SSE API for the UI | Done | PR #12 |
 | Shared ack/resolve transitions for delivery | Done | PR #12 |
 | Rules in Postgres, live reload, rules / test panel / schemas API | Done | PR #13 |
-| One-command `docker compose up --build` | Built, end-to-end run pending | PR #13 |
+| One-command `docker compose up --build` | Done, verified end to end | PR #13 |
 | Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
 | Kafka-mode load test, exact counts under replay (M1) | Later | |
 
@@ -82,6 +82,15 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
   cargo run --release -p beacon -- --migrate --role ingest,matcher,aggregator,relay,api,router,delivery
 ```
 
+### Verified run (2026-11-21)
+- **`docker compose up --build`:**
+  - The first build compiles Rust and the UI, which takes a while. Later starts reuse the image.
+  - With the image built, Beacon is healthy about 7 s after the infra.
+- **`demo-seed`** posted the 5 sample events.
+- **`/api/alerts`** showed the 4 expected alerts. The unknown shape correctly created none.
+- **The UI** is served at http://localhost:8080.
+- **Delivery sent 3 emails to Mailpit** (http://localhost:8025): Anna for `HighErrorRate`, Erin and Bob for the rejected rates trade.
+
 ## Reviews and testing
 
 - **After each milestone:** an independent tester agent ran the tests, an end-to-end run and a code review. Every finding was fixed or explained.
@@ -112,8 +121,7 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
 
 ## Next
 
-1. Verify `docker compose up --build` end to end and record the command count and time for the README.
-2. Merge the PR stack, then mount delivery M5b: runbooks, approvals, the SMS/phone simulator.
-3. Schema write endpoints (`POST /api/schemas`, `/api/schemas/preview`), the recipient feed, and occurrence charts.
-4. Kafka-mode load test, and exact counts under replay (M1).
-5. README, the "what is mocked" list, and the demo video script.
+1. Merge the PR stack, then mount delivery M5b: runbooks, approvals, the SMS/phone simulator.
+2. Schema write endpoints (`POST /api/schemas`, `/api/schemas/preview`), the recipient feed, and occurrence charts.
+3. Kafka-mode load test, and exact counts under replay (M1).
+4. README, the "what is mocked" list, and the demo video script.
