@@ -119,7 +119,7 @@ export function createMock() {
           key: k,
           statusVersion: 1,
           samples: [sample],
-          timeline: [{ at: at.toISOString(), actor: `rule:${rule.id}`, kind: 'opened', message: `Opened by rule “${rule.name}” (rev 1) from ${source}` }],
+          timeline: [{ at: at.toISOString(), actor: `rule:${rule.id}`, kind: 'opened', message: `Opened by rule “${rule.name}” from ${source}` }],
           lastDedupNote: at.getTime(),
         }
         alerts.set(id, a)

@@ -93,10 +93,6 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
   width: 14px; height: 14px; border-radius: 50%; background: var(--accent);
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 25%, transparent);
 }
-.tabs { display: flex; gap: 4px; }
-.tab { padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
-.tab.is-active { background: var(--panel-2); color: var(--text); }
-.tab.is-disabled { opacity: .5; cursor: not-allowed; }
 .team-pick { margin-left: auto; }
 .team-pick select, .field select, .field input {
   background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px;
@@ -164,7 +160,7 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
 .row-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-body, .row-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row-body { color: var(--muted); }
-.row-meta { display: flex; gap: 6px; font-size: 12px; color: var(--muted); }
+.row-meta { font-size: 12px; color: var(--muted); }
 .row-side { display: flex; flex-direction: column; align-items: flex-end; justify-content: center; gap: 4px; padding: 8px 12px 8px 0; flex: none; }
 .row-last { font-size: 12px; color: var(--muted); }
 
@@ -188,7 +184,6 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
   font-variant-numeric: tabular-nums; font-weight: 700; font-size: 13px;
   padding: 0 7px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line);
 }
-.count-one { color: var(--muted); font-weight: 500; }
 .count-bump { animation: bump .6s ease-out; }
 
 .new-pill {
@@ -198,11 +193,6 @@ code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-si
 }
 
 .empty { padding: 48px 24px; text-align: center; color: var(--muted); }
-.statusbar {
-  display: flex; gap: 16px; justify-content: space-between; flex-wrap: wrap;
-  padding: 6px 16px; border-top: 1px solid var(--line); background: var(--bg-2);
-  font-size: 12px; color: var(--muted); flex: none;
-}
 
 /* ---- detail ---------------------------------------------------------------- */
 .detail { padding: 16px; display: flex; flex-direction: column; gap: 16px; }

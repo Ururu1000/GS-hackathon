@@ -150,7 +150,7 @@ export function App() {
           break
         case 'a':
         case 'r':
-          if (!selected) push('warn', 'Select an alert first (j / k or click).')
+          if (!selected) push('warn', 'Select an alert first.')
           else void act(selected, e.key === 'a' ? 'ack' : 'resolve')
           break
         case 'Escape':
@@ -173,7 +173,6 @@ export function App() {
   }, [visible, selectedId, selected, select, act, push, help])
 
   const teamName = team ? session?.teams.find((t) => t.id === team)?.name ?? team : 'All teams'
-  const hidden = all.length - visible.length
 
   return (
     <div className={`app ${selected ? 'has-detail' : ''}`}>
@@ -182,10 +181,6 @@ export function App() {
           <span className="logo" aria-hidden="true" />
           Beacon
         </div>
-        <nav className="tabs" aria-label="Sections">
-          <a className="tab is-active" href="#/" aria-current="page">Live feed</a>
-          <span className="tab is-disabled" title="Rule builder and playground: next milestone">Rules</span>
-        </nav>
         <label className="team-pick">
           <span className="sr-only">Team</span>
           <select value={team ?? ''} onChange={(e) => changeTeam(e.target.value || null)}>
@@ -195,7 +190,7 @@ export function App() {
             ))}
           </select>
         </label>
-        <div className={`conn conn-${connection}`} role="status" title={`snapshots ${state.stats.snapshots} · updates ${state.stats.upserts} · removals ${state.stats.removes} · stale dropped ${state.stats.stale}`}>
+        <div className={`conn conn-${connection}`} role="status" title={state.snapshotAt ? `Last snapshot ${new Date(state.snapshotAt).toLocaleTimeString()}. ${state.stats.upserts.toLocaleString()} updates applied, ${state.stats.stale} stale updates dropped.` : undefined}>
           <span className="conn-dot" aria-hidden="true" />
           {CONNECTION_LABEL[connection]}
         </div>
@@ -229,18 +224,6 @@ export function App() {
               </div>
             }
           />
-          <footer className="statusbar">
-            <span>
-              {visible.length.toLocaleString()} shown{hidden > 0 ? ` · ${hidden.toLocaleString()} filtered out` : ''}
-            </span>
-            <span className="statusbar-protocol" title="SSE snapshot protocol counters">
-              {state.snapshotAt ? `snapshot ${new Date(state.snapshotAt).toLocaleTimeString()}` : 'no snapshot'} ·{' '}
-              {state.stats.upserts.toLocaleString()} updates · {state.stats.stale} stale dropped
-            </span>
-            <span className="keys">
-              <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>a</kbd> ack · <kbd>r</kbd> resolve · <kbd>?</kbd> help
-            </span>
-          </footer>
         </section>
 
         {selectedId && (
@@ -256,7 +239,7 @@ export function App() {
               />
             ) : (
               <div className="empty">
-                <p>{state.stats.snapshots === 0 ? 'Loading…' : 'This alert is not in the current feed (it may have expired or belong to another team).'}</p>
+                <p>{state.stats.snapshots === 0 ? 'Loading…' : 'This alert is not in the current feed. It may have expired or belong to another team.'}</p>
                 <button className="btn" onClick={() => select(null)}>Close</button>
               </div>
             )}

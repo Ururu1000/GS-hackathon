@@ -115,9 +115,9 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
         <h3>Runbook</h3>
         <div className="placeholder">
           {detail?.runbook ? (
-            <>Runbook “{detail.runbook.title}” (rev {detail.runbook.revision}). Step rendering lands with runbooks (M5).</>
+            <>Runbook “{detail.runbook.title}”, revision {detail.runbook.revision}.</>
           ) : (
-            <>No runbook yet. Matching runbooks, filled-in next steps and action buttons appear here once runbooks ship (M5).</>
+            <>No runbook is attached to this rule.</>
           )}
         </div>
       </section>
@@ -125,12 +125,11 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
       <section className="section">
         <h3>About</h3>
         <dl className="fields">
-          <div className="kv"><dt>Rule</dt><dd>{a.rule.name} <span className="muted">({a.rule.id} · rev {a.rule.revision})</span></dd></div>
+          <div className="kv"><dt>Rule</dt><dd title={a.rule.id}>{a.rule.name} <span className="muted">rev {a.rule.revision}</span></dd></div>
           <div className="kv"><dt>Team</dt><dd>{a.team}</dd></div>
           <div className="kv"><dt>Source</dt><dd>{a.source} <span className="muted">· {a.schema}</span></dd></div>
-          <div className="kv"><dt>First seen</dt><dd>{absTime(a.first_seen)} <span className="muted">({relTime(a.first_seen, now)})</span></dd></div>
-          <div className="kv"><dt>Last seen</dt><dd>{absTime(a.last_seen)} <span className="muted">({relTime(a.last_seen, now)})</span></dd></div>
-          <div className="kv"><dt>Events</dt><dd>{a.count.toLocaleString()}</dd></div>
+          <div className="kv"><dt>First seen</dt><dd>{absTime(a.first_seen)}</dd></div>
+          <div className="kv"><dt>Last seen</dt><dd>{absTime(a.last_seen)}</dd></div>
           {a.acked_at && <div className="kv"><dt>Acked</dt><dd>{a.acked_by} · {absTime(a.acked_at)}</dd></div>}
           {a.resolved_at && (
             <div className="kv"><dt>Resolved</dt><dd>{a.resolved_by} · {absTime(a.resolved_at)} {a.resolved_reason && <span className="muted">({a.resolved_reason})</span>}</dd></div>
@@ -162,7 +161,7 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
 
       {detail && detail.samples.length > 0 && (
         <section className="section">
-          <h3>Event samples <span className="muted">(raw payloads: the first few and the latest)</span></h3>
+          <h3>Event samples</h3>
           {detail.samples.map((s) => (
             <details key={s.event_id} className="sample">
               <summary>
@@ -191,7 +190,7 @@ const STATE_HINT: Record<string, string> = {
 }
 
 function Deliveries({ items, now }: { items: DeliveryStatus[]; now: number }) {
-  if (items.length === 0) return <div className="placeholder">No external notifications for this alert: it is shown in the UI only.</div>
+  if (items.length === 0) return <div className="placeholder">No notifications sent. This alert is shown in the UI only.</div>
   const sorted = [...items].sort((a, b) => a.recipient.localeCompare(b.recipient) || a.channel.localeCompare(b.channel))
   return (
     <table className="deliveries">
