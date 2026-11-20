@@ -86,7 +86,7 @@ export function createMock() {
         else existing.samples.push(sample)
         if (at.getTime() - existing.lastDedupNote > 60_000) {
           existing.lastDedupNote = at.getTime()
-          existing.timeline.push({ at: at.toISOString(), actor: 'system', kind: 'deduplicated', message: `Duplicate events folded in; count is now ${existing.feed.count}` })
+          existing.timeline.push({ at: at.toISOString(), actor: 'system', kind: 'deduplicated', message: `Happened again (${existing.feed.count} times so far)` })
         }
         touched.push(existing.feed.id)
         if (broadcast) publish(existing, prev)
@@ -119,7 +119,7 @@ export function createMock() {
           key: k,
           statusVersion: 1,
           samples: [sample],
-          timeline: [{ at: at.toISOString(), actor: `rule:${rule.id}`, kind: 'opened', message: `Opened by rule “${rule.name}” from ${source}` }],
+          timeline: [{ at: at.toISOString(), actor: `rule:${rule.id}`, kind: 'opened', message: `Alert rule “${rule.name}” raised this alert` }],
           lastDedupNote: at.getTime(),
         }
         alerts.set(id, a)
