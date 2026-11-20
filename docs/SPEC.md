@@ -342,14 +342,14 @@ Feeds are indexed by team + recency, and audit by alert + time. Terminal outbox 
 2. **Normalize + match.**
    - Load the config snapshot, detect the schema, map fields, select candidate rules, evaluate them.
    - Emit `Match{match_id, rule_id, revision, key, event_ref + context projection}`. Presentation is rendered later.
-   - Each candidate rule's `recover_when` is evaluated separately; a hit emits `Recovery{rule_id, key}` on the same partition key. Recovery candidates are indexed from `recover_when`, independently of `when`.
+   - Each candidate rule's `recover_when` is evaluated separately; a hit emits `Recovery{recovery_id = (event_id, rule_id), rule_id, key}` on the same partition key, deduplicated by the aggregator like `match_id`. Recovery candidates are indexed from `recover_when`, independently of `when`.
    - Publish in a Kafka transaction with the input offsets.
 3. **Aggregate** (partition owner, fenced commit).
    - *Dedup:* same key within the sliding window → `count += 1`, `last_seen`. The UI gets a counter update; recipients are not re-paged, except on a severity escalation or a configured re-notify interval.
    - *Group:* the bucket persists its deadline, flushes when due even if idle, and emits one digest.
    - *Quiet timer:* evaluated by the owner after it has processed earlier buffered matches. It locks the alert and checks generation and `last_seen` before resolving.
    - *Recovery signals* route to the same incident key.
-4. **Route + throttle** (recipient owner, fenced commit). The aggregator writes the unexpanded route in the `notify` outbox row. Delivery's outbox relay expands team and on-call targets into users and publishes one `notifications` record per user, keyed by recipient. The router picks and freezes channels (§4.4). Debit the `(rule, recipient)` and recipient-wide buckets. Write delivery jobs. Excess is folded into a "N more suppressed" digest that is emitted when quota returns; nothing is silently dropped.
+4. **Route + throttle** (recipient owner, fenced commit). The aggregator writes the unexpanded route in the `notify` outbox row. Delivery's outbox relay expands team and on-call targets into users, persists that recipient list on the row before the first publish, and reuses it on retry. It publishes one `notifications` record per user, keyed by recipient. The router picks and freezes channels (§4.4). Debit the `(rule, recipient)` and recipient-wide buckets. Write delivery jobs. Excess is folded into a "N more suppressed" digest that is emitted when quota returns; nothing is silently dropped.
 5. **Render per channel** from an immutable presentation/runbook snapshot taken when the alert opens:
    - **UI and email:** the full body plus the filled-in steps.
    - **SMS:** a bounded title, an absolute short link (configured public URL), and an approval challenge if one is needed.
@@ -492,7 +492,7 @@ GET    /metrics · /ready                   Prometheus · per-role readiness
 4. It drains the buffer as absolute upserts and removals, dropping any per-alert `version` that is older than or equal to what the client has.
 5. Rows not in the snapshot are validated against the authorized PG projection before insert, so a delayed update can't resurrect a stale row. Removal versions are cached for the connection, bounded.
 6. On buffer overflow, a consumer gap or a rebalance, the stream restarts with a fresh snapshot. A client can reconnect to **any** replica.
-7. When a removal leaves the filtered page short, the client refills it over REST (`GET /api/alerts` with the same filters and a cursor after its last row) and merges by `version`. The server sends no refill.
+7. When a removal leaves the filtered page short, the client refills it over REST (`GET /api/alerts` with the same filters and a cursor after its last row, or the first page if none remain) and merges by `version`, also against cached removal versions. The server sends no refill.
 8. Heartbeats run and proxy buffering is off.
 
 True `Last-Event-ID` replay needs a durable, commit-ordered feed log, which is a later feature.
