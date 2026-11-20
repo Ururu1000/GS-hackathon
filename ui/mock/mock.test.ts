@@ -300,3 +300,27 @@ it('selects across all matching detectors and uses envelope inference only as a 
   } })
   expect(await check(envelope)).toMatchObject({ schema: 'custom.status', fields: { stage: 'sample' } })
 })
+
+it('applies detector precedence before resolving matching detectors with the same name', async () => {
+  const event = {
+    ...failedWorkflow(), alertname: 'HighErrorRate', status: 'firing',
+    labels: { service: 'payments-api', severity: 'critical', region: 'eu-west' },
+  }
+  const spec = {
+    schema: 'prometheus.alert', priority: 0, detect: { path: 'status', op: 'exists' },
+    fields: { stage: { path: 'status' } },
+  }
+  await request('/api/schemas', 201, 'POST', { spec })
+  await request('/ingest/alertmanager', 202, 'POST', event)
+  const { items } = await request('/api/alerts?team=payments')
+  expect(items).toContainEqual(expect.objectContaining({
+    schema: 'prometheus.alert', rule: expect.objectContaining({ id: 'anna-payments-critical' }),
+  }))
+
+  await request('/api/schemas', 200, 'POST', {
+    spec: { ...spec, priority: 60, detect: { ...spec.detect, source: 'http:alertmanager' } },
+    expected_revision: 1,
+  })
+  expect(await request('/api/rules/test', 200, 'POST', { rule: RULES[0], event, source: 'http:alertmanager' }))
+    .toMatchObject({ schema: 'prometheus.alert', fields: { stage: 'firing' } })
+})

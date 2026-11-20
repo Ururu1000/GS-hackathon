@@ -147,12 +147,11 @@ export function mappedContext(event: unknown, source: string, mappings: Iterable
     schema: spec.schema, scoped: Boolean(spec.detect.source), priority: spec.priority,
     fields: () => previewMapping(spec, event, source).fields,
   }))
-  const overridden = new Set(candidates.map((item) => item.schema))
   let fallback: { schema: string; fields: Record<string, unknown> } | undefined
   for (const builtIn of builtInMappings(event)) {
     if (builtIn.fallback) {
       fallback = builtIn
-    } else if (!overridden.has(builtIn.schema)) {
+    } else {
       candidates.push({
         schema: builtIn.schema, scoped: builtIn.preferredSource === source, priority: builtIn.priority,
         fields: () => builtIn.fields,
@@ -160,7 +159,8 @@ export function mappedContext(event: unknown, source: string, mappings: Iterable
     }
   }
   candidates.sort((a, b) => Number(b.scoped) - Number(a.scoped) || b.priority - a.priority)
-  const [first, second] = candidates
+  const first = candidates[0]
+  const second = candidates.find((candidate) => candidate.schema !== first?.schema)
   if (!first && fallback) return { raw: event, source, schema: fallback.schema, fields: fallback.fields }
   if (first && !(second && first.scoped === second.scoped && first.priority === second.priority))
     return { raw: event, source, schema: first.schema, fields: first.fields() }
