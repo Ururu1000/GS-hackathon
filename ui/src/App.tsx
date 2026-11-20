@@ -331,7 +331,7 @@ export function App() {
       {route.view === 'preferences' && <PreferencesScreen kind={route.kind} id={route.id} me={session?.user.id ?? null} onNavigate={navigate} onToast={push} />}
       {route.view === 'proposals' && <ProposalsScreen id={route.id} team={team} onNavigate={navigate} onToast={push} onChanged={refreshProposals} />}
       {route.view === 'sources' && <SourcesScreen onCreateRule={createRuleFromSample} />}
-      {route.view === 'runbooks' && <RunbooksScreen team={team} teams={session?.teams ?? []} />}
+      {route.view === 'runbooks' && <RunbooksScreen team={team} teams={session?.teams ?? []} canImport={session?.capabilities?.runbook_import === true} />}
       {route.view === 'simulator' && <SimulatorScreen />}
       </Suspense>
 

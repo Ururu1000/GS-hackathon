@@ -22,7 +22,7 @@ export function createSimulator(canSeeTeam: (team: string) => boolean) {
     const all = [...receipts.values()].reverse()
       .filter((entry) => canSeeTeam(entry.team) && (cursor === undefined || entry.message.id < cursor))
     const items = all.slice(0, PAGE_LIMIT).map(({ message }) => message)
-    return { items, next_cursor: all.length > PAGE_LIMIT ? String(items.at(-1)?.id) : null, replies_available: true }
+    return { items, next_cursor: all.length > PAGE_LIMIT ? String(items.at(-1)?.id) : null }
   }
 
   return {
@@ -37,9 +37,10 @@ export function createSimulator(canSeeTeam: (team: string) => boolean) {
       }
       if (canSeeTeam(team)) for (const res of streams) write(res, 'simulator.message', item)
     },
-    find(id: string) {
-      const entry = receipts.get(id)
-      return entry && canSeeTeam(entry.team) ? entry : null
+    approvalSms(from: string, code?: string) {
+      const candidates = [...receipts.values()].reverse().filter((entry) =>
+        entry.approval && entry.message.channel === 'sms' && entry.message.to === from && canSeeTeam(entry.team))
+      return candidates.find((entry) => entry.message.approval_challenge === `Y ${code}`) ?? candidates[0] ?? null
     },
     stream(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(200, {

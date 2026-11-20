@@ -1,7 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
 import { API_BASE, errorText } from '../api/client'
-import { listSimulatorMessages, replyToSimulatorMessage, type SimulatorMessage, type SimulatorPage } from '../api/screens'
+import { listSimulatorMessages, replyToSimulatorMessage, type SimulatorMessage, type SimulatorPage, type SmsReplyOutcome } from '../api/screens'
+import { internationalPhone } from '../lib/phone'
 import { absTime } from '../lib/time'
+
+const replyStatus: Record<SmsReplyOutcome, string> = {
+  approved: 'Reply accepted. Request approved.',
+  rejected: 'Reply accepted. Request rejected.',
+  acked: 'Alert acknowledged.',
+  already_decided: 'This approval request is already closed.',
+  wrong_code: 'The gateway rejected the code. Check the SMS and try again.',
+  too_many_attempts: 'The gateway blocked further attempts for this request.',
+  unknown: 'The gateway found no matching request.',
+}
 
 const MAILPIT_URL = import.meta.env.VITE_MAILPIT_URL || 'http://localhost:8025'
 
@@ -20,13 +31,16 @@ export function SimulatorScreen() {
   const [selected, setSelected] = useState<string | null>(null)
   const [recipient, setRecipient] = useState('')
   const [reply, setReply] = useState('')
-  const [decided, setDecided] = useState<Record<string, string>>({})
+  const [decided, setDecided] = useState<Record<string, SmsReplyOutcome>>({})
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [sending, setSending] = useState(false)
   const recipients = useMemo(() => [...new Set(page?.items.map((item) => item.recipient) ?? [])].sort(), [page])
   const items = recipient ? (page?.items ?? []).filter((item) => item.recipient === recipient) : page?.items ?? []
   const current = items.find((item) => item.receipt_id === selected) ?? items[0] ?? null
+  const from = current?.channel === 'sms' ? internationalPhone(current.to) : null
+  const command = current?.approval_challenge?.trim().match(/^(?:Y\s+)?(\d{4})$/i)
+  const approvalReply = command?.[1] ? `Y ${command[1]}` : null
 
   useEffect(() => {
     const controller = new AbortController()
@@ -74,15 +88,19 @@ export function SimulatorScreen() {
     }
   }
 
-  const send = async () => {
-    if (!current || !reply.trim() || sending) return
+  const send = async (text: string) => {
+    if (!current || !from || !text.trim() || sending) return
     const receipt = current.receipt_id
     setError(null)
     setSending(true)
     try {
-      const result = await replyToSimulatorMessage(receipt, reply.trim())
-      setDecided((previous) => ({ ...previous, [receipt]: result.state }))
-      setReply('')
+      const result = await replyToSimulatorMessage(from, text.trim())
+      if (result.outcome === 'wrong_code' || result.outcome === 'unknown') {
+        setError(replyStatus[result.outcome])
+      } else {
+        setDecided((previous) => ({ ...previous, [receipt]: result.outcome }))
+        setReply('')
+      }
     } catch (e) {
       setError(errorText(e))
     } finally {
@@ -130,16 +148,19 @@ export function SimulatorScreen() {
               {current.duplicates > 0 && <p className="hint">{current.duplicates} duplicate receipt{current.duplicates === 1 ? '' : 's'}</p>}
               <a href={`#/alerts/${encodeURIComponent(current.alert_id)}`}>Open alert</a>
               {current.channel === 'sms' && current.approval_challenge && (
-                decided[current.receipt_id] ? <p className="notice" role="status">Reply accepted. Request {decided[current.receipt_id]}.</p>
-                  : page?.replies_available ? (
-                    <form className="stack tight" onSubmit={(e) => { e.preventDefault(); void send() }}>
+                decided[current.receipt_id] ? <p className="notice" role="status">{replyStatus[decided[current.receipt_id]!]}</p>
+                  : from ? (
+                    <form className="stack tight" onSubmit={(e) => { e.preventDefault(); void send(reply) }}>
                       <label className="form-field">
                         <span className="label">SMS reply</span>
-                        <input className="input mono" maxLength={32} value={reply} disabled={sending} onChange={(e) => setReply(e.target.value)} placeholder={`Y ${current.approval_challenge}`} />
+                        <input className="input mono" maxLength={160} value={reply} disabled={sending} onChange={(e) => setReply(e.target.value)} placeholder={approvalReply ?? undefined} />
                       </label>
-                      <button className="btn btn-primary" type="submit" disabled={sending || !reply.trim()}>Send reply</button>
+                      <div className="inline">
+                        {approvalReply && <button className="btn" type="button" disabled={sending} onClick={() => void send(approvalReply)}>Reply {approvalReply}</button>}
+                        <button className="btn btn-primary" type="submit" disabled={sending || !reply.trim()}>Send reply</button>
+                      </div>
                     </form>
-                  ) : <p className="hint">The gateway hasn’t enabled replies on this deployment.</p>
+                  ) : <p className="hint">This receipt has no reply-capable phone number.</p>
               )}
             </>
           )}

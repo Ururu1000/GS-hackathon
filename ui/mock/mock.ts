@@ -49,6 +49,7 @@ import type { DiscoveredSchema, SchemaMapping, SourceView } from '../src/api/scr
 import { createSimulator } from './simulator.ts'
 import { importRunbook, prepareRunbook } from './import-runbook.ts'
 import { mappedContext, parseMapping, previewMapping } from './schemas.ts'
+import { internationalPhone } from '../src/lib/phone.ts'
 import { redactText, redactValue } from '../src/lib/redact.ts'
 import { inWindow, parseWindow, resolveChannels } from '../src/prefs/resolve.ts'
 import { applyRule, dedupKey, parseDuration, recovers, testRule, validateRule, type Ctx } from './engine.ts'
@@ -650,7 +651,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         user: { id: ME_ID, name: demoUserName },
         teams: [...teams.values()].filter((t) => allowed.has(t.id)).map((t) => ({ id: t.id, name: t.name })),
         csrf_token: csrf,
-        capabilities: { recipient_feed: true, mock_transports: true },
+        capabilities: { recipient_feed: true, mock_transports: true, runbook_import: true },
       }
       return json(res, 200, session), true
     }
@@ -665,27 +666,28 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       return simulator.stream(req, res), true
     }
     if (path === '/api/simulator/reply' && method === 'POST') {
-      return write(req, res, (b: { receipt_id?: string; text?: string }) => {
-        if (typeof b.receipt_id !== 'string' || typeof b.text !== 'string' || b.text.length > 32)
-          return err(res, 400, 'bad_request', 'A receipt and an SMS reply are required')
-        const entry = simulator.find(b.receipt_id)
-        if (!entry?.approval || entry.message.channel !== 'sms')
-          return err(res, 404, 'not_found', 'No approval SMS for this receipt')
+      return write(req, res, (b: { from?: string; text?: string }) => {
+        const from = typeof b.from === 'string' && internationalPhone(b.from)
+        if (!from || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 160)
+          return err(res, 400, 'bad_request', 'A phone number and an SMS reply are required')
+        const answer = b.text.trim().match(/^([YN])\s+(\d{4})$/i)
+        const entry = simulator.approvalSms(from, answer?.[2])
+        if (!entry?.approval) return json(res, 200, { outcome: 'unknown' })
         const a = alerts.get(entry.message.alert_id)
         const step = entry.approval.step
         const approval = a?.runbook.get(step)?.approvals.find((request) => request.id === entry.approval?.id)
         if (!a || !approval || !approval.eligible.includes(entry.message.recipient) || approval.requested_by === entry.message.recipient)
-          return err(res, 403, 'forbidden', 'This SMS sender cannot decide the request')
+          return json(res, 200, { outcome: 'unknown' })
         if (a.feed.status === 'resolved' || approval.state !== 'pending' || Date.parse(approval.expires_at) <= Date.now())
-          return err(res, 409, 'invalid_transition', 'This approval request is closed')
-        if (entry.approval.attempts >= 5) return err(res, 429, 'rate_limited', 'Too many incorrect replies')
-        const answer = b.text.trim().match(/^([YN])\s+(\d{4})$/i)
+          return json(res, 200, { outcome: 'already_decided' })
+        if (entry.approval.attempts >= 5) return json(res, 200, { outcome: 'too_many_attempts' })
         if (!answer?.[2] || createHash('sha256').update(answer[2]).digest('hex') !== approval.sms_code_hash) {
           entry.approval.attempts++
-          return err(res, 422, 'invalid', 'Reply Y or N followed by the code in the SMS')
+          return json(res, 200, { outcome: 'wrong_code' })
         }
         const decision = answer[1]?.toUpperCase() === 'Y' ? 'approve' : 'reject'
-        json(res, 200, completeApproval(a, step, approval, decision, entry.message.recipient, 'SMS reply'))
+        const result = completeApproval(a, step, approval, decision, entry.message.recipient, 'SMS reply')
+        json(res, 200, { outcome: result.state, execution_id: result.execution_id })
       })
     }
     if (path === '/api/stream' && method === 'GET') return openStream(req, res, url), true
@@ -779,10 +781,13 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
           }
           rt.approvals.push(request)
           for (const recipient of eligible) {
+            const phone = people.get(recipient.replace(/^user:/, ''))?.contact.phone
+            const to = phone ? internationalPhone(phone) : null
+            if (!to) continue
             simulator.send(a.feed.team, {
               receipt_id: uid('sms'), job_id: request.id, alert_id: a.feed.id, channel: 'sms',
-              recipient, to: 'Demo phone', text: `Approve “${d.action.label}” on ${redactText(a.feed.title, 160)}? Reply Y ${rawCode} or N ${rawCode}.`,
-              approval_challenge: rawCode, duplicates: 0, received_at: request.requested_at,
+              recipient, to, text: `Approve “${d.action.label}” on ${redactText(a.feed.title, 160)}? Reply Y ${rawCode} or N ${rawCode}.`,
+              approval_challenge: `Y ${rawCode}`, duplicates: 0, received_at: request.requested_at,
             }, { id: request.id, step, attempts: 0 })
           }
           note(a, 'approval', ME, `Asked for approval to run “${d.action.label}” (${redactText(view.text, 160)})`)

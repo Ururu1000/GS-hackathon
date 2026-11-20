@@ -11,7 +11,7 @@ const formats: { id: RunbookFormat; label: string }[] = [
 ]
 const formatLabel = (format: string) => formats.find((entry) => entry.id === format)?.label ?? format
 
-export function RunbooksScreen({ teams, team }: { teams: Session['teams']; team: string | null }) {
+export function RunbooksScreen({ teams, team, canImport }: { teams: Session['teams']; team: string | null; canImport: boolean }) {
   const [items, setItems] = useState<RunbookSummary[] | null>(null)
   const [draft, setDraft] = useState<RunbookImport>({ title: '', content: '', format: 'markdown', team: '' })
   const [preview, setPreview] = useState<RunbookPreview | null>(null)
@@ -75,7 +75,7 @@ export function RunbooksScreen({ teams, team }: { teams: Session['teams']; team:
   return (
     <div className="screen feature-screen">
       <header className="screen-head"><div className="screen-title"><h1>Runbooks</h1></div></header>
-      <div className="feature-columns">
+      {canImport && <div className="feature-columns">
         <section className="editor-section stack">
           <h2>Import runbook</h2>
           <label className="form-field">
@@ -151,7 +151,9 @@ export function RunbooksScreen({ teams, team }: { teams: Session['teams']; team:
           {problem && <p className="notice notice-warn" role="alert">{problem}</p>}
           {saved && <p className="notice" role="status">Saved {saved.title}. Choose it in the <a href="#/rules">rule editor</a> to attach it.</p>}
         </section>
-      </div>
+      </div>}
+      {!canImport && <p className="muted">The live service loads runbooks from its configuration.</p>}
+      {!canImport && problem && <p className="notice notice-warn" role="alert">{problem}</p>}
       <section className="editor-section">
         <h2>Saved runbooks</h2>
         {items?.length ? <ul className="feature-items">{items.map((item) => (

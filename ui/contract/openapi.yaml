@@ -495,7 +495,7 @@ paths:
     post:
       operationId: replyFromSimulator
       summary: Send an approval reply from a simulated device
-      description: Available when the simulator advertises replies_available. The service resolves the sender from the receipt and applies the approval's eligibility, expiry, and attempt limit.
+      description: The gateway forwards a reply from the SMS recipient to the signed delivery callback. The service applies the approval's eligibility, expiry, and attempt limit.
       parameters: [ { $ref: '#/components/parameters/Csrf' } ]
       requestBody:
         required: true
@@ -503,10 +503,10 @@ paths:
           application/json:
             schema:
               type: object
-              required: [receipt_id, text]
+              required: [from, text]
               properties:
-                receipt_id: { type: string }
-                text: { type: string, maxLength: 32, examples: ['Y 1234'] }
+                from: { type: string, examples: ['+447700900125'] }
+                text: { type: string, maxLength: 160, examples: ['Y 1234'] }
       responses:
         '200':
           description: Reply applied
@@ -514,9 +514,9 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [state]
+                required: [outcome]
                 properties:
-                  state: { type: string, enum: [approved, rejected] }
+                  outcome: { type: string, enum: [approved, rejected, acked, already_decided, wrong_code, too_many_attempts, unknown] }
                   execution_id: { type: string }
         '403': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
@@ -848,7 +848,6 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/SimulatorMessage' } }
         next_cursor: { type: [string, 'null'] }
-        replies_available: { type: boolean, default: false }
     Severity:
       type: string
       enum: [critical, error, warning, info]
@@ -1069,6 +1068,7 @@ components:
           properties:
             recipient_feed: { type: boolean, description: Supports recipient scope on both feed endpoints }
             mock_transports: { type: boolean, description: Accepts fixture broker and log events through the mock ingest endpoint }
+            runbook_import: { type: boolean, description: Supports runbook preview and publication }
     SnapshotEvent:
       type: object
       required: [team, items, next_cursor, server_time]

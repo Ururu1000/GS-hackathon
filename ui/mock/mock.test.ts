@@ -197,10 +197,10 @@ it('runs an escalation through the eligible simulated phone and consumes the SMS
   const { items } = await request('/api/simulator/messages')
   const sms = items.find((item: { alert_id: string; approval_challenge: string | null }) => item.alert_id === id && item.approval_challenge)
   expect(sms.recipient).toBe('user:carol')
-  const reply = { receipt_id: sms.receipt_id, text: `Y ${sms.approval_challenge}` }
+  const reply = { from: sms.to, text: sms.approval_challenge }
   const result = await request('/api/simulator/reply', 200, 'POST', reply)
-  expect(result).toMatchObject({ state: 'approved' })
-  await request('/api/simulator/reply', 409, 'POST', reply)
+  expect(result).toMatchObject({ outcome: 'approved' })
+  expect(await request('/api/simulator/reply', 200, 'POST', reply)).toEqual({ outcome: 'already_decided' })
   await vi.runAllTimersAsync()
   const detail = await request(path)
   const step = detail.runbook.steps.find((entry: RunbookStep) => entry.id === 'escalate')

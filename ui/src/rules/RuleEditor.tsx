@@ -320,7 +320,7 @@ export function RuleEditor({ id, from, team, initialEvent, mockTransports, onEve
                   ))}
                   {draft.runbook && !runbooks.some((r) => r.id === draft.runbook) && <option value={draft.runbook}>{draft.runbook}</option>}
                 </select>
-                <p className="hint">Shown on every alert from this rule, with the event’s values filled in. <a href="#/runbooks">Import a runbook</a></p>
+                <p className="hint">Shown on every alert from this rule, with the event’s values filled in. <a href="#/runbooks">Browse runbooks</a></p>
               </Section>
             </div>
           )}

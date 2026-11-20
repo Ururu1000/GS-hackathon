@@ -87,7 +87,6 @@ export interface SimulatorMessage {
 export interface SimulatorPage {
   items: SimulatorMessage[]
   next_cursor: string | null
-  replies_available?: boolean
 }
 
 export const listSources = (signal?: AbortSignal) => request<SourceView[]>('/api/sources', { signal })
@@ -107,5 +106,7 @@ export const publishRunbook = (draft: RunbookImport, preview: RunbookPreview) =>
 
 export const listSimulatorMessages = (cursor?: string, signal?: AbortSignal) =>
   request<SimulatorPage>(`/api/simulator/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`, { signal })
-export const replyToSimulatorMessage = (receiptId: string, text: string) =>
-  post<{ state: 'approved' | 'rejected'; execution_id?: string }>('/api/simulator/reply', { receipt_id: receiptId, text })
+export type SmsReplyOutcome = 'approved' | 'rejected' | 'acked' | 'already_decided' | 'wrong_code' | 'too_many_attempts' | 'unknown'
+
+export const replyToSimulatorMessage = (from: string, text: string) =>
+  post<{ outcome: SmsReplyOutcome }>('/api/simulator/reply', { from, text })
