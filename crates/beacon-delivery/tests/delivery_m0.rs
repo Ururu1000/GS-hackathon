@@ -39,6 +39,7 @@ fn person(id: &str, email: Option<&str>) -> Person {
             phone: None,
         },
         preferences: None,
+        rules: Vec::new(),
     }
 }
 
@@ -56,6 +57,7 @@ fn directory() -> Directory {
             members: vec!["anna".into(), "bob".into(), "carol".into()],
             lead: Some("bob".into()),
             oncall: Default::default(),
+            default_channels: None,
         }],
     )
     .expect("directory")
@@ -290,6 +292,7 @@ async fn end_to_end_router_then_worker_then_mailpit(pool: PgPool) {
             members: vec!["anna".into(), "bob".into()],
             lead: None,
             oncall: Default::default(),
+            default_channels: None,
         }],
     )
     .expect("directory");

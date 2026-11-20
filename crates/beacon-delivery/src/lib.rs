@@ -13,15 +13,21 @@
 //!                          any tx through a channel::Channel, finalizes fenced by lease_token
 //! ```
 //!
-//! M0 is email only. SMS/phone, preferences, throttles, escalation, approvals and runbooks
-//! plug in later without schema changes (see the migration's comments).
+//! M4 adds per-person preferences (`prefs`), SMS/phone via the fake gateway (`gateway`,
+//! `channel::gateway_client`), a durable per-channel `breaker` and one-hop fallback jobs.
+//! Throttles, escalation, approvals and runbooks come later.
 
+pub mod breaker;
 pub mod channel;
+pub mod clock;
 pub mod config;
+pub mod gateway;
 pub mod model;
+pub mod prefs;
 pub mod router;
 pub mod worker;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Migrations for the whole workspace live in the repo-root `migrations/` directory.
@@ -34,6 +40,8 @@ pub struct RouterConfig {
     pub poll_interval: Duration,
     /// Max outbox rows claimed per transaction.
     pub batch_size: i64,
+    /// Time used for preference windows; frozen into the job's `route_info.decision`.
+    pub clock: Arc<dyn clock::Clock>,
 }
 
 impl Default for RouterConfig {
@@ -41,6 +49,7 @@ impl Default for RouterConfig {
         Self {
             poll_interval: Duration::from_millis(250),
             batch_size: 100,
+            clock: Arc::new(clock::SystemClock),
         }
     }
 }
@@ -75,6 +84,7 @@ pub struct WorkerConfig {
     /// Max sends in flight at once for this worker.
     pub concurrency: usize,
     pub backoff: BackoffPolicy,
+    pub breaker: breaker::BreakerPolicy,
 }
 
 impl Default for WorkerConfig {
@@ -86,6 +96,7 @@ impl Default for WorkerConfig {
             lease: Duration::from_secs(30),
             concurrency: 16,
             backoff: BackoffPolicy::default(),
+            breaker: breaker::BreakerPolicy::default(),
         }
     }
 }

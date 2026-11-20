@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::channel::{Channel, OutboundMessage, Receipt, SendError};
+use crate::channel::{AlertView, Channel, Receipt, SendError};
 use crate::model::{AlertStatus, DeliveryJob, JobStatus};
 use crate::{BackoffPolicy, Shutdown, WorkerConfig};
 
@@ -220,21 +220,6 @@ enum Outcome {
     LostLease,
 }
 
-fn render(job: &DeliveryJob, severity: &str, title: &str, body: &str) -> OutboundMessage {
-    OutboundMessage {
-        job_id: job.id,
-        alert_id: job.alert_id,
-        recipient_id: job.recipient_id.clone(),
-        address: job.address.clone(),
-        severity: severity.to_string(),
-        subject: format!("[{}] {}", severity.to_uppercase(), title),
-        body: format!(
-            "{body}\n\n-- \nBeacon alert {} / job {}\n",
-            job.alert_id, job.id
-        ),
-    }
-}
-
 async fn finalize_cancelled_logged(
     pool: &PgPool,
     job: &DeliveryJob,
@@ -275,7 +260,14 @@ async fn process_job(
         return finalize_cancelled_logged(pool, &job, token, &format!("alert {status}")).await;
     }
 
-    let msg = render(&job, &severity, &title, &body);
+    let alert = AlertView {
+        id: job.alert_id,
+        status,
+        severity,
+        title,
+        body,
+    };
+    let msg = channel.render(&alert, &job);
     match channel.send(&msg).await {
         Ok(receipt) => {
             if finalize_sent(pool, job.id, token, &receipt).await? {

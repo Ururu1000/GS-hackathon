@@ -19,6 +19,10 @@ chrono.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+chrono-tz.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true

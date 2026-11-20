@@ -1,12 +1,12 @@
-//! M0 recipient directory, loaded once at startup from YAML (board #35 item 4).
+//! Recipient directory and delivery settings, loaded once at startup from YAML (board #35).
 //! Postgres-backed versioned config replaces this at M2 (SPEC §4.6).
 //!
-//! `config/people/<id>.yaml` (SPEC §4.4; `preferences` is kept but unused in M0):
+//! `config/people/<id>.yaml` (SPEC §4.4; `preferences` syntax in `crate::prefs`):
 //! ```yaml
 //! user: anna
 //! name: Anna Example            # optional
 //! contact: { email: anna@example.test, phone: "+44 7700 900123" }
-//! preferences: [...]            # optional, opaque in M0
+//! preferences: [...]            # optional, parsed into `Person::rules` at load
 //! ```
 //!
 //! `config/teams/<id>.yaml`:
@@ -16,12 +16,26 @@
 //! lead: bob                     # optional
 //! oncall:                       # optional: schedule id -> rotation, first entry is on call (M0)
 //!   rates-primary: [bob, anna]
+//! default_channels: [email]     # optional: team default when no personal preference matches
+//! ```
+//!
+//! `config/delivery.yaml` (optional; missing file = defaults):
+//! ```yaml
+//! channels:
+//!   phone: { fallback: sms }    # one-hop fallback channel when a job finally fails
+//!   sms:   { fallback: email }
+//!   email: {}
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::prefs::PreferenceRule;
+
+/// Channel names config may use. `ui` is the alert feed itself and never becomes a job.
+pub const KNOWN_CHANNELS: &[&str] = &["email", "sms", "phone", "ui"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Contact {
@@ -38,8 +52,12 @@ pub struct Person {
     #[serde(default)]
     pub name: Option<String>,
     pub contact: Contact,
+    /// Raw `preferences:` as written; parsed and validated into `rules` by `Directory`.
     #[serde(default)]
     pub preferences: Option<serde_json::Value>,
+    /// Parsed preference rules, first match wins (filled by `Directory::from_parts`).
+    #[serde(skip)]
+    pub rules: Vec<PreferenceRule>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +70,86 @@ pub struct Team {
     pub lead: Option<String>,
     #[serde(default)]
     pub oncall: HashMap<String, Vec<String>>,
+    /// Team default channels (SPEC §4.4 precedence step 3).
+    #[serde(default)]
+    pub default_channels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct ChannelSettings {
+    #[serde(default)]
+    pub fallback: Option<String>,
+}
+
+/// `config/delivery.yaml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DeliverySettings {
+    #[serde(default)]
+    pub channels: HashMap<String, ChannelSettings>,
+}
+
+impl Default for DeliverySettings {
+    /// phone -> sms -> email, email has no fallback.
+    fn default() -> Self {
+        let fb = |c: &str| ChannelSettings {
+            fallback: Some(c.to_string()),
+        };
+        Self {
+            channels: HashMap::from([
+                ("phone".to_string(), fb("sms")),
+                ("sms".to_string(), fb("email")),
+                ("email".to_string(), ChannelSettings::default()),
+            ]),
+        }
+    }
+}
+
+impl DeliverySettings {
+    /// Load `<root>/delivery.yaml`; a missing file gives `Default`. Channel names and fallback
+    /// targets must be in `KNOWN_CHANNELS` (not `ui`), and a channel may not fall back to itself.
+    pub fn load(root: &Path) -> Result<Self, ConfigError> {
+        let path = root.join("delivery.yaml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        };
+        let s: Self = serde_saphyr::from_str(&text).map_err(|e| ConfigError::Parse {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        s.validate()?;
+        Ok(s)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let job_channel = |c: &str| KNOWN_CHANNELS.contains(&c) && c != "ui";
+        for (ch, cs) in &self.channels {
+            if !job_channel(ch) {
+                return Err(ConfigError::Invalid(format!(
+                    "delivery.yaml: unknown channel {ch:?}"
+                )));
+            }
+            if let Some(fb) = &cs.fallback {
+                if !job_channel(fb) || fb == ch {
+                    return Err(ConfigError::Invalid(format!(
+                        "delivery.yaml: channel {ch:?} has invalid fallback {fb:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The configured fallback channel for `channel`, if any.
+    pub fn fallback_for(&self, channel: &str) -> Option<&str> {
+        self.channels.get(channel)?.fallback.as_deref()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +178,8 @@ pub enum ExpandError {
 pub struct Directory {
     pub people: HashMap<String, Person>,
     pub teams: HashMap<String, Team>,
+    /// `config/delivery.yaml` (fallback chain). `from_parts` uses the default.
+    pub delivery: DeliverySettings,
 }
 
 impl Directory {
@@ -88,7 +188,9 @@ impl Directory {
     pub fn load(root: &Path) -> Result<Self, ConfigError> {
         let people: Vec<Person> = load_dir(&root.join("people"))?;
         let teams: Vec<Team> = load_dir(&root.join("teams"))?;
-        Self::from_parts(people, teams)
+        let mut dir = Self::from_parts(people, teams)?;
+        dir.delivery = DeliverySettings::load(root)?;
+        Ok(dir)
     }
 
     /// Build from already-parsed parts (used by tests), with the same validation as `load`.
@@ -156,9 +258,13 @@ impl Directory {
             }
         }
 
+        // agent 1: parse each person's `preferences` into `rules` via
+        // `crate::prefs::parse_preferences(&p.id, raw, KNOWN_CHANNELS)` and validate
+        // `Team::default_channels` against KNOWN_CHANNELS, before building the Directory.
         Ok(Self {
             people: people_map,
             teams: teams_map,
+            delivery: DeliverySettings::default(),
         })
     }
 
@@ -274,6 +380,7 @@ mod tests {
                 phone: None,
             },
             preferences: None,
+            rules: Vec::new(),
         }
     }
 
@@ -286,6 +393,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
                 .collect(),
+            default_channels: None,
         }
     }
 
