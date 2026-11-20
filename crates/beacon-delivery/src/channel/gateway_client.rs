@@ -199,7 +199,10 @@ fn render_approval_sms(severity: &str, action: &str, title: &str, code: &str) ->
         );
         // Paranoia bound (a pathological action name): never exceed the segment.
         if bare.chars().count() > SMS_MAX_CHARS {
-            format!("{}…", bare.chars().take(SMS_MAX_CHARS - 1).collect::<String>())
+            format!(
+                "{}…",
+                bare.chars().take(SMS_MAX_CHARS - 1).collect::<String>()
+            )
         } else {
             bare
         }
@@ -607,7 +610,8 @@ mod tests {
             msg.body
         );
         assert!(
-            msg.body.contains("Reply \"Y 4821\" to approve, \"N 4821\" to reject."),
+            msg.body
+                .contains("Reply \"Y 4821\" to approve, \"N 4821\" to reject."),
             "instruction must survive: {}",
             msg.body
         );
@@ -623,7 +627,8 @@ mod tests {
         });
         let msg = ch.render(&alert, &huge_action);
         assert!(
-            msg.body.contains(": Reply \"Y 4821\" to approve, \"N 4821\" to reject."),
+            msg.body
+                .contains(": Reply \"Y 4821\" to approve, \"N 4821\" to reject."),
             "colon fallback: {}",
             msg.body
         );
@@ -652,7 +657,11 @@ mod tests {
         };
         let msg = ch.render(&alert, &with_approval);
         assert_eq!(msg.subject, "", "phone jobs never carry approvals");
-        assert!(msg.body.starts_with("Beacon alert."), "TTS script: {}", msg.body);
+        assert!(
+            msg.body.starts_with("Beacon alert."),
+            "TTS script: {}",
+            msg.body
+        );
 
         // An sms approval object without a code is not a prompt (defensive).
         let ch = sms_channel();
@@ -663,7 +672,11 @@ mod tests {
         });
         let msg = ch.render(&alert, &codeless);
         assert_eq!(msg.subject, "");
-        assert!(msg.body.ends_with(&format!("/a/{alert_id}")), "{}", msg.body);
+        assert!(
+            msg.body.ends_with(&format!("/a/{alert_id}")),
+            "{}",
+            msg.body
+        );
     }
 
     #[test]
