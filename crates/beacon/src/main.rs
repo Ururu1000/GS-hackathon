@@ -1,4 +1,4 @@
-//! `beacon --role ingest,sources,matcher,aggregator,relay,router,delivery,gateway [--migrate]`
+//! `beacon --role ingest,sources,matcher,aggregator,relay,router,delivery,gateway,scheduler [--migrate]`
 //!
 //! Roles are comma-separated and may repeat `--role`. Each team adds its roles to `Role`.
 //! Configuration comes from the environment:
@@ -16,6 +16,7 @@
 //! | `PUBLIC_URL`         | `http://localhost:5173` (SMS short links) | delivery          |
 //! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
 //! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery |
+//! | `ESCALATE_AFTER_OVERRIDE_MS` | unset (demo: replaces rule `escalate_after`) | router |
 //! | `DB_MAX_CONNECTIONS` | sized from the roles (see `pool_size`)    | all               |
 //! | `SHUTDOWN_GRACE_SECS`| `20` (drain time after SIGTERM/SIGINT)    | all               |
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
@@ -55,9 +56,12 @@ enum Role {
     Delivery,
     /// fake SMS/phone provider + device-simulator API (part b)
     Gateway,
+    /// escalation timers -> next on-call / lead (part b)
+    Scheduler,
 }
 
-const ROLES: &str = "ingest, sources, matcher, aggregator, relay, router, delivery, gateway";
+const ROLES: &str =
+    "ingest, sources, matcher, aggregator, relay, router, delivery, gateway, scheduler";
 
 impl Role {
     fn parse(s: &str) -> Result<Self> {
@@ -70,6 +74,7 @@ impl Role {
             "router" => Self::Router,
             "delivery" => Self::Delivery,
             "gateway" => Self::Gateway,
+            "scheduler" => Self::Scheduler,
             other => bail!("unknown role {other:?} (known: {ROLES})"),
         })
     }
@@ -289,12 +294,34 @@ async fn main() -> Result<()> {
                 info!(
                     people = dir.people.len(),
                     teams = dir.teams.len(),
+                    rules = dir.rules.by_rule.len(),
                     "router starting"
                 );
+                let escalate_after_override = match std::env::var("ESCALATE_AFTER_OVERRIDE_MS") {
+                    Ok(v) => Some(std::time::Duration::from_millis(
+                        v.parse().context("ESCALATE_AFTER_OVERRIDE_MS")?,
+                    )),
+                    Err(_) => None,
+                };
                 tasks.spawn(beacon_delivery::router::run_router(
                     pool.clone(),
                     Arc::new(dir),
-                    RouterConfig::default(),
+                    RouterConfig {
+                        escalate_after_override,
+                        ..RouterConfig::default()
+                    },
+                    shutdown_rx.clone(),
+                ));
+            }
+            Role::Scheduler => {
+                let dir_path = PathBuf::from(env_or("BEACON_CONFIG_DIR", "config"));
+                let dir = Directory::load(&dir_path)
+                    .with_context(|| format!("loading people/teams from {}", dir_path.display()))?;
+                info!("escalation scheduler starting");
+                tasks.spawn(beacon_delivery::escalation::run_scheduler(
+                    pool.clone(),
+                    Arc::new(dir),
+                    beacon_delivery::escalation::SchedulerConfig::default(),
                     shutdown_rx.clone(),
                 ));
             }

@@ -180,6 +180,8 @@ pub struct Directory {
     pub teams: HashMap<String, Team>,
     /// `config/delivery.yaml` (fallback chain). `from_parts` uses the default.
     pub delivery: DeliverySettings,
+    /// `escalate_after` / `throttle` per rule from `config/rules` (part (a)'s files, optional).
+    pub rules: crate::rules::RulePolicies,
 }
 
 impl Directory {
@@ -202,6 +204,7 @@ impl Directory {
         let teams: Vec<Team> = load_dir(&root.join("teams"))?;
         let mut dir = Self::from_parts(people, teams)?;
         dir.delivery = DeliverySettings::load(root)?;
+        dir.rules = crate::rules::RulePolicies::load(&root.join("rules"));
         Ok(dir)
     }
 
@@ -302,6 +305,7 @@ impl Directory {
             people: people_map,
             teams: teams_map,
             delivery: DeliverySettings::default(),
+            rules: Default::default(),
         })
     }
 

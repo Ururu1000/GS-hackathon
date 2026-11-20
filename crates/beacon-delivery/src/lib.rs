@@ -21,10 +21,13 @@ pub mod breaker;
 pub mod channel;
 pub mod clock;
 pub mod config;
+pub mod escalation;
 pub mod gateway;
 pub mod model;
 pub mod prefs;
 pub mod router;
+pub mod rules;
+pub mod throttle;
 pub mod worker;
 
 use std::sync::Arc;
@@ -42,6 +45,8 @@ pub struct RouterConfig {
     pub batch_size: i64,
     /// Time used for preference windows; frozen into the job's `route_info.decision`.
     pub clock: Arc<dyn clock::Clock>,
+    /// Demo/test knob: replaces every rule's `escalate_after` (env `ESCALATE_AFTER_OVERRIDE_MS`).
+    pub escalate_after_override: Option<Duration>,
 }
 
 impl Default for RouterConfig {
@@ -50,6 +55,7 @@ impl Default for RouterConfig {
             poll_interval: Duration::from_millis(250),
             batch_size: 100,
             clock: Arc::new(clock::SystemClock),
+            escalate_after_override: None,
         }
     }
 }
