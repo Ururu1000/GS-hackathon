@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::breaker::{self, Gate};
 use crate::channel::{AlertView, Channel, Receipt, SendError};
 use crate::model::{AlertStatus, DeliveryJob, JobStatus};
 use crate::{BackoffPolicy, Shutdown, WorkerConfig};
@@ -25,20 +26,28 @@ pub struct WorkStats {
     pub dead_on_claim: u64,
     /// Finalize found the lease_token changed (another worker took over).
     pub lost_lease: u64,
+    /// Put back to `pending` with the attempt refunded because the channel breaker was open.
+    pub deferred: u64,
+    /// Fallback jobs inserted for jobs that died (one hop, SPEC §5.6), including
+    /// dead-on-claim ones.
+    pub fallbacks: u64,
 }
 
 /// Outcome of a claim: jobs this worker now holds plus how many expired leases were
-/// dead-lettered instead of being reclaimed.
+/// dead-lettered instead of being reclaimed, and how many fallback jobs were inserted for
+/// those dead-lettered rows (SPEC §5.6).
 #[derive(Debug, Default)]
 pub struct Claimed {
     pub jobs: Vec<DeliveryJob>,
     pub dead_on_claim: u64,
+    pub fallbacks: u64,
 }
 
 /// One short transaction:
 /// 1. `in_flight` jobs of `channel` whose lease expired AND `attempts >= max_attempts` become
 ///    `dead` with `last_error_class = 'ambiguous'`,
-///    `last_error = 'max attempts exceeded after lease expiry'`.
+///    `last_error = 'max attempts exceeded after lease expiry'`. Each such row gets at most
+///    one fallback job (SPEC §5.6) in the same transaction.
 /// 2. Claim up to `cfg.batch_size` jobs that are `pending` and due, or `in_flight` with an
 ///    expired lease (and attempts left), `FOR UPDATE SKIP LOCKED`: set `in_flight`,
 ///    `locked_by`, `locked_until = now() + lease`, a fresh `lease_token`, `attempts + 1`.
@@ -51,7 +60,7 @@ pub async fn claim_batch(
 ) -> Result<Claimed, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    let dead_on_claim = sqlx::query(
+    let dead_ids: Vec<(Uuid,)> = sqlx::query_as(
         "UPDATE delivery_jobs \
          SET status = 'dead', last_error_class = 'ambiguous', \
              last_error = 'max attempts exceeded after lease expiry', \
@@ -60,12 +69,26 @@ pub async fn claim_batch(
              SELECT id FROM delivery_jobs \
              WHERE channel = $1 AND status = 'in_flight' AND locked_until < now() \
                AND attempts >= max_attempts \
-             FOR UPDATE SKIP LOCKED)",
+             FOR UPDATE SKIP LOCKED) \
+         RETURNING id",
     )
     .bind(channel)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .fetch_all(&mut *tx)
+    .await?;
+    let dead_on_claim = dead_ids.len() as u64;
+
+    let mut fallbacks = 0u64;
+    for (id,) in &dead_ids {
+        if insert_fallback_job(&mut tx, *id).await? {
+            fallbacks += 1;
+        }
+    }
+    if fallbacks > 0 {
+        info!(
+            count = fallbacks,
+            "fallback jobs created for jobs dead-lettered on claim"
+        );
+    }
 
     let jobs = sqlx::query_as::<_, DeliveryJob>(
         "WITH c AS ( \
@@ -94,7 +117,51 @@ pub async fn claim_batch(
     Ok(Claimed {
         jobs,
         dead_on_claim,
+        fallbacks,
     })
+}
+
+/// Insert the one-hop fallback job for the freshly dead job `dead_id` (SPEC §5.6), inside the
+/// caller's transaction: the dead row must already be `dead` (with its terminal
+/// `last_error`) in this transaction.
+///
+/// At most one row, ever:
+/// - `fallback_of IS NULL` on the dead job means a fallback never falls back again (one hop);
+/// - `ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING` skips the insert
+///   when the person already has any job on the fallback channel for the same notification.
+///
+/// The fallback job's `route_info` keeps the provenance chain: `target`, `rule_id` and
+/// `reason` from the original route, plus `fallback_from` (the channel that died) and
+/// `fallback_reason` (the dead job's terminal error). A dead job without a `fallback`
+/// object (or with null channel/address) inserts nothing. Returns `true` when a row was
+/// inserted.
+async fn insert_fallback_job(
+    tx: &mut sqlx::PgConnection,
+    dead_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO delivery_jobs \
+             (alert_id, notify_seq, recipient_id, channel, address, route_info, fallback_of) \
+         SELECT j.alert_id, j.notify_seq, j.recipient_id, \
+                j.route_info->'fallback'->>'channel', \
+                j.route_info->'fallback'->>'address', \
+                jsonb_build_object('target', j.route_info->'target', \
+                                    'rule_id', j.route_info->'rule_id', \
+                                    'reason', j.route_info->'reason', \
+                                    'fallback_from', j.channel, \
+                                    'fallback_reason', j.last_error), \
+                j.id \
+         FROM delivery_jobs j \
+         WHERE j.id = $1 AND j.status = 'dead' AND j.fallback_of IS NULL \
+           AND j.route_info ? 'fallback' \
+           AND j.route_info->'fallback'->>'channel' IS NOT NULL \
+           AND j.route_info->'fallback'->>'address' IS NOT NULL \
+         ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING",
+    )
+    .bind(dead_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Finalizers: each is `UPDATE ... WHERE id = $1 AND lease_token = $2 AND status = 'in_flight'`
@@ -148,8 +215,9 @@ pub async fn finalize_cancelled(
     Ok(res.rows_affected() == 1)
 }
 
-/// Permanent errors, or any error when `attempts >= max_attempts`, -> `dead`.
-/// Otherwise -> `pending` with `due_at = now() + backoff_delay(policy, attempts)`.
+/// Permanent errors, or any error when `attempts >= max_attempts`, -> `dead`; every death
+/// also inserts at most one fallback job (SPEC §5.6) in the same transaction. Otherwise ->
+/// `pending` with `due_at = now() + max(backoff_delay(policy, attempts), retry_after)`.
 /// Returns `Some(new_status)` or `None` if the lease was lost.
 pub async fn finalize_failed(
     pool: &PgPool,
@@ -158,7 +226,28 @@ pub async fn finalize_failed(
     err: &SendError,
     policy: &BackoffPolicy,
 ) -> Result<Option<crate::model::JobStatus>, sqlx::Error> {
+    Ok(finalize_failed_inner(pool, job, token, err, policy)
+        .await?
+        .map(|outcome| outcome.status))
+}
+
+/// What `finalize_failed_inner` did to one job.
+#[derive(Debug)]
+struct FailedOutcome {
+    status: JobStatus,
+    /// Fallback jobs inserted because the job died (0 or 1).
+    fallbacks: u64,
+}
+
+async fn finalize_failed_inner(
+    pool: &PgPool,
+    job: &DeliveryJob,
+    token: Uuid,
+    err: &SendError,
+    policy: &BackoffPolicy,
+) -> Result<Option<FailedOutcome>, sqlx::Error> {
     let dead = matches!(err, SendError::Permanent(_)) || job.attempts >= job.max_attempts;
+    let mut tx = pool.begin().await?;
     let res = if dead {
         sqlx::query(
             "UPDATE delivery_jobs \
@@ -170,10 +259,11 @@ pub async fn finalize_failed(
         .bind(token)
         .bind(err.message())
         .bind(err.class().as_str())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
     } else {
-        let delay = backoff_delay(policy, job.attempts);
+        // The provider's requested minimum delay wins over our own backoff when it is larger.
+        let delay = backoff_delay(policy, job.attempts).max(err.retry_after().unwrap_or_default());
         sqlx::query(
             "UPDATE delivery_jobs \
              SET status = 'pending', last_error = $3, last_error_class = $4, \
@@ -186,17 +276,59 @@ pub async fn finalize_failed(
         .bind(err.message())
         .bind(err.class().as_str())
         .bind(delay.as_secs_f64())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
     };
     if res.rows_affected() != 1 {
+        // Lease lost: nothing was written; dropping the tx rolls it back.
         return Ok(None);
     }
-    Ok(Some(if dead {
-        JobStatus::Dead
-    } else {
-        JobStatus::Pending
+
+    let mut fallbacks = 0u64;
+    if dead && insert_fallback_job(&mut tx, job.id).await? {
+        fallbacks += 1;
+        info!(job_id = %job.id, alert_id = %job.alert_id, from_channel = job.channel,
+              "fallback job created for dead delivery");
+    }
+    tx.commit().await?;
+    Ok(Some(FailedOutcome {
+        status: if dead {
+            JobStatus::Dead
+        } else {
+            JobStatus::Pending
+        },
+        fallbacks,
     }))
+}
+
+/// Put a claimed job back to `pending` WITHOUT consuming its attempt: the channel breaker is
+/// (now) open, so the send must wait out the cooldown instead of counting against
+/// `max_attempts` ("deferred jobs don't consume attempts", SPEC §2.3). Sets
+/// `attempts = attempts - 1` (the refund), `due_at = now() + delay`, records the error, clears
+/// the lease; fenced by `token` like the other finalizers. Returns `false` if the lease was
+/// lost.
+pub async fn finalize_deferred(
+    pool: &PgPool,
+    job: &DeliveryJob,
+    token: Uuid,
+    err: &SendError,
+    delay: Duration,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE delivery_jobs \
+         SET status = 'pending', attempts = attempts - 1, last_error = $3, \
+             last_error_class = $4, due_at = now() + make_interval(secs => $5::float8), \
+             lease_token = NULL, locked_until = NULL, locked_by = NULL, updated_at = now() \
+         WHERE id = $1 AND lease_token = $2 AND status = 'in_flight'",
+    )
+    .bind(job.id)
+    .bind(token)
+    .bind(err.message())
+    .bind(err.class().as_str())
+    .bind(delay.as_secs_f64())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Full-jitter exponential backoff: uniform in `[0, min(cap, base * 2^(attempts-1))]`,
@@ -216,7 +348,10 @@ enum Outcome {
     Sent,
     Cancelled,
     Retried,
-    Dead,
+    /// Put back to `pending` with the attempt refunded (channel breaker open).
+    Deferred,
+    /// Died; the payload is how many fallback jobs were created for it.
+    Dead(u64),
     LostLease,
 }
 
@@ -240,6 +375,9 @@ async fn process_job(
     channel: &dyn Channel,
     cfg: &WorkerConfig,
     job: DeliveryJob,
+    // `Some(token)` when this job is the breaker probe (this worker holds the channel's
+    // probe lease): the send's outcome must be reported against that token.
+    probe: Option<Uuid>,
 ) -> Result<Outcome, sqlx::Error> {
     // The claim always sets a token; a job without one cannot be finalized.
     let Some(token) = job.lease_token else {
@@ -270,7 +408,12 @@ async fn process_job(
     let msg = channel.render(&alert, &job);
     match channel.send(&msg).await {
         Ok(receipt) => {
-            if finalize_sent(pool, job.id, token, &receipt).await? {
+            let finalized = finalize_sent(pool, job.id, token, &receipt).await?;
+            // The provider accepted this message, so the channel is healthy. Report it even
+            // if the job lease was lost: a probe closing the breaker is never wrong here, and
+            // a normal success only resets a `closed` row's failure streak.
+            breaker::record_success(pool, channel.name(), probe).await?;
+            if finalized {
                 info!(job_id = %job.id, alert_id = %job.alert_id, attempts = job.attempts,
                       provider_message_id = %receipt.provider_message_id, "delivery sent");
                 Ok(Outcome::Sent)
@@ -279,38 +422,97 @@ async fn process_job(
                 Ok(Outcome::LostLease)
             }
         }
-        Err(err) => match finalize_failed(pool, &job, token, &err, &cfg.backoff).await? {
-            Some(JobStatus::Dead) => {
-                info!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
-                      error = err.message(), "delivery dead");
-                Ok(Outcome::Dead)
+        Err(err) => {
+            if matches!(err, SendError::Permanent(_)) {
+                // A permanent error means the address is wrong, not the provider: it says
+                // nothing about channel health, so it never touches the breaker.
+                finish_failed(pool, &job, token, &err, &cfg.backoff).await
+            } else {
+                // Transient / ambiguous / Retry-After: counts against the channel.
+                let open =
+                    breaker::record_failure(pool, channel.name(), probe, &cfg.breaker).await?;
+                if open {
+                    // The breaker is open (this failure may have opened it): park the job
+                    // until the cooldown ends instead of consuming its attempt.
+                    if finalize_deferred(pool, &job, token, &err, cfg.breaker.cooldown).await? {
+                        info!(job_id = %job.id, alert_id = %job.alert_id, channel = channel.name(),
+                              delay = ?cfg.breaker.cooldown, class = err.class().as_str(),
+                              error = err.message(), "delivery deferred: channel breaker open");
+                        Ok(Outcome::Deferred)
+                    } else {
+                        warn!(job_id = %job.id, "lease lost while deferring");
+                        Ok(Outcome::LostLease)
+                    }
+                } else {
+                    finish_failed(pool, &job, token, &err, &cfg.backoff).await
+                }
             }
-            Some(_) => {
-                warn!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
-                      error = err.message(), "delivery failed, will retry");
-                Ok(Outcome::Retried)
-            }
-            None => {
-                warn!(job_id = %job.id, "lease lost while recording send failure");
-                Ok(Outcome::LostLease)
-            }
-        },
+        }
     }
 }
 
-/// Claim one batch and process it with up to `cfg.concurrency` sends in flight. For each job:
-/// read `alerts.status, title, body, severity` (no lock); if the alert is missing or not
-/// deliverable -> `finalize_cancelled`; else build an `OutboundMessage` and `channel.send`
-/// (no transaction open), then finalize. Returns once every claimed job is finalized.
+/// Finalize a send failure through the normal retry/dead path (breaker stays as it is).
+async fn finish_failed(
+    pool: &PgPool,
+    job: &DeliveryJob,
+    token: Uuid,
+    err: &SendError,
+    policy: &BackoffPolicy,
+) -> Result<Outcome, sqlx::Error> {
+    match finalize_failed_inner(pool, job, token, err, policy).await? {
+        Some(outcome) if outcome.status == JobStatus::Dead => {
+            info!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
+                  error = err.message(), fallbacks = outcome.fallbacks, "delivery dead");
+            Ok(Outcome::Dead(outcome.fallbacks))
+        }
+        Some(_) => {
+            warn!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
+                  error = err.message(), "delivery failed, will retry");
+            Ok(Outcome::Retried)
+        }
+        None => {
+            warn!(job_id = %job.id, "lease lost while recording send failure");
+            Ok(Outcome::LostLease)
+        }
+    }
+}
+
+/// Consult the channel breaker, then claim one batch and process it with up to
+/// `cfg.concurrency` sends in flight:
+/// - breaker `open` → claim nothing (returns an all-zero [`WorkStats`], so the run loop sleeps);
+/// - this worker holds the probe → claim exactly ONE job and report its outcome against the
+///   probe token;
+/// - breaker `closed` → a normal batch.
+///
+/// For each job: read `alerts.status, title, body, severity` (no lock); if the alert is
+/// missing or not deliverable -> `finalize_cancelled`; else build an `OutboundMessage` and
+/// `channel.send` (no transaction open), then finalize. Returns once every claimed job is
+/// finalized.
 pub async fn work_once(
     pool: &PgPool,
     channel: &Arc<dyn Channel>,
     cfg: &WorkerConfig,
 ) -> Result<WorkStats, sqlx::Error> {
-    let claimed = claim_batch(pool, channel.name(), cfg).await?;
+    let gate = breaker::acquire(pool, channel.name(), &cfg.breaker).await?;
+    let probe = match gate {
+        Gate::Open => return Ok(WorkStats::default()),
+        Gate::Closed => None,
+        Gate::Probe { token } => Some(token),
+    };
+
+    // The probe holder claims exactly one job: a single send speaks for the whole channel.
+    let claimed = if probe.is_some() {
+        let mut probe_cfg = cfg.clone();
+        probe_cfg.batch_size = 1;
+        claim_batch(pool, channel.name(), &probe_cfg).await?
+    } else {
+        claim_batch(pool, channel.name(), cfg).await?
+    };
+
     let mut stats = WorkStats {
         claimed: claimed.jobs.len() as u64,
         dead_on_claim: claimed.dead_on_claim,
+        fallbacks: claimed.fallbacks,
         ..WorkStats::default()
     };
     if claimed.dead_on_claim > 0 {
@@ -334,7 +536,11 @@ pub async fn work_once(
             Ok(Ok(Outcome::Sent)) => stats.sent += 1,
             Ok(Ok(Outcome::Cancelled)) => stats.cancelled += 1,
             Ok(Ok(Outcome::Retried)) => stats.retried += 1,
-            Ok(Ok(Outcome::Dead)) => stats.dead += 1,
+            Ok(Ok(Outcome::Deferred)) => stats.deferred += 1,
+            Ok(Ok(Outcome::Dead(fallbacks))) => {
+                stats.dead += 1;
+                stats.fallbacks += fallbacks;
+            }
             Ok(Ok(Outcome::LostLease)) => stats.lost_lease += 1,
             Ok(Err(e)) => {
                 error!(error = %e, "job processing failed; lease will expire and the job be reclaimed");
@@ -354,12 +560,14 @@ pub async fn work_once(
         while let Some(res) = set.try_join_next() {
             tally(&mut stats, &mut first_err, res);
         }
+        // With a probe gate, the single claimed job is the probe job.
+        let job_probe = probe;
         let pool = pool.clone();
         let channel = Arc::clone(channel);
         let cfg = Arc::clone(&cfg_arc);
         set.spawn(async move {
             let _permit = permit;
-            process_job(&pool, channel.as_ref(), &cfg, job).await
+            process_job(&pool, channel.as_ref(), &cfg, job, job_probe).await
         });
     }
     while let Some(res) = set.join_next().await {

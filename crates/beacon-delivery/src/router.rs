@@ -1,24 +1,26 @@
-//! M0 router: outbox `kind='notify'` rows -> `delivery_jobs`, one transaction per batch.
+//! Router: outbox `kind='notify'` rows -> `delivery_jobs`, one transaction per batch (M0),
+//! resolving each recipient's channels per SPEC §4.4 and freezing the decision into
+//! `route_info` (M4, §5.4).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::SecondsFormat;
 use serde_json::json;
 use sqlx::PgPool;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::config::Directory;
+use crate::config::{Directory, Person, Team, address_for};
 use crate::model::NotifyPayload;
+use crate::prefs::{self, Decision, RoutingContext};
 use crate::{RouterConfig, Shutdown};
 
-/// Channels the router can create jobs for in M0. `ui` is delivered by the alert feed itself
-/// and never becomes a job; any other channel is skipped with a warning until it exists.
-pub const SUPPORTED_JOB_CHANNELS: &[&str] = &["email"];
-
-/// Channels used when a route entry has no explicit `channels:` (M0; preferences come at M4).
-pub const DEFAULT_CHANNELS: &[&str] = &["email"];
+/// Channels the router can create delivery jobs for: email via SMTP, sms and phone via the
+/// fake gateway. `ui` is delivered by the alert feed itself and never becomes a job; any
+/// other channel is skipped with a warning.
+pub const SUPPORTED_JOB_CHANNELS: &[&str] = &["email", "sms", "phone"];
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RouteStats {
@@ -28,7 +30,8 @@ pub struct RouteStats {
     pub jobs_inserted: u64,
     /// Rows whose payload failed to parse (marked processed, logged).
     pub malformed: u64,
-    /// Recipients skipped (unknown target, no address for the channel, unsupported channel).
+    /// Recipients skipped (unknown target, no address for the channel, unsupported channel),
+    /// counted once per `(person, channel)` pair.
     pub skipped: u64,
 }
 
@@ -51,14 +54,16 @@ pub async fn route_once(
     .fetch_all(&mut *tx)
     .await?;
 
+    // One decision time per call, frozen into every job's `route_info.decided_at`.
+    let now = cfg.clock.now();
     let mut stats = RouteStats::default();
     if rows.is_empty() {
         tx.commit().await?;
         return Ok(stats);
     }
 
-    for (outbox_id, alert_id, payload) in &rows {
-        let payload: NotifyPayload = match serde_json::from_value(payload.clone()) {
+    for (outbox_id, alert_id, raw) in &rows {
+        let payload: NotifyPayload = match serde_json::from_value(raw.clone()) {
             Ok(p) => p,
             Err(err) => {
                 // Still marked processed below: a poison row must not block the queue.
@@ -67,9 +72,12 @@ pub async fn route_once(
                 continue;
             }
         };
+        let ctx = routing_context(&payload, raw);
 
-        // (recipient, channel) pairs already planned for this payload.
-        let mut seen: HashSet<(String, &str)> = HashSet::new();
+        // (person, channel) pairs already planned for this payload: a person reached by
+        // several entries gets the union of channels, and the first decision for a pair
+        // wins (SPEC §4.4).
+        let mut seen: HashSet<(String, String)> = HashSet::new();
 
         for entry in &payload.route {
             let people = match dir.expand(&entry.to) {
@@ -80,41 +88,60 @@ pub async fn route_once(
                     continue;
                 }
             };
-            let channels: Vec<&str> = match &entry.channels {
-                Some(c) => c.iter().map(String::as_str).collect(),
-                None => DEFAULT_CHANNELS.to_vec(),
-            };
 
             for person in people {
-                for &channel in &channels {
+                // Step 1 or steps 2-4 of the §4.4 precedence for this (entry, person).
+                let planned: Vec<(String, Decision)> = match &entry.channels {
+                    Some(explicit) => explicit
+                        .iter()
+                        .map(|c| (c.clone(), Decision::Explicit))
+                        .collect(),
+                    None => {
+                        let team = team_for_target(dir, &entry.to, person, &payload.team);
+                        let r = prefs::resolve_channels(person, team, &ctx, now);
+                        r.channels
+                            .into_iter()
+                            .map(|c| (c, r.decision.clone()))
+                            .collect()
+                    }
+                };
+
+                for (channel, decision) in planned {
+                    // `ui` is delivered by the alert feed itself: no job, not counted.
                     if channel == "ui" {
                         continue;
                     }
-                    if !SUPPORTED_JOB_CHANNELS.contains(&channel) {
+                    if !seen.insert((person.id.clone(), channel.clone())) {
+                        continue; // first decision for this pair is already planned
+                    }
+                    if !SUPPORTED_JOB_CHANNELS.contains(&channel.as_str()) {
                         warn!(outbox_id, %alert_id, recipient = %person.id, channel, "unsupported channel, skipping");
                         stats.skipped += 1;
                         continue;
                     }
-                    let address = match channel {
-                        "email" => person.contact.email.as_deref(),
-                        _ => None,
-                    };
-                    let Some(address) = address else {
+                    let Some(address) = address_for(person, &channel) else {
                         warn!(outbox_id, %alert_id, recipient = %person.id, channel, "no address for channel, skipping");
                         stats.skipped += 1;
                         continue;
                     };
-                    if !seen.insert((person.id.clone(), channel)) {
-                        continue;
-                    }
 
-                    let route_info = json!({
+                    // Provenance frozen at routing time (SPEC §4.4 "decided once"), plus
+                    // the one-hop fallback used if this job later dies terminally (§5.6).
+                    let mut route_info = json!({
                         "target": entry.to,
                         "rule_id": payload.rule_id,
                         "rule_revision": payload.rule_revision,
                         "reason": payload.reason,
                         "outbox_id": outbox_id,
+                        "decision": decision,
+                        "decided_at": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                     });
+                    if let Some(fb) = dir.delivery.fallback_for(&channel)
+                        && let Some(fb_address) = address_for(person, fb)
+                    {
+                        route_info["fallback"] = json!({ "channel": fb, "address": fb_address });
+                    }
+
                     let res = sqlx::query(
                         "INSERT INTO delivery_jobs \
                            (alert_id, notify_seq, recipient_id, channel, address, route_info) \
@@ -124,7 +151,7 @@ pub async fn route_once(
                     .bind(alert_id)
                     .bind(payload.notify_seq)
                     .bind(&person.id)
-                    .bind(channel)
+                    .bind(&channel)
                     .bind(address)
                     .bind(route_info)
                     .execute(&mut *tx)
@@ -144,6 +171,46 @@ pub async fn route_once(
 
     tx.commit().await?;
     Ok(stats)
+}
+
+/// Facts a preference can match on: the payload plus its optional raw `context` object
+/// (`service`, `environment`). `NotifyPayload.context` lands with part (a); read it from
+/// the raw JSON so routing works before and after that lands.
+fn routing_context(payload: &NotifyPayload, raw: &serde_json::Value) -> RoutingContext {
+    let ctx = raw.get("context").and_then(|c| c.as_object());
+    let field = |key: &str| {
+        ctx.and_then(|o| o.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    RoutingContext {
+        severity: payload.severity.clone(),
+        team: payload.team.clone(),
+        rule_id: payload.rule_id.clone(),
+        service: field("service"),
+        environment: field("environment"),
+    }
+}
+
+/// The team whose default applies when resolving `person` reached via `target` (SPEC §4.4
+/// step 3): the routed team for `team:`/`oncall:` targets; for `user:` targets the alert's
+/// team if the person is a member; otherwise `None`.
+fn team_for_target<'a>(
+    dir: &'a Directory,
+    target: &str,
+    person: &Person,
+    alert_team: &str,
+) -> Option<&'a Team> {
+    match target.split_once(':') {
+        Some(("team", id)) => dir.teams.get(id),
+        Some(("oncall", schedule)) => dir.team_for_schedule(schedule),
+        // `expand` already rejected malformed targets; for anything else the alert's team
+        // applies when the person belongs to it.
+        _ => dir
+            .teams
+            .get(alert_team)
+            .filter(|t| t.members.contains(&person.id)),
+    }
 }
 
 /// Loop `route_once` until shutdown. Polls again immediately after a full batch, otherwise

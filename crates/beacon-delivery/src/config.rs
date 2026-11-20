@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::prefs::PreferenceRule;
+use crate::prefs::{PreferenceRule, parse_preferences};
 
 /// Channel names config may use. `ui` is the alert feed itself and never becomes a job.
 pub const KNOWN_CHANNELS: &[&str] = &["email", "sms", "phone", "ui"];
@@ -135,12 +135,12 @@ impl DeliverySettings {
                     "delivery.yaml: unknown channel {ch:?}"
                 )));
             }
-            if let Some(fb) = &cs.fallback {
-                if !job_channel(fb) || fb == ch {
-                    return Err(ConfigError::Invalid(format!(
-                        "delivery.yaml: channel {ch:?} has invalid fallback {fb:?}"
-                    )));
-                }
+            if let Some(fb) = &cs.fallback
+                && (!job_channel(fb) || fb == ch)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "delivery.yaml: channel {ch:?} has invalid fallback {fb:?}"
+                )));
             }
         }
         Ok(())
@@ -252,15 +252,40 @@ impl Directory {
                     )));
                 }
             }
+            // Team defaults are step 3 of the routing precedence (SPEC §4.4): they must be
+            // usable channels, and an empty default would silently mean "never here".
+            if let Some(defaults) = &t.default_channels {
+                if defaults.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "team {:?}: default_channels must not be empty",
+                        t.id
+                    )));
+                }
+                for c in defaults {
+                    if !KNOWN_CHANNELS.contains(&c.as_str()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "team {:?}: default_channels names unknown channel {c:?}",
+                            t.id
+                        )));
+                    }
+                }
+            }
             let id = t.id.clone();
             if teams_map.insert(id.clone(), t).is_some() {
                 return Err(ConfigError::Invalid(format!("duplicate team id {id:?}")));
             }
         }
 
-        // agent 1: parse each person's `preferences` into `rules` via
-        // `crate::prefs::parse_preferences(&p.id, raw, KNOWN_CHANNELS)` and validate
-        // `Team::default_channels` against KNOWN_CHANNELS, before building the Directory.
+        // Parse and validate each person's `preferences:` into rules (SPEC §4.4); the
+        // error names the person and the failing entry.
+        for (id, p) in people_map.iter_mut() {
+            let rules = match p.preferences.as_ref() {
+                None => Vec::new(),
+                Some(raw) => parse_preferences(id, raw, KNOWN_CHANNELS)?,
+            };
+            p.rules = rules;
+        }
+
         Ok(Self {
             people: people_map,
             teams: teams_map,
@@ -270,6 +295,14 @@ impl Directory {
 
     pub fn person(&self, id: &str) -> Option<&Person> {
         self.people.get(id)
+    }
+
+    /// The team that defines the on-call `schedule`. Schedule ids are unique across teams
+    /// (validated in `from_parts`), so at most one team matches.
+    pub fn team_for_schedule(&self, schedule: &str) -> Option<&Team> {
+        self.teams
+            .values()
+            .find(|t| t.oncall.contains_key(schedule))
     }
 
     /// Expand one route target into people, de-duplicated, in a stable order.
@@ -329,6 +362,17 @@ impl Directory {
             out.push(person);
         }
         Ok(out)
+    }
+}
+
+/// The person's address on `channel`: `email` -> `contact.email`, `sms`/`phone` ->
+/// `contact.phone`, anything else -> `None`. The router freezes it into
+/// `delivery_jobs.address` when planning a job.
+pub fn address_for<'a>(person: &'a Person, channel: &str) -> Option<&'a str> {
+    match channel {
+        "email" => person.contact.email.as_deref(),
+        "sms" | "phone" => person.contact.phone.as_deref(),
+        _ => None,
     }
 }
 
@@ -536,6 +580,78 @@ mod tests {
         assert!(m.contains("\"s\"") && m.contains("both"), "{m}");
     }
 
+    fn person_with_prefs(id: &str, prefs: serde_json::Value) -> Person {
+        Person {
+            preferences: Some(prefs),
+            ..person(id)
+        }
+    }
+
+    #[test]
+    fn from_parts_parses_preferences_into_rules() {
+        let p = person_with_prefs(
+            "a",
+            serde_json::json!([
+                {"match": {"severity": "critical"}, "channels": ["sms"],
+                 "when": {"between": "08:00-20:00", "tz": "Europe/London"},
+                 "otherwise": ["email"]},
+                {"default": ["ui"]},
+            ]),
+        );
+        let d = Directory::from_parts(vec![p], vec![]).unwrap();
+        assert_eq!(d.person("a").unwrap().rules.len(), 2);
+    }
+
+    #[test]
+    fn from_parts_rejects_bad_preferences() {
+        let p = person_with_prefs(
+            "a",
+            serde_json::json!([
+                {"match": {}, "channels": ["fax"]},
+            ]),
+        );
+        let m = invalid(Directory::from_parts(vec![p], vec![]));
+        assert!(
+            m.contains("person a: preferences[0]") && m.contains("fax"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn from_parts_rejects_bad_default_channels() {
+        let mut t = team("t", &["a"], &[]);
+        t.default_channels = Some(vec![]);
+        let m = invalid(Directory::from_parts(vec![person("a")], vec![t]));
+        assert!(m.contains("default_channels") && m.contains("empty"), "{m}");
+
+        let mut t = team("t", &["a"], &[]);
+        t.default_channels = Some(vec!["fax".into()]);
+        let m = invalid(Directory::from_parts(vec![person("a")], vec![t]));
+        assert!(m.contains("default_channels") && m.contains("fax"), "{m}");
+    }
+
+    #[test]
+    fn team_for_schedule_finds_defining_team() {
+        let d = dir();
+        assert_eq!(d.team_for_schedule("rates-primary").unwrap().id, "rates");
+        assert!(d.team_for_schedule("nope").is_none());
+    }
+
+    #[test]
+    fn address_for_maps_channels_to_contacts() {
+        let d = dir();
+        let anna = d.person("anna").unwrap();
+        assert_eq!(address_for(anna, "email"), Some("anna@example.test"));
+        assert_eq!(address_for(anna, "sms"), None, "fixture has no phone");
+
+        let mut with_phone = person("p");
+        with_phone.contact.phone = Some("+44 7700 900777".into());
+        assert_eq!(address_for(&with_phone, "sms"), Some("+44 7700 900777"));
+        assert_eq!(address_for(&with_phone, "phone"), Some("+44 7700 900777"));
+        assert_eq!(address_for(&with_phone, "ui"), None);
+        assert_eq!(address_for(&with_phone, "fax"), None);
+    }
+
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("beacon-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -618,6 +734,8 @@ mod tests {
         assert_eq!(anna.contact.email.as_deref(), Some("anna@example.test"));
         assert_eq!(anna.contact.phone.as_deref(), Some("+44 7700 900123"));
         assert!(anna.preferences.is_some());
+        // Her preferences also parse and validate into rules (3 in the seed file).
+        assert_eq!(anna.rules.len(), 3);
         for t in ["settlements", "pricing", "rates", "payments"] {
             assert!(!d.expand(&format!("team:{t}")).unwrap().is_empty(), "{t}");
         }
