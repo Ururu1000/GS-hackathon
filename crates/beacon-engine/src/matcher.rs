@@ -99,8 +99,13 @@ fn encode_bounded(mut rec: beacon_core::MatchRecord) -> Result<(String, Vec<u8>)
     warn!(rule = %rec.rule_id, bytes = payload.len(), "match too large; dropping copied fields");
     rec.fields.clear();
     rec.key.clear();
-    rec.diagnostics.push(format!("match was {} bytes; card fields dropped", payload.len()));
-    Ok((rec.fingerprint.clone(), serde_json::to_vec(&rec)?))
+    rec.diagnostics = vec![format!("match was {} bytes; card fields dropped", payload.len())];
+    let payload = serde_json::to_vec(&rec)?;
+    // What is left is ids, two rendered strings capped at 8 KiB and the rule's
+    // configured route; if even that is too large the config is broken, so fail
+    // loudly rather than let the producer reject it.
+    anyhow::ensure!(payload.len() <= MAX_MATCH_BYTES, "match for rule {} is {} bytes even without fields", rec.rule_id, payload.len());
+    Ok((rec.fingerprint.clone(), payload))
 }
 
 /// Enqueue without blocking; if the local queue is full, wait and retry. Any

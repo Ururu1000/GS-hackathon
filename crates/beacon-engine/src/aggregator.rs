@@ -141,10 +141,11 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
                 if let Some(i) = current.filter(|&i| within(&states[i], m)) {
                     let s = &mut states[i];
                     s.count += 1;
-                    if m.ingested_at > s.last_seen {
+                    // last_seen and last_event_id always describe the same (latest) fire.
+                    if m.ingested_at >= s.last_seen {
                         s.last_seen = m.ingested_at;
+                        s.last_event_id = Some(m.event_id.clone());
                     }
-                    s.last_event_id = Some(m.event_id.clone());
                     s.touched = true;
                     if rank(&m.severity) > rank(&s.severity) {
                         s.severity = m.severity.clone();
@@ -195,9 +196,8 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
                     // moves to the new incident.
                     s.count -= 1;
                     s.last_seen = m.ingested_at;
-                } else {
-                    s.last_event_id = Some(m.event_id.clone());
                 }
+                s.last_event_id = Some(m.event_id.clone());
                 active.remove(&key);
                 if let Some(new) = reopened {
                     states.push(new);
