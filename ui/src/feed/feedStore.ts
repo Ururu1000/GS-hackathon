@@ -32,6 +32,7 @@ export interface FeedState {
   snapshotAt: string | null
   history: ReadonlyMap<string, FeedAlert>
   nextCursor: string | null
+  snapshotOldest: FeedAlert | null
   /** Ids that entered the page in the last applied batch (not via snapshot). */
   inserted: readonly string[]
   stats: FeedStats
@@ -44,6 +45,7 @@ export const emptyFeed: FeedState = {
   snapshotAt: null,
   history: new Map(),
   nextCursor: null,
+  snapshotOldest: null,
   inserted: [],
   stats: { snapshots: 0, upserts: 0, removes: 0, stale: 0 },
 }
@@ -73,6 +75,7 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
   let tombstones: Map<string, number> | null = null
   let snapshotAt = state.snapshotAt
   let nextCursor = state.nextCursor
+  let snapshotOldest = state.snapshotOldest
   let history: Map<string, FeedAlert> | null = null
   const older = () => (history ??= new Map(state.history))
   let membershipChanged = false
@@ -111,7 +114,8 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
         rows().set(next.id, next)
         if (!cur) {
           membershipChanged = true
-          inserted.add(next.id)
+          if (snapshotOldest && compareFeed(next, snapshotOldest) > 0) moved.add(next.id)
+          else inserted.add(next.id)
         } else if (cur.first_seen !== next.first_seen && !replaced) {
           // first_seen is immutable by contract; re-position defensively.
           membershipChanged = true
@@ -141,6 +145,12 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
     }
     snapshotAt = snap.server_time
     nextCursor = snap.next_cursor
+    snapshotOldest = null
+    if (nextCursor) {
+      for (const alert of fresh.values()) {
+        if (!snapshotOldest || compareFeed(alert, snapshotOldest) > 0) snapshotOldest = alert
+      }
+    }
     history = new Map()
     membershipChanged = true
     replaced = true
@@ -215,6 +225,7 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
     snapshotAt,
     history: history ?? state.history,
     nextCursor,
+    snapshotOldest,
     inserted: replaced && inserted.size === 0 ? [] : [...inserted],
     stats,
   }

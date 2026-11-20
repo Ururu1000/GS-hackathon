@@ -344,7 +344,7 @@ export function App() {
               <span className="small muted">Recipient</span>
               <select className="select" value={recipient ?? ''} onChange={(e) => { setRecipient(e.target.value || null); select(null) }}>
                 <option value="">All recipients</option>
-                {directory.filter((person) => !team || person.teams.includes(team)).map((person) =>
+                {directory.map((person) =>
                   <option key={person.id} value={person.id}>{person.name}</option>)}
               </select>
             </label>

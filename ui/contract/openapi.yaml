@@ -517,6 +517,7 @@ paths:
                 required: [outcome]
                 properties:
                   outcome: { type: string, enum: [approved, rejected, acked, already_decided, wrong_code, too_many_attempts, unknown] }
+                  approval_id: { type: string }
                   execution_id: { type: string }
         '403': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }

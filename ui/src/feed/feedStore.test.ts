@@ -161,3 +161,15 @@ it('pages history separately and applies only newer stream updates and removals'
   expect(state.history.size).toBe(0)
   expect(state.nextCursor).toBeNull()
 })
+
+it('keeps updates older than the snapshot window out of the new-alert indicator', () => {
+  const boundary = alert('boundary', 1, { first_seen: '2026-10-23T09:00:00.000Z' })
+  const older = alert('older', 2, { first_seen: '2026-10-23T08:59:00.000Z', status: 'resolved' })
+  const latest = alert('latest', 1, { first_seen: '2026-10-23T09:01:00.000Z' })
+  const snapshot: StreamEvent = {
+    type: 'snapshot', data: { team: null, items: [boundary], next_cursor: 'older', server_time: '2026-10-23T09:00:30.000Z' },
+  }
+  const state = applyEvents(emptyFeed, [snapshot, up(older), up(latest)])
+  expect(state.order).toEqual(['latest', 'boundary', 'older'])
+  expect(state.inserted).toEqual(['latest'])
+})

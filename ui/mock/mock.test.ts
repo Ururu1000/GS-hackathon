@@ -199,7 +199,7 @@ it('runs an escalation through the eligible simulated phone and consumes the SMS
   expect(sms.recipient).toBe('user:carol')
   const reply = { from: sms.to, text: sms.approval_challenge }
   const result = await request('/api/simulator/reply', 200, 'POST', reply)
-  expect(result).toMatchObject({ outcome: 'approved' })
+  expect(result).toMatchObject({ outcome: 'approved', approval_id: gated.error.approval_id })
   expect(await request('/api/simulator/reply', 200, 'POST', reply)).toEqual({ outcome: 'already_decided' })
   await vi.runAllTimersAsync()
   const detail = await request(path)
@@ -228,4 +228,22 @@ it('keeps the same recipient scope when loading historical pages and counts occu
   const detail = await request(`/api/alerts/${second.items[0].id}`)
   expect(detail.count).toBe(2)
   expect(detail.occurrences.counts).toEqual([2])
+})
+
+it('keeps a built-in source mapping ahead of a generic mapping', async () => {
+  await request('/api/schemas', 201, 'POST', { spec: {
+    schema: 'custom.status', priority: 0, detect: { path: 'status', op: 'exists' }, fields: {},
+  } })
+  const raw = {
+    alertname: 'HighErrorRate', status: 'firing',
+    labels: { service: 'payments-api', severity: 'critical', region: 'eu-west' },
+  }
+  await request('/ingest/alertmanager', 202, 'POST', raw)
+  const { items } = await request('/api/alerts?team=payments')
+  expect(items).toContainEqual(expect.objectContaining({
+    schema: 'prometheus.alert', rule: expect.objectContaining({ id: 'anna-payments-critical' }),
+  }))
+  await request('/ingest/playground', 202, 'POST', { status: 'example' })
+  const { items: recent } = await request('/api/events/recent')
+  expect(recent[0].schema).toBe('custom.status')
 })

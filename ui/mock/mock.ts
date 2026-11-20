@@ -687,7 +687,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         }
         const decision = answer[1]?.toUpperCase() === 'Y' ? 'approve' : 'reject'
         const result = completeApproval(a, step, approval, decision, entry.message.recipient, 'SMS reply')
-        json(res, 200, { outcome: result.state, execution_id: result.execution_id })
+        json(res, 200, { outcome: result.state, approval_id: approval.id, execution_id: result.execution_id })
       })
     }
     if (path === '/api/stream' && method === 'GET') return openStream(req, res, url), true

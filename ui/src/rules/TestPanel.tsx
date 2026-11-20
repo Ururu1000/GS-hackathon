@@ -29,7 +29,7 @@ export function TestPanel({ rule, team, initialSample, initialEvent, mockTranspo
   const available = discovered ? [discovered, ...SAMPLES] : SAMPLES
   const first = discovered ?? SAMPLES.find((s) => s.id === initialSample) ?? SAMPLES[0]!
   const replaySources = mockTransports ? ALLOWED_SOURCES : ALLOWED_SOURCES.filter((source) => source.startsWith('http:'))
-  const allowedSources = [...new Set([...replaySources, ...(initialEvent?.source.startsWith('http:') ? [initialEvent.source] : [])])]
+  const allowedSources = [...new Set([...replaySources, ...(initialEvent && (mockTransports || initialEvent.source.startsWith('http:')) ? [initialEvent.source] : [])])]
   const [text, setText] = useState(() => JSON.stringify(first.event, null, 2))
   const [source, setSource] = useState(first.source)
   const [picked, setPicked] = useState(`sample:${first.id}`)

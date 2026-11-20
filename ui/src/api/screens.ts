@@ -108,5 +108,10 @@ export const listSimulatorMessages = (cursor?: string, signal?: AbortSignal) =>
   request<SimulatorPage>(`/api/simulator/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`, { signal })
 export type SmsReplyOutcome = 'approved' | 'rejected' | 'acked' | 'already_decided' | 'wrong_code' | 'too_many_attempts' | 'unknown'
 
+export interface SmsReplyResult {
+  outcome: SmsReplyOutcome
+  approval_id?: string
+}
+
 export const replyToSimulatorMessage = (from: string, text: string) =>
-  post<{ outcome: SmsReplyOutcome }>('/api/simulator/reply', { from, text })
+  post<SmsReplyResult>('/api/simulator/reply', { from, text })

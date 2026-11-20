@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { API_BASE, errorText } from '../api/client'
-import { listSimulatorMessages, replyToSimulatorMessage, type SimulatorMessage, type SimulatorPage, type SmsReplyOutcome } from '../api/screens'
+import { listSimulatorMessages, replyToSimulatorMessage, type SimulatorMessage, type SimulatorPage, type SmsReplyOutcome, type SmsReplyResult } from '../api/screens'
 import { internationalPhone } from '../lib/phone'
 import { absTime } from '../lib/time'
 
@@ -30,14 +30,15 @@ export function SimulatorScreen() {
   const [connected, setConnected] = useState(false)
   const [selected, setSelected] = useState<string | null>(null)
   const [recipient, setRecipient] = useState('')
-  const [reply, setReply] = useState('')
-  const [decided, setDecided] = useState<Record<string, SmsReplyOutcome>>({})
+  const [draft, setDraft] = useState<{ receipt: string; text: string } | null>(null)
+  const [decided, setDecided] = useState<Record<string, SmsReplyResult>>({})
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [sending, setSending] = useState(false)
   const recipients = useMemo(() => [...new Set(page?.items.map((item) => item.recipient) ?? [])].sort(), [page])
   const items = recipient ? (page?.items ?? []).filter((item) => item.recipient === recipient) : page?.items ?? []
   const current = items.find((item) => item.receipt_id === selected) ?? items[0] ?? null
+  const reply = draft && current?.receipt_id === draft.receipt ? draft.text : ''
   const from = current?.channel === 'sms' ? internationalPhone(current.to) : null
   const command = current?.approval_challenge?.trim().match(/^(?:Y\s+)?(\d{4})$/i)
   const approvalReply = command?.[1] ? `Y ${command[1]}` : null
@@ -91,6 +92,12 @@ export function SimulatorScreen() {
   const send = async (text: string) => {
     if (!current || !from || !text.trim() || sending) return
     const receipt = current.receipt_id
+    const submittedCode = text.trim().match(/^[YN]\s+(\d{4})$/i)?.[1]
+    if (!submittedCode || submittedCode !== command?.[1]) {
+      setError('Reply Y or N with the code shown in this SMS.')
+      return
+    }
+    setSelected(receipt)
     setError(null)
     setSending(true)
     try {
@@ -98,8 +105,8 @@ export function SimulatorScreen() {
       if (result.outcome === 'wrong_code' || result.outcome === 'unknown') {
         setError(replyStatus[result.outcome])
       } else {
-        setDecided((previous) => ({ ...previous, [receipt]: result.outcome }))
-        setReply('')
+        setDecided((previous) => ({ ...previous, [receipt]: result }))
+        setDraft((previous) => previous?.receipt === receipt ? null : previous)
       }
     } catch (e) {
       setError(errorText(e))
@@ -120,7 +127,7 @@ export function SimulatorScreen() {
           <h2>Inbox</h2>
           <label className="form-field">
             <span className="label">Recipient</span>
-            <select className="select" value={recipient} onChange={(e) => { setRecipient(e.target.value); setSelected(null); setReply('') }}>
+            <select className="select" value={recipient} onChange={(e) => { setRecipient(e.target.value); setSelected(null); setDraft(null) }}>
               <option value="">All recipients</option>
               {recipients.map((name) => <option key={name} value={name}>{name.replace(/^user:/, '')}</option>)}
             </select>
@@ -128,7 +135,7 @@ export function SimulatorScreen() {
           {items.length ? <ul className="feature-items simulator-inbox">
             {items.map((item) => (
               <li key={item.receipt_id}>
-                <button className="btn btn-ghost" aria-pressed={current?.receipt_id === item.receipt_id} onClick={() => { setSelected(item.receipt_id); setReply('') }}>
+                <button className="btn btn-ghost" aria-pressed={current?.receipt_id === item.receipt_id} onClick={() => { setSelected(item.receipt_id); setDraft(null) }}>
                   <span>{item.channel === 'sms' ? 'SMS' : 'Call'} · {item.recipient.replace(/^user:/, '')}</span>
                   <span className="muted small">{item.text}</span>
                 </button>
@@ -148,12 +155,15 @@ export function SimulatorScreen() {
               {current.duplicates > 0 && <p className="hint">{current.duplicates} duplicate receipt{current.duplicates === 1 ? '' : 's'}</p>}
               <a href={`#/alerts/${encodeURIComponent(current.alert_id)}`}>Open alert</a>
               {current.channel === 'sms' && current.approval_challenge && (
-                decided[current.receipt_id] ? <p className="notice" role="status">{replyStatus[decided[current.receipt_id]!]}</p>
+                decided[current.receipt_id] ? <p className="notice" role="status">{replyStatus[decided[current.receipt_id]!.outcome]}</p>
                   : from ? (
                     <form className="stack tight" onSubmit={(e) => { e.preventDefault(); void send(reply) }}>
                       <label className="form-field">
                         <span className="label">SMS reply</span>
-                        <input className="input mono" maxLength={160} value={reply} disabled={sending} onChange={(e) => setReply(e.target.value)} placeholder={approvalReply ?? undefined} />
+                        <input className="input mono" maxLength={160} value={reply} disabled={sending} onChange={(e) => {
+                          setSelected(current.receipt_id)
+                          setDraft({ receipt: current.receipt_id, text: e.target.value })
+                        }} placeholder={approvalReply ?? undefined} />
                       </label>
                       <div className="inline">
                         {approvalReply && <button className="btn" type="button" disabled={sending} onClick={() => void send(approvalReply)}>Reply {approvalReply}</button>}
