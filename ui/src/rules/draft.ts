@@ -160,19 +160,65 @@ export function toYaml(rule: RuleSpec): string {
 
 export type YamlResult = { ok: true; rule: RuleSpec } | { ok: false; message: string; line: number | null; col: number | null }
 
+const MAX_YAML_CHARS = 64 * 1024
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function hasForbiddenKey(v: unknown, depth = 0): string | null {
+  if (depth > 20 || v === null || typeof v !== 'object') return null
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const bad = hasForbiddenKey(item, depth + 1)
+      if (bad) return bad
+    }
+    return null
+  }
+  for (const k of Object.keys(v as Record<string, unknown>)) {
+    if (FORBIDDEN_KEYS.has(k)) return k
+    const bad = hasForbiddenKey((v as Record<string, unknown>)[k], depth + 1)
+    if (bad) return bad
+  }
+  return null
+}
+
+function isConditionShape(c: unknown, depth = 0): boolean {
+  if (depth > 12 || c === null || typeof c !== 'object' || Array.isArray(c)) return false
+  const o = c as Record<string, unknown>
+  if ('all' in o) return Array.isArray(o.all) && o.all.every((x) => isConditionShape(x, depth + 1))
+  if ('any' in o) return Array.isArray(o.any) && o.any.every((x) => isConditionShape(x, depth + 1))
+  if ('not' in o) return isConditionShape(o.not, depth + 1)
+  return typeof o.path === 'string' && typeof o.op === 'string'
+}
+
 export function fromYaml(text: string): YamlResult {
+  if (text.length > MAX_YAML_CHARS)
+    return { ok: false, message: `YAML is too large (max ${MAX_YAML_CHARS} bytes)`, line: 1, col: 1 }
   const doc = parseDocument(text, { prettyErrors: true, uniqueKeys: true })
   const e = doc.errors[0]
   if (e) {
     const pos = e.linePos?.[0]
     return { ok: false, message: e.message.split('\n')[0]!.replace(/ at line \d+, column \d+:?$/, ''), line: pos?.line ?? null, col: pos?.col ?? null }
   }
-  const v = doc.toJS() as unknown
+  let v: unknown
+  try {
+    v = doc.toJS({ maxAliasCount: 50 }) as unknown
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : 'Invalid YAML', line: 1, col: 1 }
+  }
   if (v === null || typeof v !== 'object' || Array.isArray(v))
     return { ok: false, message: 'A rule is a mapping (id:, team:, when:, …)', line: 1, col: 1 }
+  const badKey = hasForbiddenKey(v)
+  if (badKey) return { ok: false, message: `Forbidden key \`${badKey}\``, line: null, col: null }
   const r = v as Partial<RuleSpec>
   for (const k of ['id', 'team', 'when', 'route', 'present'] as const)
     if (r[k] === undefined) return { ok: false, message: `Missing \`${k}:\``, line: null, col: null }
+  if (typeof r.id !== 'string' || typeof r.team !== 'string')
+    return { ok: false, message: '`id` and `team` must be strings', line: null, col: null }
+  if (!isConditionShape(r.when))
+    return { ok: false, message: '`when` must be a condition object (all/any/not or path+op)', line: null, col: null }
+  if (!Array.isArray(r.route) || !r.route.every((x) => x !== null && typeof x === 'object' && typeof (x as { to?: unknown }).to === 'string'))
+    return { ok: false, message: '`route` must be a list of { to: ... } entries', line: null, col: null }
+  if (r.present === null || typeof r.present !== 'object' || Array.isArray(r.present) || typeof (r.present as { title?: unknown }).title !== 'string')
+    return { ok: false, message: '`present` must be an object with a `title` string', line: null, col: null }
   return { ok: true, rule: r as RuleSpec }
 }
 
