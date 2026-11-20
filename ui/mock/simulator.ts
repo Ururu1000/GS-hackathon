@@ -37,10 +37,17 @@ export function createSimulator(canSeeTeam: (team: string) => boolean) {
       }
       if (canSeeTeam(team)) for (const res of streams) write(res, 'simulator.message', item)
     },
-    approvalSms(from: string, code?: string) {
-      const candidates = [...receipts.values()].reverse().filter((entry) =>
-        entry.approval && entry.message.channel === 'sms' && entry.message.to === from && canSeeTeam(entry.team))
-      return candidates.find((entry) => entry.message.approval_challenge === `Y ${code}`) ?? candidates[0] ?? null
+    approvalSms(from: string, code?: string, receiptId?: string) {
+      const eligible = (entry: DeviceRecord) => entry.approval && entry.message.channel === 'sms' &&
+        entry.message.to === from && canSeeTeam(entry.team)
+      if (receiptId !== undefined) {
+        const entry = receipts.get(receiptId)
+        return entry && eligible(entry) ? entry : null
+      }
+      const candidates = [...receipts.values()].reverse().filter(eligible)
+      const matches = candidates.filter((entry) => entry.message.approval_challenge === `Y ${code}`)
+      if (matches.length > 1) return null
+      return matches[0] ?? candidates[0] ?? null
     },
     stream(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(200, {

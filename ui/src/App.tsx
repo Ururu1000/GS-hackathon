@@ -332,7 +332,7 @@ export function App() {
       {route.view === 'proposals' && <ProposalsScreen id={route.id} team={team} onNavigate={navigate} onToast={push} onChanged={refreshProposals} />}
       {route.view === 'sources' && <SourcesScreen onCreateRule={createRuleFromSample} />}
       {route.view === 'runbooks' && <RunbooksScreen team={team} teams={session?.teams ?? []} canImport={session?.capabilities?.runbook_import === true} />}
-      {route.view === 'simulator' && <SimulatorScreen />}
+      {route.view === 'simulator' && <SimulatorScreen mockReplies={session?.capabilities?.mock_transports === true} />}
       </Suspense>
 
       {route.view === 'alerts' && (

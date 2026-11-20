@@ -666,12 +666,13 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       return simulator.stream(req, res), true
     }
     if (path === '/api/simulator/reply' && method === 'POST') {
-      return write(req, res, (b: { from?: string; text?: string }) => {
+      return write(req, res, (b: { from?: string; text?: string; receipt_id?: string }) => {
         const from = typeof b.from === 'string' && internationalPhone(b.from)
-        if (!from || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 160)
+        if (!from || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 160 ||
+            (b.receipt_id !== undefined && typeof b.receipt_id !== 'string'))
           return err(res, 400, 'bad_request', 'A phone number and an SMS reply are required')
         const answer = b.text.trim().match(/^([YN])\s+(\d{4})$/i)
-        const entry = simulator.approvalSms(from, answer?.[2])
+        const entry = simulator.approvalSms(from, answer?.[2], b.receipt_id)
         if (!entry?.approval) return json(res, 200, { outcome: 'unknown' })
         const a = alerts.get(entry.message.alert_id)
         const step = entry.approval.step

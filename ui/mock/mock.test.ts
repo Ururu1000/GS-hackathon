@@ -5,6 +5,11 @@ import type { RuleSpec, RunbookStep } from '../src/api/types'
 import { createMock } from './mock'
 import { RULES, workflowFailed } from './scenario'
 
+vi.mock('node:crypto', async (original) => {
+  const crypto = await original<typeof import('node:crypto')>()
+  return { ...crypto, randomBytes: (size: number) => size === 2 ? Buffer.alloc(2) : crypto.randomBytes(size) }
+})
+
 let mock: ReturnType<typeof createMock>
 let server: Server
 let base: string
@@ -246,4 +251,52 @@ it('keeps a built-in source mapping ahead of a generic mapping', async () => {
   await request('/ingest/playground', 202, 'POST', { status: 'example' })
   const { items: recent } = await request('/api/events/recent')
   expect(recent[0].schema).toBe('custom.status')
+})
+
+it('binds a simulator reply to the selected receipt when two approvals share a phone and code', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout'] })
+  const openApproval = async (workflowId: string) => {
+    const { matched_alerts: [id] } = await request('/ingest/kafka:workflows', 202, 'POST', { ...failedWorkflow(), workflowId })
+    const path = `/api/alerts/${id}`
+    for (let i = 0; i < 2; i++) {
+      await request(`${path}/steps/retry/run`, 202, 'POST')
+      await vi.runAllTimersAsync()
+    }
+    const gated = await request(`${path}/steps/escalate/run`, 409, 'POST')
+    return { id, path, approvalId: gated.error.approval_id }
+  }
+  const older = await openApproval('duplicate-code-older')
+  const newer = await openApproval('duplicate-code-newer')
+  const { items } = await request('/api/simulator/messages')
+  const receipts = items.filter((item: { approval_challenge: string | null }) => item.approval_challenge === 'Y 1000')
+  expect(receipts).toHaveLength(2)
+  expect(receipts[0].to).toEqual(receipts[1].to)
+  const receipt = receipts.find((item: { alert_id: string }) => item.alert_id === older.id)
+  const reply = { from: receipt.to, text: 'N 1000' }
+  expect(await request('/api/simulator/reply', 200, 'POST', reply)).toEqual({ outcome: 'unknown' })
+  expect(await request('/api/simulator/reply', 200, 'POST', { ...reply, receipt_id: receipt.receipt_id }))
+    .toMatchObject({ outcome: 'rejected', approval_id: older.approvalId })
+  const detail = await request(newer.path)
+  const escalation = detail.runbook.steps.find((entry: RunbookStep) => entry.id === 'escalate')
+  expect(escalation.approval_request).toMatchObject({ id: newer.approvalId, state: 'pending' })
+})
+
+it('selects across all matching detectors and uses envelope inference only as a fallback', async () => {
+  const rule = RULES[0]!
+  const overlap = {
+    ...failedWorkflow(), alertname: 'HighErrorRate', status: 'firing',
+    labels: { service: 'payments-api', severity: 'critical' },
+  }
+  const check = (event: unknown, source = 'http:playground') =>
+    request('/api/rules/test', 200, 'POST', { rule, event, source })
+  expect((await check(overlap, 'http:alertmanager')).schema).toBe('prometheus.alert')
+  expect((await check(overlap)).schema).toMatch(/^unknown:/)
+
+  const envelope = { meta: { schema: 'producer.event' }, payload: {}, status: 'sample' }
+  expect((await check(envelope)).schema).toBe('producer.event')
+  await request('/api/schemas', 201, 'POST', { spec: {
+    schema: 'custom.status', priority: 0, detect: { path: 'status', op: 'exists' },
+    fields: { stage: { path: 'status' } },
+  } })
+  expect(await check(envelope)).toMatchObject({ schema: 'custom.status', fields: { stage: 'sample' } })
 })

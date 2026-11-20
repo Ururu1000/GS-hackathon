@@ -507,6 +507,7 @@ paths:
               properties:
                 from: { type: string, examples: ['+447700900125'] }
                 text: { type: string, maxLength: 160, examples: ['Y 1234'] }
+                receipt_id: { type: string, description: Mock only. Binds the reply to the selected receipt. }
       responses:
         '200':
           description: Reply applied

@@ -25,7 +25,11 @@ function mergeMessages(first: SimulatorMessage[], second: SimulatorMessage[]) {
   return [...messages.values()].sort((a, b) => Date.parse(b.received_at) - Date.parse(a.received_at) || b.id - a.id)
 }
 
-export function SimulatorScreen() {
+function approvalCode(message: SimulatorMessage) {
+  return message.approval_challenge?.trim().match(/^(?:Y\s+)?(\d{4})$/i)?.[1]
+}
+
+export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
   const [page, setPage] = useState<SimulatorPage | null>(null)
   const [connected, setConnected] = useState(false)
   const [selected, setSelected] = useState<string | null>(null)
@@ -40,8 +44,8 @@ export function SimulatorScreen() {
   const current = items.find((item) => item.receipt_id === selected) ?? items[0] ?? null
   const reply = draft && current?.receipt_id === draft.receipt ? draft.text : ''
   const from = current?.channel === 'sms' ? internationalPhone(current.to) : null
-  const command = current?.approval_challenge?.trim().match(/^(?:Y\s+)?(\d{4})$/i)
-  const approvalReply = command?.[1] ? `Y ${command[1]}` : null
+  const code = current ? approvalCode(current) : undefined
+  const approvalReply = code ? `Y ${code}` : null
 
   useEffect(() => {
     const controller = new AbortController()
@@ -93,15 +97,20 @@ export function SimulatorScreen() {
     if (!current || !from || !text.trim() || sending) return
     const receipt = current.receipt_id
     const submittedCode = text.trim().match(/^[YN]\s+(\d{4})$/i)?.[1]
-    if (!submittedCode || submittedCode !== command?.[1]) {
+    if (!submittedCode || submittedCode !== code) {
       setError('Reply Y or N with the code shown in this SMS.')
+      return
+    }
+    if (!mockReplies && page?.items.some((item) => item.receipt_id !== receipt &&
+      internationalPhone(item.to) === from && approvalCode(item) === submittedCode)) {
+      setError('Multiple messages share this code. Open the alert to decide the intended request.')
       return
     }
     setSelected(receipt)
     setError(null)
     setSending(true)
     try {
-      const result = await replyToSimulatorMessage(from, text.trim())
+      const result = await replyToSimulatorMessage(from, text.trim(), mockReplies ? receipt : undefined)
       if (result.outcome === 'wrong_code' || result.outcome === 'unknown') {
         setError(replyStatus[result.outcome])
       } else {

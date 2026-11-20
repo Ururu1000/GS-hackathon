@@ -113,5 +113,5 @@ export interface SmsReplyResult {
   approval_id?: string
 }
 
-export const replyToSimulatorMessage = (from: string, text: string) =>
-  post<SmsReplyResult>('/api/simulator/reply', { from, text })
+export const replyToSimulatorMessage = (from: string, text: string, receiptId?: string) =>
+  post<SmsReplyResult>('/api/simulator/reply', { from, text, receipt_id: receiptId })

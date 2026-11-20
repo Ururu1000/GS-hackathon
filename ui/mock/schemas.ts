@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util'
 import type { SchemaField, SchemaPreview, SchemaSpec } from '../src/api/screens.ts'
 import { COND_OPS, type Condition, type Scalar } from '../src/api/types.ts'
-import { context, evaluate, MISSING, unknownSignature, validateRule, type Ctx } from './engine.ts'
+import { builtInMappings, evaluate, MISSING, unknownSignature, validateRule, type Ctx } from './engine.ts'
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -142,28 +142,27 @@ export function previewMapping(spec: SchemaSpec, event: unknown, source: string)
   return { matched: detected(spec, event, source), fields, warnings }
 }
 
-const builtInPriority: Record<string, number> = {
-  'workflow.failed': 50, 'prometheus.alert': 50, 'log.line': 30, 'ci.deployment': 30,
-}
-
 export function mappedContext(event: unknown, source: string, mappings: Iterable<SchemaSpec>): Ctx {
-  const baseline = context(event, source)
   const candidates = [...mappings].filter((spec) => detected(spec, event, source)).map((spec) => ({
     schema: spec.schema, scoped: Boolean(spec.detect.source), priority: spec.priority,
     fields: () => previewMapping(spec, event, source).fields,
   }))
-  if (!baseline.schema.startsWith('unknown:') && !candidates.some((item) => item.schema === baseline.schema)) {
-    candidates.push({
-      schema: baseline.schema,
-      scoped: source === 'http:alertmanager' && baseline.schema === 'prometheus.alert',
-      priority: builtInPriority[baseline.schema] ?? 40,
-      fields: () => baseline.fields,
-    })
+  const overridden = new Set(candidates.map((item) => item.schema))
+  let fallback: { schema: string; fields: Record<string, unknown> } | undefined
+  for (const builtIn of builtInMappings(event)) {
+    if (builtIn.fallback) {
+      fallback = builtIn
+    } else if (!overridden.has(builtIn.schema)) {
+      candidates.push({
+        schema: builtIn.schema, scoped: builtIn.preferredSource === source, priority: builtIn.priority,
+        fields: () => builtIn.fields,
+      })
+    }
   }
   candidates.sort((a, b) => Number(b.scoped) - Number(a.scoped) || b.priority - a.priority)
   const [first, second] = candidates
-  if (!first) return baseline
-  if (second && first.scoped === second.scoped && first.priority === second.priority)
-    return { ...baseline, schema: unknownSignature(event), fields: {} }
-  return { ...baseline, schema: first.schema, fields: first.fields() }
+  if (!first && fallback) return { raw: event, source, schema: fallback.schema, fields: fallback.fields }
+  if (first && !(second && first.scoped === second.scoped && first.priority === second.priority))
+    return { raw: event, source, schema: first.schema, fields: first.fields() }
+  return { raw: event, source, schema: unknownSignature(event), fields: {} }
 }
