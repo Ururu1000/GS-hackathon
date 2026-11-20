@@ -25,7 +25,8 @@ use tokio::sync::Semaphore;
 
 use crate::publisher::{EventPublisher, PublishError};
 
-pub const MAX_BODY: usize = 1024 * 1024;
+/// Below the broker's 1 MiB record limit, leaving room for the envelope.
+pub const MAX_BODY: usize = 900 * 1024;
 pub const MAX_BATCH: usize = 1000;
 
 /// Abstracts the broker so the handler can be tested without Kafka.
@@ -77,6 +78,7 @@ fn valid_source(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
+#[allow(clippy::result_large_err)] // the Err is a ready-made HTTP response
 fn event_id(headers: &HeaderMap, source: &str) -> Result<String, Response> {
     match headers.get("idempotency-key") {
         None => Ok(uuid::Uuid::now_v7().to_string()),
@@ -93,6 +95,7 @@ fn event_id(headers: &HeaderMap, source: &str) -> Result<String, Response> {
 fn map_publish_error(e: PublishError) -> Response {
     match e {
         PublishError::Saturated => error(StatusCode::TOO_MANY_REQUESTS, "saturated", "broker queue full, retry"),
+        PublishError::TooLarge => error(StatusCode::PAYLOAD_TOO_LARGE, "event_too_large", "event exceeds the broker record limit"),
         PublishError::Broker(m) => error(StatusCode::SERVICE_UNAVAILABLE, "broker_unavailable", m),
     }
 }

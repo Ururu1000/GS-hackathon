@@ -217,14 +217,13 @@ impl CompiledRule {
                 Ok((path, label))
             })
             .collect::<Result<Vec<_>, RuleError>>()?;
-        if let Some(c) = &spec.present.color {
-            if !COLORS.contains(&c.as_str()) {
+        if let Some(c) = &spec.present.color
+            && !COLORS.contains(&c.as_str()) {
                 return Err(RuleError::Color {
                     rule,
                     color: c.clone(),
                 });
             }
-        }
         for r in &spec.route {
             if !["team:", "user:", "oncall:"].iter().any(|p| r.to.starts_with(p)) {
                 return Err(RuleError::Route {

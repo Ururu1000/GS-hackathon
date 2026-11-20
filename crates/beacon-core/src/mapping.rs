@@ -186,11 +186,10 @@ impl SchemaMapping {
 
     /// Does this mapping recognise the event? (Source scoping + discriminator tests.)
     pub fn detects(&self, event: &Event) -> bool {
-        if let Some(src) = &self.source {
-            if src != &event.source {
+        if let Some(src) = &self.source
+            && src != &event.source {
                 return false;
             }
-        }
         self.detect.eval(event)
     }
 

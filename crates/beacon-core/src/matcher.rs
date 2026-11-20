@@ -93,11 +93,10 @@ impl RuleIndex {
     pub fn candidates(&self, event: &Event) -> BTreeSet<usize> {
         let mut out: BTreeSet<usize> = self.fallback.iter().copied().collect();
         for (path, map) in &self.by_path {
-            if let Some(v) = path.resolve(event) {
-                if let Some(rules) = map.get(&canonical(v.as_ref())) {
+            if let Some(v) = path.resolve(event)
+                && let Some(rules) = map.get(&canonical(v.as_ref())) {
                     out.extend(rules.iter().copied());
                 }
-            }
         }
         out
     }

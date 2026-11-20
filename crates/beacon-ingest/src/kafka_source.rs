@@ -99,6 +99,16 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
             };
             match res {
                 Ok(()) => break,
+                Err(PublishError::TooLarge) => {
+                    // Retrying can never succeed: quarantine a truncated copy and move on.
+                    let p = msg.payload().unwrap_or_default();
+                    let head = &p[..p.len().min(64 * 1024)];
+                    let reason = format!("too large for events.raw ({} bytes); payload truncated to {} bytes", p.len(), head.len());
+                    if let Err(e) = quarantine(&publisher, &id, head, &reason).await {
+                        error!(source = %spec.id, error = %e, "quarantine of oversized payload failed; skipping");
+                    }
+                    break;
+                }
                 Err(e) => {
                     // Never skip: the upstream offset is not stored until the publish succeeds.
                     warn!(source = %spec.id, error = %e, "publish failed, retrying");

@@ -3,8 +3,9 @@
 //! Claims pending rows with `FOR UPDATE SKIP LOCKED` (any number of relays,
 //! no leader), publishes the alert's **current** full state keyed by alert id,
 //! and deletes the rows in the same transaction once the broker has
-//! acknowledged (they exist only for this relay, so nothing is kept). Several rows for one alert collapse into one publish; each
-//! record carries the alert `version`, so consumers drop stale ones.
+//! acknowledged (they exist only for this relay, so nothing is kept).
+//! Several rows for one alert collapse into one publish; each record carries
+//! the alert `version`, so consumers drop stale ones.
 //! Woken by `NOTIFY beacon_outbox`, with a short polling fallback.
 
 use std::time::Duration;

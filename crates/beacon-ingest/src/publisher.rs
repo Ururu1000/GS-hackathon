@@ -14,6 +14,9 @@ pub enum PublishError {
     /// Local queue is full: back off (HTTP 429).
     #[error("broker queue full")]
     Saturated,
+    /// The event is larger than the broker accepts (HTTP 413).
+    #[error("event too large for the broker")]
+    TooLarge,
     /// The broker failed or the outcome is unknown (HTTP 503).
     #[error("broker error: {0}")]
     Broker(String),
@@ -42,6 +45,7 @@ impl EventPublisher {
         match self.producer.send(record, Timeout::After(self.timeout)).await {
             Ok(_) => Ok(()),
             Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) => Err(PublishError::Saturated),
+            Err((KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge), _)) => Err(PublishError::TooLarge),
             Err((e, _)) => Err(PublishError::Broker(e.to_string())),
         }
     }

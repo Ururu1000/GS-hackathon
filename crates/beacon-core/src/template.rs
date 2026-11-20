@@ -35,13 +35,14 @@ fn money(v: JValue) -> String {
         return v.to_string();
     };
     let neg = n < 0.0;
-    let abs = n.abs();
-    let whole = abs.trunc() as u128;
-    let frac = ((abs - abs.trunc()) * 100.0).round() as u32;
+    // Round to cents first so 1000.999 carries into 1,001 instead of `.100`.
+    let cents = (n.abs() * 100.0).round() as u128;
+    let whole = cents / 100;
+    let frac = (cents % 100) as u32;
     let digits = whole.to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -106,6 +107,8 @@ mod tests {
         assert_eq!(money(JValue::from(999)), "999");
         assert_eq!(money(JValue::from(1234.5)), "1,234.50");
         assert_eq!(money(JValue::from("1000")), "1,000");
+        assert_eq!(money(JValue::from(1000.999)), "1,001");
+        assert_eq!(money(JValue::from(-1234567.5)), "-1,234,567.50");
     }
 
     #[test]
