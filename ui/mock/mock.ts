@@ -45,11 +45,15 @@ import type {
   TimelineEntry,
   TransitionRequest,
 } from '../src/api/types.ts'
+import type { DiscoveredSchema, SchemaMapping, SourceView } from '../src/api/screens.ts'
+import { createSimulator } from './simulator.ts'
+import { importRunbook, prepareRunbook } from './import-runbook.ts'
+import { mappedContext, parseMapping, previewMapping } from './schemas.ts'
 import { redactText, redactValue } from '../src/lib/redact.ts'
 import { inWindow, parseWindow, resolveChannels } from '../src/prefs/resolve.ts'
-import { applyRule, context, dedupKey, parseDuration, recovers, testRule, validateRule, type Ctx } from './engine.ts'
+import { applyRule, dedupKey, parseDuration, recovers, testRule, validateRule, type Ctx } from './engine.ts'
 import { failedRuns, renderActionParams, runtimeOf, viewRunbook, type RunbookRuntime, type StoredApproval } from './runbooks.ts'
-import { deliveriesFor, PEOPLE, randomEvent, RULES, RUNBOOKS, TEAMS, type DeliveryPlan } from './scenario.ts'
+import { deliveriesFor, PEOPLE, randomEvent, RULES, RUNBOOKS, TEAMS, type DeliveryPlan, type RunbookDef } from './scenario.ts'
 
 interface MockAlert {
   feed: FeedAlert
@@ -57,6 +61,7 @@ interface MockAlert {
   /** Pinned event context of the opening event (runbook templates use it). */
   ctx: Ctx
   plan: DeliveryPlan
+  occurrences: Map<number, number>
   runbookId: string | null
   runbook: RunbookRuntime
   /** Version at the last status change; 409s compare against this. */
@@ -78,6 +83,7 @@ interface RuleRec {
 interface Client {
   res: ServerResponse
   team: string | null
+  recipient: string | null
 }
 
 const env = (k: string, d: number) => {
@@ -133,6 +139,15 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   const teams = new Map<string, TeamView>(TEAMS.map((t) => [t.id, clone(t)]))
   const proposals = new Map<string, Proposal>()
   const recent: StoredRecent[] = []
+  const discovered = new Map<string, { entry: DiscoveredSchema; recent: StoredRecent }>()
+  const schemas = new Map<string, SchemaMapping>()
+  const runbooks = new Map(RUNBOOKS.map((book) => [book.id, book]))
+  const sources = new Map<string, { last: string | null; hours: Map<number, number> }>(
+    ['http:playground', 'http:alertmanager', 'http:ci', 'kafka:workflows', 'kafka:trades', 'file:pricing-engine']
+      .map((id) => [id, { last: null, hours: new Map() }]),
+  )
+  const eventContext = (event: unknown, source: string) =>
+    mappedContext(event, source, Array.from(schemas.values(), (item) => item.spec))
   const ingestHits: number[] = []
 
   const allowedVisibleTeams = (): Set<string> => {
@@ -143,6 +158,8 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   const canSeeTeam = (teamId: string | null) => teamId === null || allowedVisibleTeams().has(teamId)
   const isTeamMember = (teamId: string) => teams.get(teamId)?.members.includes(ME_ID) ?? false
   const isTeamLead = (teamId: string) => teams.get(teamId)?.lead === ME_ID
+  const simulator = createSimulator(canSeeTeam)
+  const pendingDeviceAlerts = new Set<string>()
   const canEditPerson = (personId: string) => personId === ME_ID
   let idSeq = 0
   let evSeq = 0
@@ -176,7 +193,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         byUser.set(u, set)
       }
     }
-    return [...byUser].flatMap(([u, set]) => [...set].filter((c) => c !== 'ui').map((c): [string, string] => [`user:${u}`, c]))
+    return [...byUser].flatMap(([u, set]) => [...set].map((c): [string, string] => [`user:${u}`, c]))
   }
 
   // ---- engine ------------------------------------------------------------
@@ -197,10 +214,29 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     const matchedTeams = new Set<string>()
     const eventId = `evt_${at.getTime().toString(36)}${(evSeq++).toString(36)}`
     const sample: EventSample = { event_id: eventId, received_at: at.toISOString(), raw }
-    const ctx = context(raw, source)
+    const ctx = eventContext(raw, source)
     const storedRecent: StoredRecent = { event: { ...sample, source, schema: ctx.schema }, teams: matchedTeams }
     recent.unshift(storedRecent)
     if (recent.length > RECENT_MAX) recent.length = RECENT_MAX
+    const sourceStats = sources.get(source) ?? { last: null, hours: new Map<number, number>() }
+    const hour = Math.floor(at.getTime() / HOUR)
+    sourceStats.last = sample.received_at
+    sourceStats.hours.set(hour, (sourceStats.hours.get(hour) ?? 0) + 1)
+    for (const bucket of sourceStats.hours.keys()) if (bucket < hour - 23) sourceStats.hours.delete(bucket)
+    if (sources.has(source) || sources.size < 100) sources.set(source, sourceStats)
+    if (ctx.schema.startsWith('unknown:')) {
+      const key = JSON.stringify([ctx.schema, source])
+      const prior = discovered.get(key)?.entry
+      discovered.delete(key)
+      discovered.set(key, { entry: {
+        schema: ctx.schema, source, count: (prior?.count ?? 0) + 1,
+        first_seen: prior?.first_seen ?? sample.received_at, last_seen: sample.received_at, sample: raw,
+      }, recent: storedRecent })
+      if (discovered.size > RECENT_MAX) {
+        const oldest = discovered.keys().next()
+        if (!oldest.done) discovered.delete(oldest.value)
+      }
+    }
     for (const rec of rules.values()) {
       const rule = rec.rule
       if (rule.enabled === false) continue
@@ -219,12 +255,13 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       const m = applyRule(rule, ctx)
       if (!m) continue
       matchedTeams.add(rule.team)
-      const hour = Math.floor(at.getTime() / HOUR)
       rec.fires.set(hour, (rec.fires.get(hour) ?? 0) + 1)
       const existing = k === null ? undefined : alerts.get(active.get(k) ?? '')
       const window = parseDuration(rule.dedup?.window) ?? 10 * 60_000
       if (existing && at.getTime() - Date.parse(existing.feed.last_seen) <= window) {
         const prev = existing.feed
+        existing.occurrences.set(hour, (existing.occurrences.get(hour) ?? 0) + 1)
+        for (const bucket of existing.occurrences.keys()) if (bucket < hour - 23) existing.occurrences.delete(bucket)
         existing.feed = { ...prev, count: prev.count + 1, last_seen: at.toISOString(), version: prev.version + 1 }
         if (existing.samples.length > MAX_SAMPLES_HEAD) existing.samples[MAX_SAMPLES_HEAD] = sample
         else existing.samples.push(sample)
@@ -266,6 +303,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         key: k,
         ctx,
         plan: plan(rule, ctx, m.severity, at),
+        occurrences: new Map([[hour, 1]]),
         runbookId: rule.runbook ?? null,
         runbook: new Map(),
         statusVersion: 1,
@@ -274,6 +312,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         lastDedupNote: at.getTime(),
       }
       alerts.set(id, a)
+      if (a.plan.some(([, channel]) => channel === 'sms' || channel === 'phone')) pendingDeviceAlerts.add(id)
       if (k !== null) active.set(k, id)
       touched.push(id)
       if (broadcast) publish(a, null)
@@ -300,12 +339,12 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     alerts.delete(a.feed.id)
     if (a.key !== null && active.get(a.key) === a.feed.id) active.delete(a.key)
     const rm: RemoveEvent = { id: a.feed.id, version: a.feed.version + 1, reason }
-    for (const c of clients) if (visible(c.team, a.feed)) send(c.res, 'alert.remove', rm)
+    for (const c of clients) if (visible(c.team, a, c.recipient)) send(c.res, 'alert.remove', rm)
   }
 
   // ---- runbook actions: off the alert pipeline, async (spec §6.2) ---------
 
-  const def = (a: MockAlert) => RUNBOOKS.find((r) => r.id === a.runbookId) ?? null
+  const def = (a: MockAlert) => a.runbookId ? runbooks.get(a.runbookId) ?? null : null
   const stepDef = (a: MockAlert, step: string) => def(a)?.steps.find((s) => s.id === step) ?? null
 
   function actionOutcome(a: MockAlert, name: string, params: Record<string, string>): { ok: boolean; output: string } {
@@ -361,10 +400,47 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     return ex
   }
 
+  function syncDeviceReceipts() {
+    for (const id of pendingDeviceAlerts) {
+      const a = alerts.get(id)
+      if (!a) {
+        pendingDeviceAlerts.delete(id)
+        continue
+      }
+      const jobs = deliveriesFor(a.feed, a.plan, people).filter((job) => job.channel === 'sms' || job.channel === 'phone')
+      for (const job of jobs) {
+        if (!job.sent_at || (job.channel !== 'sms' && job.channel !== 'phone')) continue
+        simulator.send(a.feed.team, {
+          receipt_id: job.id, job_id: job.id, alert_id: id, channel: job.channel, recipient: job.recipient,
+          to: job.address, text: redactText(a.feed.title, 240), approval_challenge: null,
+          duplicates: Math.max(0, job.attempts - 1), received_at: job.sent_at,
+        })
+      }
+      if (!jobs.some((job) => job.state === 'pending')) pendingDeviceAlerts.delete(id)
+    }
+  }
+
+  function completeApproval(
+    a: MockAlert, step: string, approval: StoredApproval, op: 'approve' | 'reject', actor: string, noteText?: string,
+  ): { state: 'approved' | 'rejected'; execution_id?: string } {
+    const state = op === 'approve' ? 'approved' : 'rejected'
+    approval.state = state
+    approval.decided_by = actor
+    approval.decided_at = new Date().toISOString()
+    const safeNote = noteText?.trim() ? redactText(noteText.trim(), 2000) : null
+    approval.note = safeNote
+    const label = stepDef(a, step)?.action?.label ?? step
+    note(a, 'approval', actor, `${op === 'approve' ? 'Approved' : 'Rejected'} “${label}”${safeNote ? `: ${redactText(safeNote, 240)}` : ''}`)
+    if (op === 'approve') return { state, execution_id: execute(a, step, approval.requested_by).id }
+    touch(a)
+    return { state }
+  }
+
   // ---- SSE -----------------------------------------------------------------
 
-  const visible = (team: string | null, a: FeedAlert) =>
-    allowedVisibleTeams().has(a.team) && (team === null || a.team === team)
+  const visible = (team: string | null, a: MockAlert, recipient: string | null) =>
+    canSeeTeam(a.feed.team) && (team === null || a.feed.team === team) &&
+    (recipient === null || a.plan.some(([target]) => target === `user:${recipient}`))
 
   function send(res: ServerResponse, event: string, data: unknown) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
@@ -372,7 +448,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
 
   function publish(a: MockAlert, prev: FeedAlert | null) {
     for (const c of clients) {
-      if (!visible(c.team, a.feed)) continue
+      if (!visible(c.team, a, c.recipient)) continue
       send(c.res, 'alert.upsert', a.feed)
       // Out-of-order redelivery, as a replica or the outbox might produce.
       if (prev && Math.random() < staleChance) send(c.res, 'alert.upsert', prev)
@@ -383,9 +459,10 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     const statuses = q?.getAll('status') ?? []
     const sevs = q?.getAll('severity') ?? []
     const ruleIds = q?.getAll('rule') ?? []
+    const recipient = q?.get('recipient') || null
     let items = [...alerts.values()]
+      .filter((a) => visible(team, a, recipient))
       .map((a) => a.feed)
-      .filter((a) => visible(team, a))
       .filter((a) => !statuses.length || statuses.includes(a.status))
       .filter((a) => !sevs.length || sevs.includes(a.severity))
       .filter((a) => !ruleIds.length || ruleIds.includes(a.rule.id))
@@ -412,10 +489,13 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       'X-Accel-Buffering': 'no',
     })
     res.write('retry: 1500\n\n')
-    const client: Client = { res, team }
+    const recipient = url.searchParams.get('recipient') || null
+    const client: Client = { res, team, recipient }
     // Subscribe first, then snapshot (trivially consistent here: one thread).
     clients.add(client)
-    const p = page(team)
+    const params = new URLSearchParams({ limit: '100' })
+    if (recipient) params.set('recipient', recipient)
+    const p = page(team, params)
     const snap: SnapshotEvent = { team, items: p.items, next_cursor: p.next_cursor, server_time: new Date().toISOString() }
     send(res, 'snapshot', snap)
     req.on('close', () => clients.delete(client))
@@ -536,10 +616,20 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     return true
   }
 
+  function runbookSummary(book: RunbookDef): RunbookSummary {
+    return { id: book.id, title: book.title, format: book.format, team: book.team, steps: book.steps.length }
+  }
+
   function detail(a: MockAlert): AlertDetail {
     const rb = def(a)
+    const lastHour = Math.floor(Date.parse(a.feed.last_seen) / HOUR)
+    const firstHour = Math.max(lastHour - 23, Math.floor(Date.parse(a.feed.first_seen) / HOUR))
     return {
       ...a.feed,
+      occurrences: {
+        from: new Date(firstHour * HOUR).toISOString(), bucket_seconds: HOUR / 1000,
+        counts: Array.from({ length: lastHour - firstHour + 1 }, (_, i) => a.occurrences.get(firstHour + i) ?? 0),
+      },
       samples: a.samples.map((s) => ({ ...s, raw: redactValue(s.raw) })),
       runbook: rb ? viewRunbook(rb, a.ctx, a.runbook, ME) : null,
       deliveries: deliveriesFor(a.feed, a.plan, people),
@@ -560,8 +650,43 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         user: { id: ME_ID, name: demoUserName },
         teams: [...teams.values()].filter((t) => allowed.has(t.id)).map((t) => ({ id: t.id, name: t.name })),
         csrf_token: csrf,
+        capabilities: { recipient_feed: true, mock_transports: true },
       }
       return json(res, 200, session), true
+    }
+    if (path === '/api/simulator/messages' && method === 'GET') {
+      syncDeviceReceipts()
+      const cursor = url.searchParams.get('cursor')
+      if (cursor !== null && !/^\d{1,15}$/.test(cursor)) return err(res, 400, 'bad_request', 'Invalid receipt cursor'), true
+      return json(res, 200, simulator.list(cursor === null ? undefined : Number(cursor))), true
+    }
+    if (path === '/api/simulator/stream' && method === 'GET') {
+      syncDeviceReceipts()
+      return simulator.stream(req, res), true
+    }
+    if (path === '/api/simulator/reply' && method === 'POST') {
+      return write(req, res, (b: { receipt_id?: string; text?: string }) => {
+        if (typeof b.receipt_id !== 'string' || typeof b.text !== 'string' || b.text.length > 32)
+          return err(res, 400, 'bad_request', 'A receipt and an SMS reply are required')
+        const entry = simulator.find(b.receipt_id)
+        if (!entry?.approval || entry.message.channel !== 'sms')
+          return err(res, 404, 'not_found', 'No approval SMS for this receipt')
+        const a = alerts.get(entry.message.alert_id)
+        const step = entry.approval.step
+        const approval = a?.runbook.get(step)?.approvals.find((request) => request.id === entry.approval?.id)
+        if (!a || !approval || !approval.eligible.includes(entry.message.recipient) || approval.requested_by === entry.message.recipient)
+          return err(res, 403, 'forbidden', 'This SMS sender cannot decide the request')
+        if (a.feed.status === 'resolved' || approval.state !== 'pending' || Date.parse(approval.expires_at) <= Date.now())
+          return err(res, 409, 'invalid_transition', 'This approval request is closed')
+        if (entry.approval.attempts >= 5) return err(res, 429, 'rate_limited', 'Too many incorrect replies')
+        const answer = b.text.trim().match(/^([YN])\s+(\d{4})$/i)
+        if (!answer?.[2] || createHash('sha256').update(answer[2]).digest('hex') !== approval.sms_code_hash) {
+          entry.approval.attempts++
+          return err(res, 422, 'invalid', 'Reply Y or N followed by the code in the SMS')
+        }
+        const decision = answer[1]?.toUpperCase() === 'Y' ? 'approve' : 'reject'
+        json(res, 200, completeApproval(a, step, approval, decision, entry.message.recipient, 'SMS reply'))
+      })
     }
     if (path === '/api/stream' && method === 'GET') return openStream(req, res, url), true
     if (path === '/api/alerts' && method === 'GET') {
@@ -653,6 +778,13 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
             note: null,
           }
           rt.approvals.push(request)
+          for (const recipient of eligible) {
+            simulator.send(a.feed.team, {
+              receipt_id: uid('sms'), job_id: request.id, alert_id: a.feed.id, channel: 'sms',
+              recipient, to: 'Demo phone', text: `Approve “${d.action.label}” on ${redactText(a.feed.title, 160)}? Reply Y ${rawCode} or N ${rawCode}.`,
+              approval_challenge: rawCode, duplicates: 0, received_at: request.requested_at,
+            }, { id: request.id, step, attempts: 0 })
+          }
           note(a, 'approval', ME, `Asked for approval to run “${d.action.label}” (${redactText(view.text, 160)})`)
           touch(a)
           return err(res, 409, 'approval_required', 'This step needs approval first', { approval_id: request.id })
@@ -678,19 +810,54 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
             if (r.requested_by === ME) return err(res, 403, 'forbidden', 'Requesters cannot approve or reject their own approval request')
             if (!r.eligible.includes(ME)) return err(res, 403, 'forbidden', 'You are not an approver for this step')
             if (a.feed.status === 'resolved') return err(res, 409, 'invalid_transition', 'The alert was resolved meanwhile')
-            r.state = op === 'approve' ? 'approved' : 'rejected'
-            r.decided_by = ME
-            r.decided_at = new Date().toISOString()
-            const safeNote = b.note?.trim() ? redactText(b.note.trim(), 2000) : null
-            r.note = safeNote
-            const label = stepDef(a, step)?.action?.label ?? step
-            note(a, 'approval', ME, `${op === 'approve' ? 'Approved' : 'Rejected'} “${label}”${safeNote ? `: ${redactText(safeNote, 240)}` : ''}`)
-            // Approve = consume + audit + execution intent, together.
-            if (op === 'approve') return json(res, 200, { execution_id: execute(a, step, r.requested_by).id })
-            touch(a)
-            return json(res, 200, { ok: true })
+            const result = completeApproval(a, step, r, op === 'approve' ? 'approve' : 'reject', ME, b.note)
+            return json(res, 200, result.execution_id ? { execution_id: result.execution_id } : { ok: true })
           }
         err(res, 404, 'not_found', 'No such approval request')
+      })
+    }
+
+    // ---- source discovery and schema mappings
+    if (path === '/api/sources' && method === 'GET') {
+      const cutoff = Math.floor(Date.now() / HOUR) - 23
+      const items: SourceView[] = Array.from(sources, ([id, info]) => {
+        const prefix = id.split(':', 1)[0]
+        const kind = prefix === 'kafka' || prefix === 'file' ? prefix : 'http'
+        return { id, type: kind, kind, last_seen: info.last,
+          events_24h: [...info.hours].reduce((sum, [hour, count]) => hour >= cutoff ? sum + count : sum, 0) }
+      })
+      return json(res, 200, items), true
+    }
+    if (path === '/api/schemas/discovered' && method === 'GET') {
+      const allowed = allowedVisibleTeams()
+      const items = [...discovered.values()].reverse()
+        .filter(({ recent: stored }) => stored.teams.size === 0 || [...stored.teams].some((team) => allowed.has(team)))
+        .map(({ entry }) => ({ ...entry, sample: redactValue(entry.sample) }))
+      return json(res, 200, items), true
+    }
+    if (path === '/api/schemas' && method === 'GET') return json(res, 200, [...schemas.values()]), true
+    if (path === '/api/schemas/preview' && method === 'POST') {
+      return write(req, res, (b: { spec: unknown; event: unknown; source?: string }) => {
+        const parsed = parseMapping(b.spec)
+        if ('error' in parsed) return err(res, 422, 'invalid', parsed.error)
+        const source = typeof b.source === 'string' ? b.source : 'http:playground'
+        const result = previewMapping(parsed.spec, b.event, source)
+        json(res, 200, { ...result, fields: redactValue(result.fields) })
+      })
+    }
+    if (path === '/api/schemas' && method === 'POST') {
+      return write(req, res, (b: { spec: unknown; expected_revision?: number }) => {
+        if (![...allowedVisibleTeams()].some(isTeamMember)) return err(res, 403, 'forbidden', 'A team member can publish mappings')
+        const parsed = parseMapping(b.spec)
+        if ('error' in parsed) return err(res, 422, 'invalid', parsed.error)
+        const id = parsed.spec.schema
+        const prior = schemas.get(id)
+        if (b.expected_revision !== prior?.revision)
+          return err(res, 409, 'revision_conflict', 'This schema mapping changed. Reload it before saving.', { current: prior })
+        if (!prior && schemas.size >= 100) return err(res, 422, 'invalid', 'The mock is limited to 100 schema mappings')
+        const saved: SchemaMapping = { spec: parsed.spec, revision: (prior?.revision ?? 0) + 1 }
+        schemas.set(id, saved)
+        json(res, prior ? 200 : 201, saved)
       })
     }
 
@@ -708,7 +875,8 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     if (path === '/api/rules/test' && method === 'POST') {
       return write(req, res, (b: RuleTestRequest) => {
         if (!b.rule || typeof b.rule !== 'object') return err(res, 400, 'bad_request', 'rule is required')
-        json(res, 200, testRule(b.rule, b.event, b.source))
+        const source = typeof b.source === 'string' ? b.source : 'http:test'
+        json(res, 200, testRule(b.rule, b.event, source, eventContext(b.event, source)))
       })
     }
     if (path === '/api/rules' && method === 'POST') {
@@ -761,14 +929,34 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     }
     if (path === '/api/runbooks' && method === 'GET') {
       const allowed = allowedVisibleTeams()
-      const items: RunbookSummary[] = RUNBOOKS.filter((r) => r.team === null || allowed.has(r.team)).map((r) => ({
-        id: r.id,
-        title: r.title,
-        format: r.format,
-        team: r.team,
-        steps: r.steps.length,
-      }))
+      const items = [...runbooks.values()].filter((r) => r.team === null || allowed.has(r.team)).map(runbookSummary)
       return json(res, 200, { items }), true
+    }
+    if (path === '/api/runbooks/import' && method === 'POST') {
+      return write(req, res, (input: unknown) => {
+        try {
+          const { draft, preview } = prepareRunbook(input)
+          if (!canSeeTeam(draft.team) || !isTeamMember(draft.team)) return err(res, 403, 'forbidden', 'Only team members can import runbooks for that team')
+          json(res, 200, preview)
+        } catch (e) {
+          err(res, 422, 'invalid', e instanceof Error ? e.message : 'Invalid runbook')
+        }
+      })
+    }
+    if (path === '/api/runbooks' && method === 'POST') {
+      return write(req, res, (input: unknown) => {
+        try {
+          const book = importRunbook(input)
+          if (book.team === null || !canSeeTeam(book.team) || !isTeamMember(book.team))
+            return err(res, 403, 'forbidden', 'Only team members can import runbooks for that team')
+          if (runbooks.has(book.id)) return err(res, 409, 'revision_conflict', 'A runbook with this id already exists')
+          if (runbooks.size >= 100) return err(res, 422, 'invalid', 'The mock is limited to 100 runbooks')
+          runbooks.set(book.id, book)
+          json(res, 201, runbookSummary(book))
+        } catch (e) {
+          err(res, 422, 'invalid', e instanceof Error ? e.message : 'Invalid runbook')
+        }
+      })
     }
     if (path === '/api/events/recent' && method === 'GET') {
       const team = url.searchParams.get('team') || null
@@ -923,7 +1111,8 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
 
     // ---- ingest & mock controls (CSRF-protected + bounded, dev mock only)
     if ((m = path.match(/^\/ingest\/([^/]+)$/)) && method === 'POST') {
-      const source = safeDecode(m[1]!)
+      const decoded = safeDecode(m[1]!)
+      const source = decoded && !decoded.includes(':') && /^[a-z0-9._-]+$/i.test(decoded) ? `http:${decoded}` : decoded
       if (source === null || source.length > 64 || !SOURCE_RE.test(source))
         return err(res, 400, 'bad_request', 'Invalid ingest source name'), true
       return write(req, res, (raw: unknown) => {
@@ -1042,7 +1231,8 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       }, interval),
     )
   }
-  timers.push(setInterval(() => { for (const c of clients) c.res.write(': ping\n\n') }, 15_000))
+  timers.push(setInterval(syncDeviceReceipts, 1000))
+  timers.push(setInterval(() => { simulator.ping(); for (const c of clients) c.res.write(': ping\n\n') }, 15_000))
   if (resnapshotS > 0) {
     timers.push(setInterval(() => { for (const c of clients) c.res.end() ; clients.clear() }, resnapshotS * 1000))
   }
@@ -1051,6 +1241,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   return {
     handle,
     close() {
+      simulator.close()
       for (const t of timers) clearInterval(t)
       for (const c of clients) c.res.end()
     },

@@ -127,6 +127,13 @@ function Step({ step: s, n, now, closed, busy, onRun, onCheck, onDecide }: {
       </li>
     )
 
+  if (s.kind === 'condition' || !s.action) return (
+    <li className="step">
+      <span className="step-text">{s.text}</span>
+      {s.hint && <p className="step-hint">{s.hint}</p>}
+    </li>
+  )
+
   const needsApproval = s.approval === 'required'
   const req = s.approval_request
   const label = s.action?.label ?? 'Run'

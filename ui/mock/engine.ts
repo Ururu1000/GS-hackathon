@@ -53,7 +53,7 @@ const MAX_SIG_DEPTH = 16
 const MAX_SIG_PATHS = 500
 
 /** Structural signature for unknown shapes: sorted paths, values ignored. */
-function signature(raw: unknown): string {
+export function unknownSignature(raw: unknown): string {
   const paths: string[] = []
   const walk = (v: unknown, p: string, depth: number) => {
     if (depth > MAX_SIG_DEPTH || paths.length >= MAX_SIG_PATHS) return
@@ -100,7 +100,7 @@ export function normalize(raw: unknown): { schema: string; fields: Record<string
     }
   if (isObj(r) && r.kind === 'deployment')
     return { schema: 'ci.deployment', fields: compact({ type: 'deployment', service: r.service, severity: 'info', region: r.region }) }
-  return { schema: signature(raw), fields: {} }
+  return { schema: unknownSignature(raw), fields: {} }
 }
 
 export function context(raw: unknown, source: string): Ctx {
@@ -463,8 +463,7 @@ export function recovers(rule: RuleSpec, ctx: Ctx): boolean {
 }
 
 /** `POST /api/rules/test`: zero writes, zero dispatches. */
-export function testRule(rule: unknown, event: unknown, source = 'http:test'): RuleTestResult {
-  const ctx = context(event, source)
+export function testRule(rule: unknown, event: unknown, source = 'http:test', ctx = context(event, source)): RuleTestResult {
   const parsed = parseRuleStructure(rule)
   if ('problem' in parsed)
     return { matched: false, schema: ctx.schema, fields: ctx.fields, nodes: [], card: null, warnings: [], errors: [parsed.problem] }

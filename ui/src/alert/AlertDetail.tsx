@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { getAlert } from '../api/client'
-import type { AlertDetail as Detail, DeliveryStatus, FeedAlert, TimelineEntry } from '../api/types'
+import type { AlertDetail as Detail, DeliveryStatus, FeedAlert, Occurrences, TimelineEntry } from '../api/types'
 import type { TransitionOp } from '../api/client'
 import { absTime, relTime } from '../lib/time'
 import { CheckIcon, CloseIcon, CopyIcon } from '../lib/icons'
@@ -134,6 +134,8 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
         </section>
       )}
 
+      {detail?.occurrences && <OccurrenceChart series={detail.occurrences} />}
+
       {detail?.runbook && <Runbook runbook={detail.runbook} alert={a} now={now} onChanged={reload} onToast={onToast} />}
 
       <section className="section">
@@ -208,6 +210,38 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
 }
 
 /** "Open 17s ago · 6 times" in one line. */
+function OccurrenceChart({ series }: { series: Occurrences }) {
+  const buckets = series.counts.slice(-24)
+  if (!buckets.length) return null
+  const offset = series.counts.length - buckets.length
+  const from = Date.parse(series.from) + offset * series.bucket_seconds * 1000
+  const step = series.bucket_seconds * 1000
+  const high = Math.max(1, ...buckets)
+  const total = buckets.reduce((sum, count) => sum + count, 0)
+  return (
+    <section className="section">
+      <h3>Occurrences</h3>
+      <figure className="occurrence-chart">
+        <div className="occurrence-bars" aria-hidden="true">
+          {buckets.map((count, index) => (
+            <div key={index} title={`${absTime(new Date(from + step * index).toISOString())}: ${count}`}
+              style={{ height: `${count ? Math.max(6, (count / high) * 100) : 2}%` }} />
+          ))}
+        </div>
+        <figcaption className="muted small">{total.toLocaleString()} events in {buckets.length} bucket{buckets.length === 1 ? '' : 's'}, starting {absTime(new Date(from).toISOString())}</figcaption>
+      </figure>
+      <details className="small">
+        <summary>Occurrence counts</summary>
+        <dl className="fields">
+          {buckets.map((count, index) => <div key={index} className="kv">
+            <dt>{absTime(new Date(from + step * index).toISOString())}</dt><dd>{count.toLocaleString()}</dd>
+          </div>)}
+        </dl>
+      </details>
+    </section>
+  )
+}
+
 function StatusLine({ alert: a, now }: { alert: FeedAlert; now: number }) {
   const at = (iso: string | null) => <span title={absTime(iso)}>{relTime(iso, now)}</span>
   const why = a.status === 'resolved' ? resolvedReasonText(a.resolved_reason) : null

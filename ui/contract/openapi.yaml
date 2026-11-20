@@ -96,6 +96,7 @@ paths:
         that filter (`status=open&status=acked`).
       parameters:
         - $ref: '#/components/parameters/Team'
+        - $ref: '#/components/parameters/Recipient'
         - name: status
           in: query
           schema: { type: array, items: { $ref: '#/components/schemas/AlertStatus' } }
@@ -186,7 +187,7 @@ paths:
         - `alert.remove` → `RemoveEvent`
         Later (not M0): `delivery.updated`, `approval.requested`. Clients must
         ignore event names they don't know.
-      parameters: [ { $ref: '#/components/parameters/Team' } ]
+      parameters: [ { $ref: '#/components/parameters/Team' }, { $ref: '#/components/parameters/Recipient' } ]
       responses:
         '200':
           description: Event stream
@@ -335,6 +336,84 @@ paths:
         '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RuleTestResult' } } } }
         '403': { $ref: '#/components/responses/Error' }
         '413': { $ref: '#/components/responses/Error' }
+  /api/sources:
+    get:
+      operationId: listSources
+      summary: Configured and observed event sources with activity
+      responses:
+        '200':
+          description: Visible sources
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SourceView' } }
+  /api/schemas/discovered:
+    get:
+      operationId: listDiscoveredSchemas
+      summary: Most recent unknown event shapes with a redacted sample
+      responses:
+        '200':
+          description: Up to 50 entries, newest first
+          content:
+            application/json:
+              schema: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/DiscoveredSchema' } }
+  /api/schemas:
+    get:
+      operationId: listSchemaMappings
+      responses:
+        '200':
+          description: Published schema mappings
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/SchemaMapping' } }
+    post:
+      operationId: publishSchemaMapping
+      summary: Create or publish a new revision of a schema mapping
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [spec]
+              properties:
+                spec: { $ref: '#/components/schemas/SchemaSpec' }
+                expected_revision: { type: integer, description: Omit for a new mapping }
+      responses:
+        '200': { $ref: '#/components/responses/SchemaMapping' }
+        '201': { $ref: '#/components/responses/SchemaMapping' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/schemas/preview:
+    post:
+      operationId: previewSchemaMapping
+      summary: Evaluate a mapping against one event without changing config
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [spec, event, source]
+              properties:
+                spec: { $ref: '#/components/schemas/SchemaSpec' }
+                event: { description: Raw event JSON }
+                source: { type: string }
+      responses:
+        '200':
+          description: Detector result, extracted fields, and conversion warnings
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [matched, fields, warnings]
+                properties:
+                  matched: { type: boolean }
+                  fields: { type: object }
+                  warnings: { type: array, items: { type: string } }
+        '422': { $ref: '#/components/responses/Error' }
   /api/runbooks:
     get:
       operationId: listRunbooks
@@ -349,15 +428,100 @@ paths:
                 properties:
                   items:
                     type: array
-                    items:
-                      type: object
-                      required: [id, title, format, team, steps]
-                      properties:
-                        id: { type: string }
-                        title: { type: string }
-                        format: { type: string, examples: [yaml, markdown, link, text] }
-                        team: { type: [string, 'null'] }
-                        steps: { type: integer, description: Number of steps }
+                    items: { $ref: '#/components/schemas/RunbookSummary' }
+    post:
+      operationId: publishRunbook
+      summary: Publish a previewed runbook with its edited checklist
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: '#/components/schemas/RunbookImport' }
+                - { $ref: '#/components/schemas/RunbookPreview' }
+      responses:
+        '201':
+          description: Saved runbook
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunbookSummary' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/runbooks/import:
+    post:
+      operationId: previewRunbookImport
+      summary: Preview an explicitly selected format without publishing
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RunbookImport' }
+      responses:
+        '200':
+          description: Preview checklist
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunbookPreview' }
+        '403': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/simulator/messages:
+    get:
+      operationId: listSimulatorMessages
+      summary: SMS and phone receipts from the development gateway
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Receipt page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SimulatorPage' }
+  /api/simulator/stream:
+    get:
+      operationId: streamSimulatorMessages
+      summary: Live SMS and phone receipts
+      description: SSE emits a snapshot with a SimulatorPage followed by simulator.message events with a SimulatorMessage.
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /api/simulator/reply:
+    post:
+      operationId: replyFromSimulator
+      summary: Send an approval reply from a simulated device
+      description: Available when the simulator advertises replies_available. The service resolves the sender from the receipt and applies the approval's eligibility, expiry, and attempt limit.
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receipt_id, text]
+              properties:
+                receipt_id: { type: string }
+                text: { type: string, maxLength: 32, examples: ['Y 1234'] }
+      responses:
+        '200':
+          description: Reply applied
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { type: string, enum: [approved, rejected] }
+                  execution_id: { type: string }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /api/events/recent:
     get:
       operationId: recentEvents
@@ -512,6 +676,11 @@ paths:
         '409': { $ref: '#/components/responses/Error' }
 components:
   parameters:
+    Recipient:
+      name: recipient
+      in: query
+      description: User id without the user prefix. Selects alerts with this planned recipient. Available when the session advertises recipient_feed.
+      schema: { type: string }
     Team:
       name: team
       in: query
@@ -533,6 +702,11 @@ components:
       required: true
       schema: { type: string }
   responses:
+    SchemaMapping:
+      description: Published schema mapping
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/SchemaMapping' }
     Alert:
       description: The alert after the transition
       content:
@@ -553,6 +727,128 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
   schemas:
+    SourceView:
+      type: object
+      required: [id, type, kind, last_seen, events_24h]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        kind: { type: string, enum: [http, kafka, file] }
+        topics: { type: array, items: { type: string } }
+        last_seen: { type: [string, 'null'], format: date-time }
+        events_24h: { type: integer, minimum: 0 }
+    DiscoveredSchema:
+      type: object
+      required: [schema, source, count, first_seen, last_seen, sample]
+      properties:
+        schema: { type: string }
+        source: { type: string }
+        count: { type: integer, minimum: 1 }
+        first_seen: { $ref: '#/components/schemas/Timestamp' }
+        last_seen: { $ref: '#/components/schemas/Timestamp' }
+        sample: { description: Redacted raw event JSON }
+    SchemaSpec:
+      type: object
+      required: [schema, detect]
+      properties:
+        schema: { type: string }
+        priority: { type: integer, default: 0 }
+        detect:
+          description: Typed condition with payload-relative paths and an optional source restriction.
+          allOf:
+            - { $ref: '#/components/schemas/Condition' }
+            - type: object
+              properties:
+                source: { type: string }
+        fields:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              path: { type: string }
+              value: {}
+              transform: { type: string, enum: [lower, upper, trim] }
+              enum: { type: string, enum: [severity] }
+              as: { type: string, enum: [string, number, bool, rfc3339, epoch_ms, epoch_s] }
+              equals: {}
+    SchemaMapping:
+      type: object
+      required: [spec, revision]
+      properties:
+        spec: { $ref: '#/components/schemas/SchemaSpec' }
+        revision: { type: integer, minimum: 1 }
+    RunbookImport:
+      type: object
+      required: [format, team, title, content]
+      properties:
+        format: { type: string, enum: [yaml, markdown, link, text] }
+        team: { type: string }
+        title: { type: string, maxLength: 120 }
+        content: { type: string, maxLength: 65536 }
+    RunbookPreview:
+      type: object
+      required: [id, title, steps]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        steps:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required: [id, kind, text]
+            properties:
+              id: { type: string }
+              kind: { type: string, enum: [manual, condition, action] }
+              text: { type: string, maxLength: 2000 }
+              hint: { type: string }
+              approval: { type: string, enum: [none, required] }
+              action:
+                type: object
+                required: [name, label, params, risk]
+                properties:
+                  name: { type: string }
+                  label: { type: string }
+                  params: { type: object, additionalProperties: { type: string } }
+                  risk: { type: string, enum: [low, high] }
+              after_failures:
+                type: object
+                required: [step, count]
+                properties:
+                  step: { type: string }
+                  count: { type: integer, minimum: 1 }
+              resolves: { type: boolean }
+    RunbookSummary:
+      type: object
+      required: [id, title, format, team, steps]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        format: { type: string, examples: [yaml, markdown, link, text] }
+        team: { type: [string, 'null'] }
+        steps: { type: integer, minimum: 0, description: Number of steps }
+    SimulatorMessage:
+      type: object
+      required: [id, receipt_id, job_id, alert_id, channel, recipient, to, text, approval_challenge, duplicates, received_at]
+      properties:
+        id: { type: integer }
+        receipt_id: { type: string }
+        job_id: { type: string }
+        alert_id: { type: string }
+        channel: { type: string, enum: [sms, phone] }
+        recipient: { type: string }
+        to: { type: string }
+        text: { type: string }
+        approval_challenge: { type: [string, 'null'], description: Visible to the simulated device only }
+        duplicates: { type: integer, minimum: 0 }
+        received_at: { $ref: '#/components/schemas/Timestamp' }
+    SimulatorPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/SimulatorMessage' } }
+        next_cursor: { type: [string, 'null'] }
+        replies_available: { type: boolean, default: false }
     Severity:
       type: string
       enum: [critical, error, warning, info]
@@ -722,6 +1018,13 @@ components:
             runbook: { oneOf: [ { $ref: '#/components/schemas/RunbookView' }, { type: 'null' } ] }
             deliveries: { type: array, items: { $ref: '#/components/schemas/DeliveryStatus' } }
             timeline: { type: array, items: { $ref: '#/components/schemas/TimelineEntry' } }
+            occurrences:
+              type: object
+              required: [from, bucket_seconds, counts]
+              properties:
+                from: { $ref: '#/components/schemas/Timestamp' }
+                bucket_seconds: { type: integer, minimum: 1 }
+                counts: { type: array, maxItems: 24, items: { type: integer, minimum: 0 } }
     TransitionRequest:
       type: object
       required: [expected_version]
@@ -761,6 +1064,11 @@ components:
             required: [id, name]
             properties: { id: { type: string }, name: { type: string } }
         csrf_token: { type: string }
+        capabilities:
+          type: object
+          properties:
+            recipient_feed: { type: boolean, description: Supports recipient scope on both feed endpoints }
+            mock_transports: { type: boolean, description: Accepts fixture broker and log events through the mock ingest endpoint }
     SnapshotEvent:
       type: object
       required: [team, items, next_cursor, server_time]

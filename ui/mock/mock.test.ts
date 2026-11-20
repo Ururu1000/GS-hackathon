@@ -137,3 +137,95 @@ it('rejects a rotation name already reserved by another team', async () => {
   })).toMatchObject({ error: { details: [{ path: 'oncall.settlements' }] } })
   expect(await request('/api/teams/pricing')).toMatchObject({ oncall: team.oncall, revision: team.revision })
 })
+
+it('discovers unknown events, previews a mapping without saving, and applies the published revision', async () => {
+  const source = 'http:playground'
+  const event = { trade_limit: { desk: 'EXAMPLE', amount: 42 }, token: 'demo-only' }
+  await request('/ingest/playground', 202, 'POST', event)
+  await request('/ingest/playground', 202, 'POST', event)
+  const discovered = await request('/api/schemas/discovered')
+  expect(discovered).toContainEqual(expect.objectContaining({
+    source, schema: expect.stringMatching(/^unknown:/), count: 2,
+    sample: { ...event, token: '[REDACTED]' },
+  }))
+  expect(await request('/api/sources')).toContainEqual(expect.objectContaining({ id: source, events_24h: 2 }))
+  const spec = {
+    schema: 'custom.trade-limit', priority: 50, detect: { source, path: 'trade_limit.amount', op: 'exists' },
+    fields: { service: { path: 'trade_limit.desk', transform: 'lower' } },
+  }
+  expect(await request('/api/schemas/preview', 200, 'POST', { spec, source, event }))
+    .toMatchObject({ matched: true, fields: { service: 'example' } })
+  expect(await request('/api/schemas')).toEqual([])
+  expect(await request('/api/schemas', 201, 'POST', { spec })).toMatchObject({ revision: 1 })
+  expect(await request('/api/schemas', 409, 'POST', { spec })).toMatchObject({ error: { code: 'revision_conflict' } })
+  const rule = { ...RULES[0]!, when: { path: 'fields.service', op: 'eq', value: 'example' } }
+  expect(await request('/api/rules/test', 200, 'POST', { rule, source, event }))
+    .toMatchObject({ matched: true, schema: spec.schema })
+})
+
+it('previews and edits a runbook import before attaching the saved checklist to an alert', async () => {
+  const draft = { format: 'markdown', title: 'Imported checklist', team: 'settlements',
+    content: '# Checklist\n1. Find {{raw.workflowId}}\n2. Read the audit history' }
+  const preview = await request('/api/runbooks/import', 200, 'POST', draft)
+  expect(preview.steps).toHaveLength(2)
+  const { items: before } = await request('/api/runbooks')
+  expect(before.some((book: { id: string }) => book.id === preview.id)).toBe(false)
+  const saved = await request('/api/runbooks', 201, 'POST', {
+    ...draft, ...preview, steps: [{ ...preview.steps[0], text: 'Inspect {{raw.workflowId}}' }],
+  })
+  const rule = { ...RULES[0]!, id: 'with-imported-book', runbook: saved.id }
+  await request('/api/rules', 201, 'POST', { rule })
+  const workflow = failedWorkflow()
+  await request('/ingest/kafka:workflows', 202, 'POST', workflow)
+  const { items: [alert] } = await request('/api/alerts?rule=with-imported-book')
+  expect(await request(`/api/alerts/${alert.id}`)).toMatchObject({
+    runbook: { id: saved.id, steps: [{ kind: 'manual', text: `Inspect ${workflow.workflowId}` }] },
+  })
+})
+
+it('runs an escalation through the eligible simulated phone and consumes the SMS reply once', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout'] })
+  const { matched_alerts: [id] } = await request('/ingest/kafka:workflows', 202, 'POST', failedWorkflow())
+  const path = `/api/alerts/${id}`
+  for (let i = 0; i < 2; i++) {
+    await request(`${path}/steps/retry/run`, 202, 'POST')
+    await vi.runAllTimersAsync()
+  }
+  const gated = await request(`${path}/steps/escalate/run`, 409, 'POST')
+  expect(gated.error.code).toBe('approval_required')
+  await request(`/api/approvals/${gated.error.approval_id}/approve`, 403, 'POST')
+  const { items } = await request('/api/simulator/messages')
+  const sms = items.find((item: { alert_id: string; approval_challenge: string | null }) => item.alert_id === id && item.approval_challenge)
+  expect(sms.recipient).toBe('user:carol')
+  const reply = { receipt_id: sms.receipt_id, text: `Y ${sms.approval_challenge}` }
+  const result = await request('/api/simulator/reply', 200, 'POST', reply)
+  expect(result).toMatchObject({ state: 'approved' })
+  await request('/api/simulator/reply', 409, 'POST', reply)
+  await vi.runAllTimersAsync()
+  const detail = await request(path)
+  const step = detail.runbook.steps.find((entry: RunbookStep) => entry.id === 'escalate')
+  expect(step).toMatchObject({ state: 'ok', approval_request: { decided_by: 'user:carol', state: 'approved' } })
+  expect(step.approval_request).not.toHaveProperty('approval_challenge')
+  expect(step.approval_request).not.toHaveProperty('sms_code_hash')
+})
+
+it('keeps the same recipient scope when loading historical pages and counts occurrences', async () => {
+  const base = { ...RULES[0]!, when: { path: 'raw.history', op: 'exists' }, dedup: { key: ['raw.history'], window: '10m' } }
+  await request('/api/rules', 201, 'POST', { rule: { ...base, id: 'history-bob', route: [{ to: 'user:bob', channels: ['ui'] }] } })
+  await request('/api/rules', 201, 'POST', { rule: { ...base, id: 'history-carol', route: [{ to: 'user:carol', channels: ['ui'] }] } })
+  await request('/ingest/playground', 202, 'POST', { history: 1 })
+  await request('/ingest/playground', 202, 'POST', { history: 1 })
+  await request('/ingest/playground', 202, 'POST', { history: 2 })
+  const scope = '/api/alerts?team=settlements&recipient=bob&limit=1'
+  const first = await request(scope)
+  expect(first.items).toHaveLength(1)
+  expect(first.items[0].rule.id).toBe('history-bob')
+  expect(first.next_cursor).toBeTruthy()
+  const second = await request(scope + '&cursor=' + encodeURIComponent(first.next_cursor))
+  expect(second.items[0].rule.id).toBe('history-bob')
+  expect(second.next_cursor).toBeNull()
+  expect(second.items[0].id).not.toBe(first.items[0].id)
+  const detail = await request(`/api/alerts/${second.items[0].id}`)
+  expect(detail.count).toBe(2)
+  expect(detail.occurrences.counts).toEqual([2])
+})

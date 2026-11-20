@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createRule, deleteRule, errorText, getRule, HttpError, isConflict, listDirectory, listRunbooks, listTeams, updateRule } from '../api/client'
+import type { DiscoveredSchema } from '../api/screens'
 import { SEVERITIES, type NodeDiagnostic, type PersonDirectoryEntry, type RuleItem, type RuleSpec, type RuleTestResult, type RunbookSummary, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
 import { relTime } from '../lib/time'
@@ -16,6 +17,9 @@ interface Props {
   id: string
   from: string | null
   team: string | null
+  initialEvent?: DiscoveredSchema | null
+  mockTransports?: boolean
+  onEventRuleCreated?: (id: string) => void
   onNavigate: (hash: string) => void
   onDirtyChange: (dirty: boolean) => void
   onToast: (kind: 'ok' | 'warn' | 'error', text: string) => void
@@ -25,7 +29,7 @@ type Tab = 'builder' | 'yaml'
 
 const FORMAT_LABEL: Record<string, string> = { yaml: 'steps', markdown: 'Markdown page', link: 'wiki link', text: 'notes' }
 
-export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast }: Props) {
+export function RuleEditor({ id, from, team, initialEvent, mockTransports, onEventRuleCreated, onNavigate, onDirtyChange, onToast }: Props) {
   const isNew = id === 'new' && from !== null
   const [item, setItem] = useState<RuleItem | null>(null)
   const [draft, setDraft] = useState<RuleSpec | null>(null)
@@ -64,7 +68,8 @@ export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast 
     setLoadError(null)
     setConflict(null)
     if (isNew) {
-      setDraft(template.make(teamRef.current ?? 'settlements'))
+      const teamId = teamRef.current ?? 'settlements'
+      setDraft(initialEvent ? eventRule(initialEvent, teamId) : template.make(teamId))
       idTouched.current = false
       return
     }
@@ -75,7 +80,7 @@ export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast 
       },
       (e: unknown) => setLoadError(e instanceof HttpError && e.status === 404 ? 'This rule doesn’t exist (any more).' : errorText(e)),
     )
-  }, [id, isNew, template])
+  }, [id, isNew, template, initialEvent])
 
   const savedYaml = useMemo(() => item === null ? null : toYaml(item.rule), [item])
   const dirty = draft !== null && (isNew || (item !== null &&
@@ -149,6 +154,7 @@ export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast 
         const created = await createRule(draft)
         onToast('ok', `Created “${created.rule.name || created.rule.id}”. New events are matched right away.`)
         if (mounted.current) {
+          if (initialEvent) onEventRuleCreated?.(created.rule.id)
           onDirtyChange(false)
           onNavigate(`#/rules/${encodeURIComponent(created.rule.id)}`)
         }
@@ -194,7 +200,7 @@ export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast 
         <div className="screen-title">
           <h1>{draft.name || (isNew ? 'New rule' : draft.id)}</h1>
           <span className="muted small">
-            {isNew ? `From “${template.label}”` : item ? `Revision ${item.revision} · changed ${relTime(item.updated_at, Date.now())} by ${item.updated_by.replace(/^user:/, '')}` : ''}
+            {isNew ? (initialEvent ? `From ${initialEvent.source}` : `From “${template.label}”`) : item ? `Revision ${item.revision} · changed ${relTime(item.updated_at, Date.now())} by ${item.updated_by.replace(/^user:/, '')}` : ''}
           </span>
         </div>
         <span className="spacer" />
@@ -314,14 +320,14 @@ export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast 
                   ))}
                   {draft.runbook && !runbooks.some((r) => r.id === draft.runbook) && <option value={draft.runbook}>{draft.runbook}</option>}
                 </select>
-                <p className="hint">Shown on every alert from this rule, with the event’s values filled in.</p>
+                <p className="hint">Shown on every alert from this rule, with the event’s values filled in. <a href="#/runbooks">Import a runbook</a></p>
               </Section>
             </div>
           )}
         </div>
 
         <aside className="editor-side">
-          <TestPanel rule={draft} team={draft.team} initialSample={isNew ? template.sample : guessSample(draft)} onResult={onResult} onToast={onToast} />
+          <TestPanel rule={draft} team={draft.team} initialEvent={initialEvent} mockTransports={mockTransports} initialSample={isNew ? template.sample : guessSample(draft)} onResult={onResult} onToast={onToast} />
         </aside>
       </div>
 
@@ -369,4 +375,31 @@ function guessSample(r: RuleSpec): string {
   if (s.includes('payments-api') || s.includes('prometheus')) return 'prometheus'
   if (s.includes('pricing') || s.includes('severity_rank')) return 'pricing-log'
   return 'workflow-failed'
+}
+
+function eventRule(sample: DiscoveredSchema, team: string): RuleSpec {
+  const fields = flattenPaths('raw', sample.sample)
+    .filter(({ path }) => {
+      if (!/^raw(?:\.[^.\s]+)+$/.test(path)) return false
+      let value = sample.sample
+      for (const segment of path.split('.').slice(1)) {
+        if (value === null || typeof value !== 'object' || !Object.hasOwn(value, segment)) return false
+        value = (value as Record<string, unknown>)[segment]
+      }
+      return true
+    })
+    .slice(0, 3)
+    .map(({ path }) => ({ path, label: path.slice(4) }))
+  const name = `Event from ${sample.source}`
+  return {
+    id: slugify(`${team}-event-${sample.schema}-${sample.source}`),
+    name,
+    team,
+    enabled: true,
+    when: fields.length
+      ? { all: [{ path: 'source', op: 'eq', value: sample.source }, { path: fields[0]!.path, op: 'exists' }] }
+      : { path: 'schema', op: 'eq', value: sample.schema },
+    route: [{ to: `team:${team}` }],
+    present: { title: name, fields, color: 'grey' },
+  }
 }

@@ -2,6 +2,7 @@ import type {
   AlertDetail,
   ApiError,
   FeedAlert,
+  FeedPage,
   PersonDirectoryEntry,
   PersonView,
   Preference,
@@ -121,12 +122,27 @@ export async function transition(id: string, op: TransitionOp, expectedVersion: 
   }
 }
 
-export function streamUrl(team: string | null): string {
-  return `${API_BASE}/api/stream${team ? `?team=${encodeURIComponent(team)}` : ''}`
+function feedQuery(team: string | null, recipient: string | null) {
+  const params = new URLSearchParams()
+  if (team) params.set('team', team)
+  if (recipient) params.set('recipient', recipient)
+  return params
+}
+
+export function streamUrl(team: string | null, recipient: string | null = null): string {
+  const query = feedQuery(team, recipient).toString()
+  return `${API_BASE}/api/stream${query ? `?${query}` : ''}`
+}
+
+export function loadAlertPage(team: string | null, recipient: string | null, cursor: string, signal: AbortSignal) {
+  const query = feedQuery(team, recipient)
+  query.set('cursor', cursor)
+  query.set('limit', '100')
+  return request<FeedPage>(`/api/alerts?${query}`, { signal })
 }
 
 const enc = encodeURIComponent
-const post = <T>(path: string, body: unknown = {}, signal?: AbortSignal) =>
+export const post = <T>(path: string, body: unknown = {}, signal?: AbortSignal) =>
   request<T>(path, { method: 'POST', body: JSON.stringify(body), signal })
 const put = <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
 
@@ -224,4 +240,4 @@ export const decideApproval = (id: string, op: 'approve' | 'reject', note?: stri
 
 /** Ingest a raw event on a source, as an external system would. */
 export const ingest = (source: string, raw: unknown) =>
-  post<{ id: string; matched_alerts: string[] }>(`/ingest/${enc(source)}`, raw)
+  post<{ id: string; matched_alerts?: string[] }>(`/ingest/${enc(source.replace(/^http:/, ''))}`, raw)

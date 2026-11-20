@@ -11,6 +11,7 @@ export type Route =
   | { view: 'rules'; id: string | null; from: string | null }
   | { view: 'preferences'; kind: 'person' | 'team' | null; id: string | null }
   | { view: 'proposals'; id: string | null }
+  | { view: 'sources' | 'runbooks' | 'simulator' }
 
 const dec = (s: string | undefined): string | null => {
   if (s === undefined) return null
@@ -34,6 +35,10 @@ export function parseHash(hash: string): Route {
         : { view: 'preferences', kind: null, id: null }
     case 'proposals':
       return { view: 'proposals', id: dec(seg[1]) }
+    case 'sources':
+    case 'runbooks':
+    case 'simulator':
+      return { view: seg[0] }
     case 'alerts':
       return { view: 'alerts', id: dec(seg[1]) }
     default:
@@ -53,6 +58,10 @@ export function hashFor(r: Route): string {
       return r.kind && r.id ? `#/preferences/${r.kind}/${enc(r.id)}` : '#/preferences'
     case 'proposals':
       return r.id ? `#/proposals/${enc(r.id)}` : '#/proposals'
+    case 'sources':
+    case 'runbooks':
+    case 'simulator':
+      return `#/${r.view}`
   }
 }
 
