@@ -24,5 +24,9 @@ reqwest.workspace = true
 chrono-tz.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true
+minijinja = { workspace = true, features = ["fuel"] }
+sha2.workspace = true
+hex.workspace = true
+hmac.workspace = true
 
 [dev-dependencies]

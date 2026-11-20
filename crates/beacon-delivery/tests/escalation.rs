@@ -991,6 +991,7 @@ async fn non_critical_steps_respect_the_throttle_and_critical_ones_bypass_it(poo
         RulePolicy {
             escalate_after: None,
             throttle: Some(spec),
+            runbook: None,
         },
     );
 

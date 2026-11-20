@@ -190,6 +190,30 @@ impl GatewayState {
     }
 }
 
+/// M5b (agent C): the device-simulator routes only (`/api/simulator/{messages,stream,outage}`
+/// and `POST /api/simulator/reply`), for beacon-api to mount on its origin (board #171). The
+/// `/provider/*` and `/mock/*` routes stay on the gateway role.
+pub fn simulator_router(state: GatewayState) -> axum::Router {
+    let _ = state;
+    todo!("agent C")
+}
+
+impl GatewayState {
+    /// M5b (agent C): where `POST /api/simulator/reply {from, text}` forwards replies:
+    /// `POST {url}/api/replies` with `X-Beacon-Signature: hex(hmac_sha256(secret, body))`.
+    /// `None` → the reply endpoint answers `503 {error:{code:"unavailable"}}`.
+    pub fn with_reply_forward(self, url: Option<String>, secret: Option<Vec<u8>>) -> Self {
+        let _ = (url, secret);
+        todo!("agent C")
+    }
+
+    /// M5b (agent B): base URL the gateway's own mock targets are reached at (for logs/tests);
+    /// mock outcomes default to `ok`.
+    pub fn with_mocks(self) -> Self {
+        todo!("agent B")
+    }
+}
+
 /// All gateway routes (provider + simulator) on one router. The two body-consuming POST
 /// routes are capped at [`REQUEST_BODY_LIMIT`] (a longer body is rejected with `413` before
 /// any handler or field validation runs).

@@ -24,6 +24,8 @@ use crate::throttle::ThrottleSpec;
 pub struct RulePolicy {
     pub escalate_after: Option<Duration>,
     pub throttle: Option<ThrottleSpec>,
+    /// The rule's `runbook:` id (M5b).
+    pub runbook: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +78,9 @@ impl RulePolicies {
         if let Some(ms) = raw_payload.get("escalate_after_ms").and_then(Value::as_u64) {
             p.escalate_after = Some(Duration::from_millis(ms));
         }
+        if let Some(r) = raw_payload.get("runbook").and_then(Value::as_str) {
+            p.runbook = Some(r.to_string());
+        }
         if let Some(t) = raw_payload.get("throttle").filter(|t| !t.is_null()) {
             match ThrottleSpec::from_payload_value(t) {
                 Ok(spec) => p.throttle = Some(spec),
@@ -107,9 +112,14 @@ fn policy_from_rule(path: &str, rule: &Value) -> RulePolicy {
             }
         },
     };
+    let runbook = rule
+        .get("runbook")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     RulePolicy {
         escalate_after,
         throttle,
+        runbook,
     }
 }
 

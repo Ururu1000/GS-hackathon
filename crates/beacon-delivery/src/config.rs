@@ -182,6 +182,8 @@ pub struct Directory {
     pub delivery: DeliverySettings,
     /// `escalate_after` / `throttle` per rule from `config/rules` (part (a)'s files, optional).
     pub rules: crate::rules::RulePolicies,
+    /// `config/runbooks` (M5b). `from_parts` gives an empty library.
+    pub runbooks: crate::runbook::RunbookLibrary,
 }
 
 impl Directory {
@@ -205,6 +207,10 @@ impl Directory {
         let mut dir = Self::from_parts(people, teams)?;
         dir.delivery = DeliverySettings::load(root)?;
         dir.rules = crate::rules::RulePolicies::load(&root.join("rules"));
+        dir.runbooks = crate::runbook::RunbookLibrary::load(
+            &root.join("runbooks"),
+            crate::actions::ActionRegistry::known(),
+        )?;
         Ok(dir)
     }
 
@@ -306,6 +312,7 @@ impl Directory {
             teams: teams_map,
             delivery: DeliverySettings::default(),
             rules: Default::default(),
+            runbooks: Default::default(),
         })
     }
 

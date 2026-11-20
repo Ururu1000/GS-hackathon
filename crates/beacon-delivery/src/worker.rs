@@ -462,6 +462,13 @@ async fn process_job(
             body,
         }
     };
+    // Email carries the filled-in runbook steps (SPEC §5.5); SMS keeps its short link.
+    let mut alert = alert;
+    if channel.name() == "email"
+        && let Some(section) = crate::runbook::email_section(pool, job.alert_id).await?
+    {
+        alert.body = format!("{}\n\n{}", alert.body, section);
+    }
     let msg = channel.render(&alert, &job);
     match channel.send(&msg).await {
         Ok(receipt) => {

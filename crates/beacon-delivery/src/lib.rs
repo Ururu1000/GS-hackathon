@@ -17,6 +17,11 @@
 //! `channel::gateway_client`), a durable per-channel `breaker` and one-hop fallback jobs.
 //! Throttles, escalation, approvals and runbooks come later.
 
+pub mod actions;
+pub mod alert_ops;
+pub mod api;
+pub mod approvals;
+pub mod audit;
 pub mod breaker;
 pub mod channel;
 pub mod clock;
@@ -27,6 +32,7 @@ pub mod model;
 pub mod prefs;
 pub mod router;
 pub mod rules;
+pub mod runbook;
 pub mod throttle;
 pub mod worker;
 

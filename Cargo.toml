@@ -38,3 +38,4 @@ hdrhistogram = "7.5"
 # Added by delivery (b), M4.
 chrono-tz = "0.10"
 tokio-stream = { version = "0.1", features = ["sync"] }
+hmac = "0.12"

@@ -17,6 +17,10 @@
 //! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
 //! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery |
 //! | `ESCALATE_AFTER_OVERRIDE_MS` | unset (demo: replaces rule `escalate_after`) | router |
+//! | `REPLY_SECRET`       | unset = SMS replies rejected              | gateway, delivery-api |
+//! | `DELIVERY_API_ADDR`  | `127.0.0.1:8071`                          | delivery-api      |
+//! | `DELIVERY_API_URL`   | `http://127.0.0.1:8071` (reply forward)   | gateway           |
+//! | `DELIVERY_API_DEMO_ACTOR` | `user:bob` (dev only)                | delivery-api      |
 //! | `DB_MAX_CONNECTIONS` | sized from the roles (see `pool_size`)    | all               |
 //! | `SHUTDOWN_GRACE_SECS`| `20` (drain time after SIGTERM/SIGINT)    | all               |
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
@@ -58,10 +62,13 @@ enum Role {
     Gateway,
     /// escalation timers -> next on-call / lead (part b)
     Scheduler,
+    /// runbook action executions (part b, M5b)
+    Actions,
+    /// delivery API standalone dev server until beacon-api mounts it (part b, M5b)
+    DeliveryApi,
 }
 
-const ROLES: &str =
-    "ingest, sources, matcher, aggregator, relay, router, delivery, gateway, scheduler";
+const ROLES: &str = "ingest, sources, matcher, aggregator, relay, router, delivery, gateway, scheduler, actions, delivery-api";
 
 impl Role {
     fn parse(s: &str) -> Result<Self> {
@@ -75,6 +82,8 @@ impl Role {
             "delivery" => Self::Delivery,
             "gateway" => Self::Gateway,
             "scheduler" => Self::Scheduler,
+            "actions" => Self::Actions,
+            "delivery-api" => Self::DeliveryApi,
             other => bail!("unknown role {other:?} (known: {ROLES})"),
         })
     }
@@ -313,6 +322,59 @@ async fn main() -> Result<()> {
                     shutdown_rx.clone(),
                 ));
             }
+            Role::Actions => {
+                let dir_path = PathBuf::from(env_or("BEACON_CONFIG_DIR", "config"));
+                let dir = Directory::load(&dir_path)
+                    .with_context(|| format!("loading config from {}", dir_path.display()))?;
+                let registry = beacon_delivery::actions::ActionRegistry::builtin(
+                    beacon_delivery::actions::ActionsConfig {
+                        gateway_url: env_or("SMS_GATEWAY_URL", "http://localhost:8070"),
+                        http_targets: beacon_delivery::actions::load_http_targets(&dir_path)?,
+                        timeout: std::time::Duration::from_secs(5),
+                    },
+                );
+                info!("runbook actions worker starting");
+                tasks.spawn(beacon_delivery::actions::run_actions(
+                    pool.clone(),
+                    Arc::new(dir),
+                    registry,
+                    alert_ops(),
+                    beacon_delivery::actions::ActionsWorkerConfig::default(),
+                    shutdown_rx.clone(),
+                ));
+            }
+            Role::DeliveryApi => {
+                let dir_path = PathBuf::from(env_or("BEACON_CONFIG_DIR", "config"));
+                let dir = Directory::load(&dir_path)
+                    .with_context(|| format!("loading config from {}", dir_path.display()))?;
+                let registry = beacon_delivery::actions::ActionRegistry::builtin(
+                    beacon_delivery::actions::ActionsConfig {
+                        gateway_url: env_or("SMS_GATEWAY_URL", "http://localhost:8070"),
+                        http_targets: beacon_delivery::actions::load_http_targets(&dir_path)?,
+                        timeout: std::time::Duration::from_secs(5),
+                    },
+                );
+                let state = beacon_delivery::api::ApiState {
+                    pool: pool.clone(),
+                    dir: Arc::new(dir),
+                    registry,
+                    alert_ops: alert_ops(),
+                    reply_secret: reply_secret().map(Arc::new),
+                };
+                let addr: std::net::SocketAddr = env_or("DELIVERY_API_ADDR", "127.0.0.1:8071")
+                    .parse()
+                    .context("DELIVERY_API_ADDR")?;
+                let actor =
+                    beacon_delivery::api::Actor(env_or("DELIVERY_API_DEMO_ACTOR", "user:bob"));
+                let rx = shutdown_rx.clone();
+                tasks.spawn(async move {
+                    if let Err(e) =
+                        beacon_delivery::api::serve_standalone(state, addr, actor, rx).await
+                    {
+                        tracing::error!(error = %e, "delivery-api stopped");
+                    }
+                });
+            }
             Role::Scheduler => {
                 let dir_path = PathBuf::from(env_or("BEACON_CONFIG_DIR", "config"));
                 let dir = Directory::load(&dir_path)
@@ -383,11 +445,17 @@ async fn main() -> Result<()> {
                 let addr: std::net::SocketAddr = env_or("GATEWAY_ADDR", "127.0.0.1:8070")
                     .parse()
                     .context("GATEWAY_ADDR")?;
-                let state = beacon_delivery::gateway::GatewayState::new(pool.clone()).with_token(
-                    std::env::var("GATEWAY_TOKEN")
-                        .ok()
-                        .filter(|t| !t.is_empty()),
-                );
+                let state = beacon_delivery::gateway::GatewayState::new(pool.clone())
+                    .with_token(
+                        std::env::var("GATEWAY_TOKEN")
+                            .ok()
+                            .filter(|t| !t.is_empty()),
+                    )
+                    .with_reply_forward(
+                        Some(env_or("DELIVERY_API_URL", "http://127.0.0.1:8071")),
+                        reply_secret(),
+                    )
+                    .with_mocks();
                 let rx = shutdown_rx.clone();
                 tasks.spawn(async move {
                     if let Err(e) = beacon_delivery::gateway::serve(state, addr, rx, |bound| {
@@ -432,6 +500,20 @@ async fn main() -> Result<()> {
         while tasks.join_next().await.is_some() {}
     }
     Ok(())
+}
+
+/// `REPLY_SECRET` as bytes, if set.
+fn reply_secret() -> Option<Vec<u8>> {
+    std::env::var("REPLY_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(String::into_bytes)
+}
+
+/// Alert transitions for delivery. Temporary local SQL until beacon_engine::alerts (board #185,
+/// PR #12) is in this branch's base; then wrap `beacon_engine::alerts::{transition, touch}`.
+fn alert_ops() -> Arc<dyn beacon_delivery::alert_ops::AlertOps> {
+    Arc::new(beacon_delivery::alert_ops::SqlAlertOps)
 }
 
 /// Resolves on SIGINT (Ctrl-C) or SIGTERM (what `docker stop` / Kubernetes send, QA H6).

@@ -16,6 +16,7 @@ use crate::config::{Directory, Person, Team, address_for};
 use crate::escalation;
 use crate::model::{NotifyPayload, NotifyReason};
 use crate::prefs::{self, Decision, RoutingContext};
+use crate::runbook;
 use crate::throttle::{self, PlannedJob};
 use crate::{RouterConfig, Shutdown};
 
@@ -39,6 +40,8 @@ pub struct RouteStats {
     pub suppressed: u64,
     /// Escalation timers started (M5a).
     pub timers: u64,
+    /// Runbooks frozen onto alerts (M5b).
+    pub runbooks: u64,
 }
 
 /// Claim up to `cfg.batch_size` unprocessed notify rows with `FOR UPDATE SKIP LOCKED`, insert
@@ -189,6 +192,25 @@ pub async fn route_once(
                 None,
             )
             .await?;
+        }
+
+        // Freeze the selected runbook, rendered from the pinned event context, on the alert's
+        // first notification (SPEC §6.1, M5b).
+        if payload.reason == NotifyReason::New {
+            let alert = json!({
+                "id": alert_id, "team": payload.team, "rule_id": payload.rule_id,
+                "severity": payload.severity,
+            });
+            let tctx = runbook::template_context(raw, &alert);
+            if let Some(rb) = dir
+                .runbooks
+                .select(policy.runbook.as_deref(), &payload.team, &tctx)
+            {
+                let steps = runbook::render(rb, &tctx, &crate::actions::ActionRegistry::risk_of);
+                if runbook::attach(&mut tx, *alert_id, rb, &steps, &tctx).await? {
+                    stats.runbooks += 1;
+                }
+            }
         }
 
         // Escalation clock starts at the alert's first notification (SPEC §4.4); suppressed or
