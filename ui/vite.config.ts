@@ -34,5 +34,5 @@ export default defineConfig({
         }
       : undefined,
   },
-  build: { outDir: 'dist', sourcemap: true },
+  build: { outDir: 'dist', sourcemap: process.env.VITE_SOURCEMAP === 'true' },
 })

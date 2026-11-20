@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Beacon UI API
-  version: 0.1.0-m0
+  version: 0.2.0
   description: |
     The part of the Beacon API that the React UI depends on (spec §8). Draft for
     M0, proposed by the UI (erop-laptop/claude) for the backend to adopt.
@@ -20,7 +20,22 @@ info:
     - **Auth:** a same-origin session cookie (works with EventSource). Writes
       must send `X-CSRF-Token` with the token from `GET /api/session`. M0 may
       run with a fixed demo session.
-    - **Errors:** every non-2xx body is an `ApiError`.
+    - **Authorization & privacy:** every read and write is scoped server-side
+      to the session's authorized teams and roles (`403 forbidden` otherwise).
+      - `PUT /api/people/{personId}/preferences`: self or admin only.
+      - `PUT /api/teams/{teamId}`: team lead or admin only (prevents self-promotion).
+      - `POST/PUT/DELETE /api/rules`, `POST /api/proposals/{id}/{decision}`,
+        `POST /api/alerts/{id}/steps/{step}/{run|check}`: owning team member or admin.
+      - `POST /api/approvals/{id}/{decision}`: eligible approver only; requester
+        cannot self-approve when separation of duties applies.
+      - SMS approval challenges are stored hashed and delivered out-of-band
+        only; plaintext `sms_code` is never returned in API responses.
+      - Contact details and personal schedules are omitted/redacted for other
+        users; `DeliveryStatus.address` is masked; `EventSample.raw`, runbook
+        params, execution outputs, and audit timeline entries are redacted
+        server-side (no secrets or raw PII).
+    - **Errors:** every non-2xx body is an `ApiError`. Internal `5xx` errors
+      return generic messages with no stack traces or internal paths.
 
     ## SSE (`GET /api/stream`)
     MVP recovery is a snapshot on every (re)connect, without `Last-Event-ID`:
@@ -38,6 +53,26 @@ info:
     Events carry no `id:` field in the MVP. Resolved alerts stay in the feed as
     upserts with `status: resolved`; `alert.remove` is for alerts that leave the
     scope (deleted, expired, moved to another team).
+
+    ## Config writes (rules, preferences, teams)
+    Every config object carries a `revision`. Writes send it back as
+    `expected_revision` and get `409 revision_conflict` (with `error.current`,
+    the object as it is now) if someone else saved first. A recreated rule
+    gets a higher revision than the deleted rule with the same ID. Validation failures
+    are `422 invalid` with `error.details: [{path, message}]`, where `path` is
+    a dotted path into the submitted object (`when.all.0.value`). Spec §4.6:
+    API edits and YAML imports go through one validator. Until config moves to
+    Postgres (M2), only the UI mock implements writes to people and teams.
+
+    ## Runbooks and approvals
+    `AlertDetail.runbook` carries per-step state for this alert. Running an
+    action step returns `202 {execution_id}`; the action runs off the alert
+    pipeline. A step that needs approval returns `409 approval_required` with
+    `error.approval_id`, and the request appears on the step. Approving is one
+    transaction: consume the request, audit, insert the execution. Runbook
+    activity should bump the alert `version` (so open detail panes refetch);
+    the UI also polls the detail every 2 s while a step is queued, running or
+    awaiting approval.
 servers:
   - url: /
 paths:
@@ -103,6 +138,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AlertDetail' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/alerts/{id}/ack:
     post:
@@ -119,6 +155,7 @@ paths:
             schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200': { $ref: '#/components/responses/Alert' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Conflict' }
   /api/alerts/{id}/resolve:
@@ -134,6 +171,7 @@ paths:
             schema: { $ref: '#/components/schemas/TransitionRequest' }
       responses:
         '200': { $ref: '#/components/responses/Alert' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Conflict' }
   /api/stream:
@@ -158,6 +196,320 @@ paths:
               examples:
                 basic:
                   externalValue: ./fixtures/stream-basic.sse
+  /api/alerts/{id}/steps/{step}/run:
+    post:
+      operationId: runStep
+      summary: Run a runbook action step (owning team member or admin)
+      parameters: [ { $ref: '#/components/parameters/AlertId' }, { $ref: '#/components/parameters/StepId' }, { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { expected_version: { type: integer } } }
+      responses:
+        '202':
+          description: Execution queued
+          content:
+            application/json:
+              schema: { type: object, required: [execution_id], properties: { execution_id: { type: string } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: |
+            `approval_required` (with `error.approval_id`; the request now shows on the step),
+            or `invalid_transition` (alert resolved, step locked or already running).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+  /api/alerts/{id}/steps/{step}/check:
+    post:
+      operationId: checkStep
+      summary: Tick or untick a manual step (owning team member or admin)
+      parameters: [ { $ref: '#/components/parameters/AlertId' }, { $ref: '#/components/parameters/StepId' }, { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { done: { type: boolean, default: true } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/approvals/{id}/{decision}:
+    post:
+      operationId: decideApproval
+      summary: Approve or reject a pending approval request
+      description: Approve consumes the request and starts the execution (returns its id). Eligible approver only; requester cannot self-approve.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: decision, in: path, required: true, schema: { type: string, enum: [approve, reject] } }
+        - { $ref: '#/components/parameters/Csrf' }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { note: { type: string, maxLength: 2000 } } }
+      responses:
+        '200':
+          description: Decided
+          content:
+            application/json:
+              schema: { type: object, properties: { execution_id: { type: string } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/rules:
+    get:
+      operationId: listRules
+      summary: Rules with fire counts (scoped to authorized teams)
+      parameters: [ { $ref: '#/components/parameters/Team' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, required: [items], properties: { items: { type: array, items: { $ref: '#/components/schemas/RuleItem' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createRule
+      summary: Publish a new rule (owning team member or admin)
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [rule], properties: { rule: { $ref: '#/components/schemas/RuleSpec' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/RuleItem' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/rules/{ruleId}:
+    parameters: [ { name: ruleId, in: path, required: true, schema: { type: string } } ]
+    get:
+      operationId: getRule
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RuleItem' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      operationId: updateRule
+      summary: Publish a new revision (compare-and-set; owning team member or admin)
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rule, expected_revision]
+              properties: { rule: { $ref: '#/components/schemas/RuleSpec' }, expected_revision: { type: integer } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RuleItem' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { description: '`revision_conflict`, `error.current` is the RuleItem now', content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: deleteRule
+      summary: Delete a rule (owning team member or admin)
+      parameters: [ { $ref: '#/components/parameters/Csrf' }, { name: expected_revision, in: query, required: true, schema: { type: integer } } ]
+      responses:
+        '200': { description: Deleted, content: { application/json: { schema: { type: object, properties: { deleted: { type: string } } } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/rules/test:
+    post:
+      operationId: testRule
+      summary: Dry-run a draft rule against one event (zero writes, zero dispatches)
+      description: Same compiler as publish. Bounded payload size and linear-time regex evaluation. The UI debounces calls and drops stale responses.
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rule, event]
+              properties:
+                rule: { $ref: '#/components/schemas/RuleSpec' }
+                event: { description: Raw event JSON, any shape }
+                source: { type: string, examples: ['kafka:workflows'] }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RuleTestResult' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+  /api/runbooks:
+    get:
+      operationId: listRunbooks
+      summary: Runbooks visible to the session's authorized teams
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, title, format, team, steps]
+                      properties:
+                        id: { type: string }
+                        title: { type: string }
+                        format: { type: string, examples: [yaml, markdown, link, text] }
+                        team: { type: [string, 'null'] }
+                        steps: { type: integer, description: Number of steps }
+  /api/events/recent:
+    get:
+      operationId: recentEvents
+      summary: Recently ingested events the session may see, redacted server-side (test panel samples)
+      parameters:
+        - $ref: '#/components/parameters/Team'
+        - { name: limit, in: query, schema: { type: integer, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      allOf:
+                        - { $ref: '#/components/schemas/EventSample' }
+                        - { type: object, required: [source, schema], properties: { source: { type: string }, schema: { type: string } } }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/people/directory:
+    get:
+      operationId: listDirectory
+      summary: Minimal user directory (id, name, teams) for recipient pickers — no contact PII or schedules
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/PersonDirectoryEntry' }
+  /api/people:
+    get:
+      operationId: listPeople
+      summary: People visible to the session (contact details and personal schedules omitted/redacted for other users unless admin)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/PersonView' } } } } } } }
+  /api/people/{personId}/preferences:
+    put:
+      operationId: savePreferences
+      summary: Update a person's notification preferences (self or admin only)
+      parameters: [ { name: personId, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [preferences, expected_revision]
+              properties:
+                preferences: { type: array, items: { $ref: '#/components/schemas/Preference' } }
+                expected_revision: { type: integer }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/PersonView' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/teams:
+    get:
+      operationId: listTeams
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/TeamView' } } } } } } }
+  /api/teams/{teamId}:
+    put:
+      operationId: saveTeam
+      summary: Update team membership, lead, on-call rotation and defaults (team lead or admin only)
+      parameters: [ { name: teamId, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision]
+              properties:
+                members: { type: array, items: { type: string } }
+                lead: { type: [string, 'null'] }
+                oncall: { type: object, additionalProperties: { type: array, items: { type: string } } }
+                default_channels: { type: array, items: { type: string } }
+                expected_revision: { type: integer }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/TeamView' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/proposals:
+    get:
+      operationId: listProposals
+      summary: Proposals scoped to the session's authorized teams (newest first)
+      parameters:
+        - $ref: '#/components/parameters/Team'
+        - name: state
+          in: query
+          schema: { type: string, enum: [pending, accepted, rejected, stale] }
+      responses:
+        '200': { description: Newest first, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: '#/components/schemas/Proposal' } } } } } } }
+        '403': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createProposal
+      summary: Suggest a change to a rule (typed, against its current revision)
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rule_id, base_revision, kind, summary, proposed_rule]
+              properties:
+                rule_id: { type: string }
+                base_revision: { type: integer }
+                kind: { type: string, enum: [noisy, reroute, template, other] }
+                summary: { type: string, maxLength: 200 }
+                note: { type: string, maxLength: 4000 }
+                proposed_rule: { $ref: '#/components/schemas/RuleSpec' }
+                alert_id: { type: string }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Proposal' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/proposals/count:
+    get:
+      operationId: countPendingProposals
+      summary: Lightweight count of pending proposals visible to the session (avoids downloading full proposal payloads for nav badges)
+      parameters: [ { $ref: '#/components/parameters/Team' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, required: [pending], properties: { pending: { type: integer, minimum: 0 } } }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/proposals/{proposalId}/{decision}:
+    post:
+      operationId: decideProposal
+      summary: Accept (= publish against base_revision) or reject (owning team member or admin)
+      description: If the rule moved past `base_revision`, accept is `409 revision_conflict` and the proposal becomes `stale`.
+      parameters:
+        - { name: proposalId, in: path, required: true, schema: { type: string } }
+        - { name: decision, in: path, required: true, schema: { type: string, enum: [accept, reject] } }
+        - { $ref: '#/components/parameters/Csrf' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Proposal' } } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
 components:
   parameters:
     Team:
@@ -167,6 +519,11 @@ components:
       schema: { type: string }
     AlertId:
       name: id
+      in: path
+      required: true
+      schema: { type: string }
+    StepId:
+      name: step
       in: path
       required: true
       schema: { type: string }
@@ -261,7 +618,7 @@ components:
       properties:
         event_id: { type: string }
         received_at: { $ref: '#/components/schemas/Timestamp' }
-        raw: { description: The original payload, untouched }
+        raw: { description: Event payload with secrets and PII redacted server-side }
     TimelineEntry:
       type: object
       required: [at, actor, kind, message]
@@ -275,14 +632,66 @@ components:
         message: { type: string }
     RunbookView:
       type: object
-      description: Placeholder until M5 (runbooks).
-      required: [id, revision, title, format, steps]
+      description: The runbook selected for this alert (spec §6.1), with per-step state for this alert instance.
+      required: [id, revision, title, format, url, text, steps]
       properties:
         id: { type: string }
         revision: { type: integer }
         title: { type: string }
-        format: { type: string, enum: [yaml, markdown, link, text] }
-        steps: { type: array, items: {} }
+        format: { type: string, examples: [yaml, markdown, link, text] }
+        url: { type: [string, 'null'], description: '`link` runbooks; the UI only opens http(s)' }
+        text: { type: [string, 'null'], description: '`text`/`markdown` original, verbatim' }
+        steps: { type: array, items: { $ref: '#/components/schemas/RunbookStep' } }
+    RunbookStep:
+      type: object
+      required: [id, kind, text, hint, action, approval, state, disabled_reason, done_by, done_at, runs, approval_request]
+      properties:
+        id: { type: string, description: Stable across revisions }
+        kind: { type: string, enum: [manual, condition, action] }
+        text: { type: string, description: Rendered from the pinned event context }
+        hint: { type: [string, 'null'], description: Guidance shown but not enforced }
+        action:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [name, label, params, risk]
+              properties:
+                name: { type: string, examples: [http_get, retry_workflow, escalate, restart_service] }
+                label: { type: string }
+                params: { type: object, additionalProperties: { type: string }, description: Rendered, secrets redacted }
+                risk: { type: string, enum: [low, high] }
+        approval: { type: string, enum: [none, required] }
+        state: { type: string, examples: [idle, done, queued, running, ok, failed, uncertain, cancelled, awaiting_approval, rejected] }
+        disabled_reason: { type: [string, 'null'], examples: ['Available after 2 failed retries (1 so far)'] }
+        done_by: { type: [string, 'null'] }
+        done_at: { oneOf: [ { $ref: '#/components/schemas/Timestamp' }, { type: 'null' } ] }
+        runs: { type: array, items: { $ref: '#/components/schemas/Execution' }, description: Oldest first }
+        approval_request: { oneOf: [ { $ref: '#/components/schemas/ApprovalRequest' }, { type: 'null' } ] }
+    Execution:
+      type: object
+      required: [id, state, requested_by, started_at, finished_at, output]
+      properties:
+        id: { type: string }
+        state: { type: string, enum: [queued, running, ok, failed, uncertain, cancelled] }
+        requested_by: { type: string }
+        started_at: { type: [string, 'null'] }
+        finished_at: { type: [string, 'null'] }
+        output: { type: [string, 'null'], description: Short, redacted }
+    ApprovalRequest:
+      type: object
+      required: [id, state, requested_by, requested_at, expires_at, eligible, can_decide, decided_by, decided_at, note]
+      properties:
+        id: { type: string }
+        state: { type: string, enum: [pending, approved, rejected, expired] }
+        requested_by: { type: string }
+        requested_at: { $ref: '#/components/schemas/Timestamp' }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+        eligible: { type: array, items: { type: string }, examples: [['user:carol']] }
+        can_decide: { type: boolean, description: Whether the session user is eligible to decide (excludes requester self-approval) }
+        sms_sent: { type: boolean, description: Whether an out-of-band SMS challenge was sent to eligible approvers (plaintext code is never returned) }
+        decided_by: { type: [string, 'null'] }
+        decided_at: { type: [string, 'null'] }
+        note: { type: [string, 'null'] }
     DeliveryStatus:
       type: object
       description: |
@@ -295,7 +704,7 @@ components:
         id: { type: string, description: Delivery job id }
         recipient: { type: string, examples: ['user:anna'] }
         channel: { type: string, examples: [email, sms, phone, ui] }
-        address: { type: string, examples: [anna@example.test, '+44 7700 900123'] }
+        address: { type: string, description: Masked destination address to avoid broadcasting personal contact PII, examples: ['a***@example.test', '+44 •••• ••0123'] }
         state:
           type: string
           examples: [pending, in_flight, sent, cancelled, dead]
@@ -329,9 +738,14 @@ components:
           properties:
             code:
               type: string
-              examples: [version_conflict, invalid_transition, not_found, forbidden, csrf, bad_request, internal]
+              examples: [version_conflict, invalid_transition, revision_conflict, approval_required, invalid, not_found, forbidden, csrf, bad_request, internal]
             message: { type: string }
-            current: { $ref: '#/components/schemas/FeedAlert' }
+            current: { description: 'The object as it is now: FeedAlert for alert transitions; RuleItem, PersonView or TeamView for config writes' }
+            approval_id: { type: string, description: '`approval_required` only' }
+            details:
+              type: array
+              description: '`invalid` only'
+              items: { type: object, required: [path, message], properties: { path: { type: string }, message: { type: string } } }
     Session:
       type: object
       required: [user, teams, csrf_token]
@@ -362,3 +776,172 @@ components:
         id: { type: string }
         version: { type: integer }
         reason: { type: string, enum: [deleted, out_of_scope, expired] }
+    Condition:
+      description: 'Typed condition tree (spec §4.3). Missing values compare false; `not` negates.'
+      oneOf:
+        - { type: object, required: [all], properties: { all: { type: array, items: { $ref: '#/components/schemas/Condition' } } } }
+        - { type: object, required: [any], properties: { any: { type: array, items: { $ref: '#/components/schemas/Condition' } } } }
+        - { type: object, required: [not], properties: { not: { $ref: '#/components/schemas/Condition' } } }
+        - type: object
+          required: [path, op]
+          properties:
+            path: { type: string, examples: [raw.payload.notional, fields.severity, schema, source] }
+            op: { type: string, enum: [eq, neq, gt, gte, lt, lte, in, not_in, contains, starts_with, regex, exists, not_exists] }
+            value: { description: 'Scalar, or a list for in/not_in; omitted for exists/not_exists' }
+    RuleSpec:
+      type: object
+      description: The JSON form of `config/rules/*.yaml`. Unknown keys are inert; prototype-pollution keys (`__proto__`, `constructor`, `prototype`) are forbidden.
+      required: [id, team, when, route, present]
+      additionalProperties: true
+      properties:
+        id: { type: string, pattern: '^[a-z0-9][a-z0-9-]{1,62}$' }
+        name: { type: string }
+        team: { type: string }
+        enabled: { type: boolean, default: true }
+        when: { $ref: '#/components/schemas/Condition' }
+        severity: { $ref: '#/components/schemas/Severity', description: "Omitted = the event's fields.severity" }
+        route:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [to]
+            properties:
+              to: { type: string, examples: ['team:rates', 'user:anna', 'oncall:settlements'] }
+              channels: { type: array, items: { type: string }, description: Omitted = recipient preferences }
+        present:
+          type: object
+          required: [title]
+          properties:
+            title: { type: string }
+            body: { type: string }
+            fields: { type: array, items: { oneOf: [ { type: string }, { type: object, required: [path, label], properties: { path: { type: string }, label: { type: string } } } ] } }
+            color: { $ref: '#/components/schemas/ColorToken' }
+        dedup: { type: object, properties: { key: { type: array, items: { type: string } }, window: { type: string, examples: [10m] } } }
+        group: { type: object, properties: { by: { type: array, items: { type: string } }, window: { type: [string, integer] } } }
+        throttle: { type: object, properties: { max: { type: integer }, per: { type: string } } }
+        runbook: { type: string }
+        auto_resolve: { type: object, properties: { recover_when: { $ref: '#/components/schemas/Condition' }, quiet_for: { type: string } } }
+        escalate_after: { type: string }
+    RuleItem:
+      type: object
+      required: [rule, revision, updated_at, updated_by, stats]
+      properties:
+        rule: { $ref: '#/components/schemas/RuleSpec' }
+        revision: { type: integer, description: 'Send back as expected_revision' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_by: { type: string, examples: ['user:erop', config] }
+        stats:
+          type: object
+          required: [fires_24h, open_alerts, last_fired_at, hourly]
+          properties:
+            fires_24h: { type: integer }
+            open_alerts: { type: integer }
+            last_fired_at: { type: [string, 'null'] }
+            hourly: { type: array, items: { type: integer }, minItems: 24, maxItems: 24, description: Matching events per hour, oldest first }
+        can_edit: { type: boolean, description: Whether the session user may edit or delete this rule }
+    RuleTestResult:
+      type: object
+      required: [matched, schema, fields, nodes, card, warnings, errors]
+      properties:
+        matched: { type: boolean }
+        schema: { type: string, description: Detected schema or unknown:<signature> }
+        fields: { type: object, description: Normalized fields as the rule sees them }
+        nodes:
+          type: array
+          items:
+            type: object
+            required: [node, result]
+            properties:
+              node: { type: string, description: 'Child indexes from the root, dot-separated; "" = root. A not wraps its child at index 0.' }
+              result: { type: string, enum: [match, no_match, skipped, error] }
+              actual: { description: The value at the leaf path; absent when missing }
+              message: { type: string }
+        card:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [title, body, severity, color, fields, dedup_key]
+              properties:
+                title: { type: string }
+                body: { type: string }
+                severity: { $ref: '#/components/schemas/Severity' }
+                color: { $ref: '#/components/schemas/ColorToken' }
+                fields: { type: array, items: { $ref: '#/components/schemas/AlertField' } }
+                dedup_key: { type: array, items: { type: string } }
+        warnings: { type: array, items: { type: string } }
+        errors: { type: array, items: { type: object, required: [path, message], properties: { path: { type: string }, message: { type: string } } } }
+    Preference:
+      description: One line of a person's preferences; the first match wins (spec §4.4). A `default` line goes last.
+      oneOf:
+        - type: object
+          required: [default]
+          properties: { default: { type: array, items: { type: string } } }
+        - type: object
+          required: [match, channels]
+          properties:
+            match:
+              type: object
+              properties:
+                severity: { oneOf: [ { $ref: '#/components/schemas/Severity' }, { type: array, items: { $ref: '#/components/schemas/Severity' } } ] }
+                service: { type: string }
+                team: { type: string }
+            channels: { type: array, items: { type: string } }
+            when:
+              type: object
+              required: [between, tz]
+              properties:
+                between: { type: string, examples: ['08:00-20:00'], description: 'Half-open local window; may wrap midnight' }
+                tz: { type: string, examples: [Europe/London] }
+            otherwise: { type: array, items: { type: string }, description: 'Outside the window; omitted = skip this line' }
+    PersonDirectoryEntry:
+      type: object
+      required: [id, name, teams]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        teams: { type: array, items: { type: string } }
+    PersonView:
+      type: object
+      required: [id, name, contact, teams, preferences, revision]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        contact: { type: object, description: Omitted/empty for other users unless authorized, properties: { email: { type: string }, phone: { type: string } } }
+        teams: { type: array, items: { type: string } }
+        preferences: { type: array, description: Empty/redacted for other users unless authorized, items: { $ref: '#/components/schemas/Preference' } }
+        revision: { type: integer }
+        can_edit: { type: boolean, description: Whether the session user may view/edit this person's contact details and preferences }
+    TeamView:
+      type: object
+      required: [id, name, members, lead, oncall, default_channels, revision]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        members: { type: array, items: { type: string } }
+        lead: { type: [string, 'null'] }
+        oncall: { type: object, additionalProperties: { type: array, items: { type: string } }, description: 'Schedule → rotation; first is on call' }
+        default_channels: { type: array, items: { type: string } }
+        revision: { type: integer }
+        can_edit: { type: boolean, description: Whether the session user (team lead or admin) may edit this team }
+    Proposal:
+      type: object
+      required: [id, rule_id, rule_name, kind, summary, note, base_revision, base_rule, proposed_rule, author, auto, alert_id, created_at, state, decided_by, decided_at]
+      properties:
+        id: { type: string }
+        rule_id: { type: string }
+        rule_name: { type: string }
+        kind: { type: string, examples: [noisy, reroute, template, other] }
+        summary: { type: string }
+        note: { type: string }
+        base_revision: { type: integer }
+        base_rule: { $ref: '#/components/schemas/RuleSpec' }
+        proposed_rule: { $ref: '#/components/schemas/RuleSpec' }
+        author: { type: string, examples: ['user:erin', system] }
+        auto: { type: boolean, description: Suggested by Beacon from how the alerts were handled }
+        alert_id: { type: [string, 'null'] }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        state: { type: string, enum: [pending, accepted, rejected, stale] }
+        decided_by: { type: [string, 'null'] }
+        decided_at: { type: [string, 'null'] }
+        can_review: { type: boolean, description: Whether the session user may accept or reject this proposal }

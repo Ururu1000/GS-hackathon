@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { getAlert } from '../api/client'
 import type { AlertDetail as Detail, DeliveryStatus, FeedAlert, TimelineEntry } from '../api/types'
 import type { TransitionOp } from '../api/client'
 import { absTime, relTime } from '../lib/time'
 import { CheckIcon, CloseIcon, CopyIcon } from '../lib/icons'
+import { maskAddress } from '../lib/redact'
 import { actorName, colorToken, CountBadge, resolvedReasonText, resolvedText, SeverityBadge, STATUS_LABEL } from './badges'
+import { LIVE_STATES, Runbook } from './Runbook'
 
 interface Props {
   /** Live projection from the feed store (count/status update in place). */
@@ -15,15 +17,23 @@ interface Props {
   pending: TransitionOp | null
   onAct: (op: TransitionOp) => void
   onClose: () => void
+  onToast: (kind: 'ok' | 'warn' | 'error', text: string) => void
+  onNavigate: (hash: string) => void
 }
 
-const REFETCH_MIN_MS = 1500
+const SuggestChange = lazy(() => import('../proposals/SuggestChange').then((m) => ({ default: m.SuggestChange })))
 
-/** Detail data (samples, timeline) refetches when the alert's version changes
- * (throttled) and after every reconnect. */
+const REFETCH_MIN_MS = 1500
+const POLL_MS = 2000
+
+/** Detail data (samples, runbook, timeline) refetches when the alert's version
+ * changes (throttled), after every reconnect, right after the user acts, and
+ * every 2 s while a runbook step is queued, running or awaiting approval (the
+ * backend may not bump the alert version for those). */
 function useDetail(id: string, version: number, snapshotAt: string | null) {
   const [detail, setDetail] = useState<Detail | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [tick, setTick] = useState(0)
   const last = useRef(0)
 
   useEffect(() => {
@@ -31,6 +41,13 @@ function useDetail(id: string, version: number, snapshotAt: string | null) {
     setError(null)
     last.current = 0
   }, [id])
+
+  const live = !!detail?.runbook?.steps.some((s) => LIVE_STATES.includes(s.state))
+  useEffect(() => {
+    if (!live) return
+    const t = setInterval(() => setTick((n) => n + 1), POLL_MS)
+    return () => clearInterval(t)
+  }, [live])
 
   useEffect(() => {
     const ctl = new AbortController()
@@ -50,13 +67,18 @@ function useDetail(id: string, version: number, snapshotAt: string | null) {
       clearTimeout(t)
       ctl.abort()
     }
-  }, [id, version, snapshotAt])
+  }, [id, version, snapshotAt, tick])
 
-  return { detail, error }
+  const reload = () => {
+    last.current = 0
+    setTick((n) => n + 1)
+  }
+  return { detail, error, reload }
 }
 
-export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose }: Props) {
-  const { detail, error } = useDetail(a.id, a.version, snapshotAt)
+export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose, onToast, onNavigate }: Props) {
+  const { detail, error, reload } = useDetail(a.id, a.version, snapshotAt)
+  const [suggesting, setSuggesting] = useState(false)
   const headingRef = useRef<HTMLHeadingElement>(null)
   useEffect(() => headingRef.current?.focus({ preventScroll: true }), [a.id])
 
@@ -112,6 +134,8 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
         </section>
       )}
 
+      {detail?.runbook && <Runbook runbook={detail.runbook} alert={a} now={now} onChanged={reload} onToast={onToast} />}
+
       <section className="section">
         {error && <div className="placeholder error">Couldn’t load this part. It will retry automatically.</div>}
         {!detail && !error && <div className="placeholder">Loading…</div>}
@@ -136,12 +160,22 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
       <section className="section">
         <dl className="fields">
           <div className="kv"><dt>Team</dt><dd>{a.team}</dd></div>
-          <div className="kv"><dt>Alert rule</dt><dd>{a.rule.name}</dd></div>
-          {detail?.runbook && <div className="kv"><dt>Runbook</dt><dd>{detail.runbook.title}</dd></div>}
+          <div className="kv"><dt>Alert rule</dt><dd><a href={`#/rules/${encodeURIComponent(a.rule.id)}`}>{a.rule.name}</a></dd></div>
           <div className="kv"><dt>Started</dt><dd>{absTime(a.first_seen)}</dd></div>
           <div className="kv"><dt>Latest</dt><dd>{absTime(a.last_seen)}</dd></div>
         </dl>
       </section>
+
+      <section className="section suggest-row">
+        <p className="small muted">Too noisy, wrong people, or missing something?</p>
+        <button className="btn btn-sm" onClick={() => setSuggesting(true)}>Suggest a change</button>
+      </section>
+
+      {suggesting && (
+        <Suspense fallback={null}>
+          <SuggestChange alert={a} samples={detail?.samples ?? []} onClose={() => setSuggesting(false)} onToast={onToast} onNavigate={onNavigate} />
+        </Suspense>
+      )}
 
       <details className="section tech">
         <summary>Technical details</summary>
@@ -157,6 +191,7 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
         {detail && detail.samples.length > 0 && (
           <>
             <h4>Raw events</h4>
+            <p className="hint">Payloads are redacted server-side, but may still contain sensitive operational data.</p>
             {detail.samples.map((s) => (
               <details key={s.event_id} className="sample">
                 <summary>
@@ -245,7 +280,7 @@ function Deliveries({ items, now }: { items: DeliveryStatus[]; now: number }) {
           <li key={d.id} className="dl">
             <div className="dl-main">
               {CHANNEL_LABEL[d.channel] ?? d.channel} to <strong>{actorName(d.recipient)}</strong>
-              <span className="muted"> {d.address}</span>
+              <span className="muted"> {maskAddress(d.channel, d.address)}</span>
               {d.last_error && <div className="small err-text">{d.last_error}</div>}
             </div>
             <div className="dl-side">
