@@ -4,6 +4,7 @@ import type { AlertDetail as Detail, DeliveryStatus, FeedAlert, TimelineEntry } 
 import type { TransitionOp } from '../api/client'
 import { absTime, relTime } from '../lib/time'
 import { CheckIcon, CloseIcon, CopyIcon } from '../lib/icons'
+import { maskAddress } from '../lib/redact'
 import { actorName, colorToken, CountBadge, resolvedReasonText, resolvedText, SeverityBadge, STATUS_LABEL } from './badges'
 import { LIVE_STATES, Runbook } from './Runbook'
 
@@ -190,6 +191,7 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
         {detail && detail.samples.length > 0 && (
           <>
             <h4>Raw events</h4>
+            <p className="hint">Payloads are redacted server-side, but may still contain sensitive operational data.</p>
             {detail.samples.map((s) => (
               <details key={s.event_id} className="sample">
                 <summary>
@@ -278,7 +280,7 @@ function Deliveries({ items, now }: { items: DeliveryStatus[]; now: number }) {
           <li key={d.id} className="dl">
             <div className="dl-main">
               {CHANNEL_LABEL[d.channel] ?? d.channel} to <strong>{actorName(d.recipient)}</strong>
-              <span className="muted"> {d.address}</span>
+              <span className="muted"> {maskAddress(d.channel, d.address)}</span>
               {d.last_error && <div className="small err-text">{d.last_error}</div>}
             </div>
             <div className="dl-side">

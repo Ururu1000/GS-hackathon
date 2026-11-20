@@ -5,6 +5,7 @@
 // what the feed does.
 
 import type { DeliveryStatus, FeedAlert, PersonView, RuleSpec, TeamView } from '../src/api/types.ts'
+import { maskAddress } from '../src/lib/redact.ts'
 
 const pick = <T>(xs: readonly T[]): T => xs[Math.floor(Math.random() * xs.length)]!
 const int = (lo: number, hi: number) => lo + Math.floor(Math.random() * (hi - lo + 1))
@@ -379,7 +380,8 @@ export function deliveriesFor(a: FeedAlert, plan: DeliveryPlan, people: Map<stri
   return plan.map(([recipient, channel], i) => {
     const h = hash(a.id + i)
     const p = people.get(recipient.replace(/^user:/, ''))
-    const address = (channel === 'email' ? p?.contact.email : p?.contact.phone) ?? '—'
+    const rawAddress = (channel === 'email' ? p?.contact.email : p?.contact.phone) ?? '—'
+    const address = maskAddress(channel, rawAddress)
     const sendAt = opened + 1000 + (h % 2500)
     const base = { id: `dj_${a.id.slice(4)}_${i}`, recipient, channel, address }
     if (stopped && Date.parse(stopped) < sendAt)
