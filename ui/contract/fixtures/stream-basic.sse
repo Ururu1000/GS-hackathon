@@ -1,0 +1,36 @@
+retry: 1500
+
+: 1. snapshot replaces the client's page (2 alerts)
+event: snapshot
+data: {"team":null,"items":[{"id":"alt_01JB3Q8YQ5T0V7","team":"settlements","version":1,"rule":{"id":"settlements-workflow-failed","revision":3,"name":"Settlement workflow failed (prod)"},"status":"open","severity":"error","color":"red","title":"Workflow order-settlement failed at validate-counterparty","body":"TIMEOUT: Counterparty service did not respond in 5000 ms","fields":[{"path":"raw.workflowId","label":"Workflow ID","value":"WF-20251023-0042"},{"path":"raw.step","label":"Step","value":"validate-counterparty"},{"path":"raw.error.code","label":"Error code","value":"TIMEOUT"}],"count":1,"first_seen":"2026-10-23T09:14:02.331Z","last_seen":"2026-10-23T09:14:02.331Z","source":"kafka:workflows","schema":"workflow.failed","acked_by":null,"acked_at":null,"resolved_by":null,"resolved_at":null,"resolved_reason":null},{"id":"alt_01JB3Q7A2M4N8P","team":"payments","version":4,"rule":{"id":"payments-high-error-rate","revision":1,"name":"Payments API alerts (critical)"},"status":"open","severity":"critical","color":"red","title":"HighErrorRate on payments-api (eu-west)","body":"Error rate 12% over the last 5 minutes","fields":[{"path":"fields.service","label":"Service","value":"payments-api"},{"path":"raw.labels.region","label":"Region","value":"eu-west"}],"count":4,"first_seen":"2026-10-23T09:13:00.120Z","last_seen":"2026-10-23T09:13:58.900Z","source":"http:alertmanager","schema":"prometheus.alert","acked_by":null,"acked_at":null,"resolved_by":null,"resolved_at":null,"resolved_reason":null}],"next_cursor":null,"server_time":"2026-10-23T09:14:05.000Z"}
+
+: 2. new alert: insert at the top (first_seen is newest)
+event: alert.upsert
+data: {"id":"alt_01JB3Q9C0R2S4T","team":"rates","version":1,"rule":{"id":"rates-rejected-trades","revision":1,"name":"Rejected rates trades > 10M"},"status":"open","severity":"warning","color":"amber","title":"Rejected EUR 25,000,000 trade T-99877","body":"Reason: LIMIT_BREACH","fields":[{"path":"raw.payload.desk","label":"Desk","value":"rates"},{"path":"raw.payload.reason","label":"Reason","value":"LIMIT_BREACH"},{"path":"raw.meta.producer","label":"Producer","value":"trade-gateway"}],"count":1,"first_seen":"2026-10-23T09:14:02.400Z","last_seen":"2026-10-23T09:14:02.400Z","source":"kafka:trades","schema":"trade.rejected.v1","acked_by":null,"acked_at":null,"resolved_by":null,"resolved_at":null,"resolved_reason":null}
+
+: 3. dedup counter bump on the payments alert (v4 -> v5, count 37)
+event: alert.upsert
+data: {"id":"alt_01JB3Q7A2M4N8P","team":"payments","version":5,"rule":{"id":"payments-high-error-rate","revision":1,"name":"Payments API alerts (critical)"},"status":"open","severity":"critical","color":"red","title":"HighErrorRate on payments-api (eu-west)","body":"Error rate 12% over the last 5 minutes","fields":[{"path":"fields.service","label":"Service","value":"payments-api"},{"path":"raw.labels.region","label":"Region","value":"eu-west"}],"count":37,"first_seen":"2026-10-23T09:13:00.120Z","last_seen":"2026-10-23T09:14:06.200Z","source":"http:alertmanager","schema":"prometheus.alert","acked_by":null,"acked_at":null,"resolved_by":null,"resolved_at":null,"resolved_reason":null}
+
+: 4. late duplicate of v4: client holds v5, so it MUST drop this
+event: alert.upsert
+data: {"id":"alt_01JB3Q7A2M4N8P","team":"payments","version":4,"rule":{"id":"payments-high-error-rate","revision":1,"name":"Payments API alerts (critical)"},"status":"open","severity":"critical","color":"red","title":"HighErrorRate on payments-api (eu-west)","body":"Error rate 12% over the last 5 minutes","fields":[{"path":"fields.service","label":"Service","value":"payments-api"},{"path":"raw.labels.region","label":"Region","value":"eu-west"}],"count":4,"first_seen":"2026-10-23T09:13:00.120Z","last_seen":"2026-10-23T09:13:58.900Z","source":"http:alertmanager","schema":"prometheus.alert","acked_by":null,"acked_at":null,"resolved_by":null,"resolved_at":null,"resolved_reason":null}
+
+: 5. status change: acked by anna
+event: alert.upsert
+data: {"id":"alt_01JB3Q8YQ5T0V7","team":"settlements","version":2,"rule":{"id":"settlements-workflow-failed","revision":3,"name":"Settlement workflow failed (prod)"},"status":"acked","severity":"error","color":"red","title":"Workflow order-settlement failed at validate-counterparty","body":"TIMEOUT: Counterparty service did not respond in 5000 ms","fields":[{"path":"raw.workflowId","label":"Workflow ID","value":"WF-20251023-0042"},{"path":"raw.step","label":"Step","value":"validate-counterparty"},{"path":"raw.error.code","label":"Error code","value":"TIMEOUT"}],"count":1,"first_seen":"2026-10-23T09:14:02.331Z","last_seen":"2026-10-23T09:14:02.331Z","source":"kafka:workflows","schema":"workflow.failed","acked_by":"user:anna","acked_at":"2026-10-23T09:14:07.000Z","resolved_by":null,"resolved_at":null,"resolved_reason":null}
+
+: ping
+
+: 6. alert leaves the scope; remember version 2 for this id
+event: alert.remove
+data: {"id":"alt_01JB3Q9C0R2S4T","version":2,"reason":"out_of_scope"}
+
+: 7. delayed v1 of the removed alert: <= removal version 2, MUST be dropped (no resurrection)
+event: alert.upsert
+data: {"id":"alt_01JB3Q9C0R2S4T","team":"rates","version":1,"rule":{"id":"rates-rejected-trades","revision":1,"name":"Rejected rates trades > 10M"},"status":"open","severity":"warning","color":"amber","title":"Rejected EUR 25,000,000 trade T-99877","body":"Reason: LIMIT_BREACH","fields":[{"path":"raw.payload.desk","label":"Desk","value":"rates"},{"path":"raw.payload.reason","label":"Reason","value":"LIMIT_BREACH"},{"path":"raw.meta.producer","label":"Producer","value":"trade-gateway"}],"count":1,"first_seen":"2026-10-23T09:14:02.400Z","last_seen":"2026-10-23T09:14:02.400Z","source":"kafka:trades","schema":"trade.rejected.v1","acked_by":null,"acked_at":null,"resolved_by":null,"resolved_at":null,"resolved_reason":null}
+
+: 8. unknown event name (later milestone): clients MUST ignore it
+event: delivery.updated
+data: {"alert_id":"alt_01JB3Q8YQ5T0V7"}
+

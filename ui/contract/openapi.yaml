@@ -1,0 +1,353 @@
+openapi: 3.1.0
+info:
+  title: Beacon UI API
+  version: 0.1.0-m0
+  description: |
+    The part of the Beacon API that the React UI depends on (spec §8). Draft for
+    M0, proposed by the UI (erop-laptop/claude) for the backend to adopt.
+    The TypeScript mirror is `ui/src/api/types.ts`; the SSE fixtures are in
+    `ui/contract/fixtures/`. The dev mock (`ui/mock/`) implements this file.
+
+    ## Conventions
+    - **Timestamps:** RFC 3339 in UTC with millisecond precision and a `Z`
+      suffix, e.g. `2026-10-23T09:14:02.331Z`.
+    - **Field names:** snake_case. Enums are lower-case strings.
+    - **Alert `version`:** a per-alert, strictly increasing integer. Every
+      visible change (count bump, status change, re-render) bumps it. There is
+      no global ordering across alerts.
+    - **Feed order:** keyset `(first_seen, id)`, newest first. `first_seen`
+      never changes, so rows never move once shown.
+    - **Auth:** a same-origin session cookie (works with EventSource). Writes
+      must send `X-CSRF-Token` with the token from `GET /api/session`. M0 may
+      run with a fixed demo session.
+    - **Errors:** every non-2xx body is an `ApiError`.
+
+    ## SSE (`GET /api/stream`)
+    MVP recovery is a snapshot on every (re)connect, without `Last-Event-ID`:
+    1. The server subscribes and buffers live updates first, then reads the
+       authorized feed page from Postgres.
+    2. It sends `event: snapshot`, which **replaces** the client's page.
+    3. It drains the buffer, then streams `alert.upsert` (the full absolute
+       `FeedAlert`, never a delta) and `alert.remove`.
+    4. The client drops any upsert whose `version` is <= the version it holds
+       for that alert, or <= a removal version it saw for that id.
+    5. On overflow, a consumer gap or a rebalance the server closes the stream;
+       the browser reconnects (to any replica) and gets a fresh snapshot.
+    6. The server sends a `: ping` comment at least every 15 s, and sets
+       `Cache-Control: no-cache` and `X-Accel-Buffering: no`.
+    Events carry no `id:` field in the MVP. Resolved alerts stay in the feed as
+    upserts with `status: resolved`; `alert.remove` is for alerts that leave the
+    scope (deleted, expired, moved to another team).
+servers:
+  - url: /
+paths:
+  /api/session:
+    get:
+      operationId: getSession
+      summary: Current user, visible teams and the CSRF token
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+  /api/alerts:
+    get:
+      operationId: listAlerts
+      summary: Feed page (keyset, newest first)
+      description: |
+        The same projection the stream's `snapshot` carries. Filters are
+        optional and combine with AND; a repeated parameter means OR within
+        that filter (`status=open&status=acked`).
+      parameters:
+        - $ref: '#/components/parameters/Team'
+        - name: status
+          in: query
+          schema: { type: array, items: { $ref: '#/components/schemas/AlertStatus' } }
+          style: form
+          explode: true
+        - name: severity
+          in: query
+          schema: { type: array, items: { $ref: '#/components/schemas/Severity' } }
+          style: form
+          explode: true
+        - name: rule
+          in: query
+          description: Rule id(s).
+          schema: { type: array, items: { type: string } }
+          style: form
+          explode: true
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 5000, default: 500 }
+        - name: cursor
+          in: query
+          description: Opaque `next_cursor` from a previous page (older rows).
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeedPage' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+  /api/alerts/{id}:
+    get:
+      operationId: getAlert
+      summary: Alert detail
+      parameters: [ { $ref: '#/components/parameters/AlertId' } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertDetail' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/alerts/{id}/ack:
+    post:
+      operationId: ackAlert
+      summary: Acknowledge (open → acked)
+      description: |
+        Idempotent: acking an already acked alert returns 200 with the current
+        state. Acking a resolved alert is `409 invalid_transition`.
+      parameters: [ { $ref: '#/components/parameters/AlertId' }, { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Alert' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/alerts/{id}/resolve:
+    post:
+      operationId: resolveAlert
+      summary: Resolve (open | acked → resolved)
+      description: Idempotent on an already resolved alert.
+      parameters: [ { $ref: '#/components/parameters/AlertId' }, { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Alert' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/stream:
+    get:
+      operationId: streamAlerts
+      summary: 'SSE: snapshot | alert.upsert | alert.remove'
+      description: |
+        `text/event-stream`. See the protocol in the description at the top.
+        Event names and the JSON in each `data:` line:
+        - `snapshot` → `SnapshotEvent`
+        - `alert.upsert` → `FeedAlert`
+        - `alert.remove` → `RemoveEvent`
+        Later (not M0): `delivery.updated`, `approval.requested`. Clients must
+        ignore event names they don't know.
+      parameters: [ { $ref: '#/components/parameters/Team' } ]
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+              examples:
+                basic:
+                  externalValue: ./fixtures/stream-basic.sse
+components:
+  parameters:
+    Team:
+      name: team
+      in: query
+      description: Team id. Omitted = every team the session can see.
+      schema: { type: string }
+    AlertId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    Csrf:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema: { type: string }
+  responses:
+    Alert:
+      description: The alert after the transition
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/FeedAlert' }
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: |
+        `version_conflict`: the alert's status changed after
+        `expected_version` (count-only bumps never conflict).
+        `invalid_transition`: e.g. ack on a resolved alert.
+        Both include `error.current`, the alert as it is now.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+  schemas:
+    Severity:
+      type: string
+      enum: [critical, error, warning, info]
+    AlertStatus:
+      type: string
+      enum: [open, acked, resolved]
+    ColorToken:
+      type: string
+      description: Semantic colour from the rule's `present.color`. Unknown values render grey.
+      enum: [red, orange, amber, yellow, green, blue, purple, grey]
+    Timestamp:
+      type: string
+      format: date-time
+      examples: ['2026-10-23T09:14:02.331Z']
+    RuleRef:
+      type: object
+      required: [id, revision, name]
+      properties:
+        id: { type: string, examples: [rates-rejected-trades] }
+        revision: { type: integer, description: Rule revision the alert was opened and rendered under }
+        name: { type: string }
+    AlertField:
+      type: object
+      required: [path, label, value]
+      properties:
+        path: { type: string, examples: [raw.payload.desk] }
+        label: { type: string, examples: [Desk] }
+        value: { type: string, description: Rendered by the backend }
+    FeedAlert:
+      type: object
+      description: The feed projection. Rendered presentation is frozen at the opening rule revision; count, status and timestamps are live.
+      required: [id, team, version, rule, status, severity, color, title, body, fields, count, first_seen, last_seen, source, schema, acked_by, acked_at, resolved_by, resolved_at, resolved_reason]
+      properties:
+        id: { type: string, examples: [alt_01JB3Q8YQ5T0V7] }
+        team: { type: string }
+        version: { type: integer, minimum: 1 }
+        rule: { $ref: '#/components/schemas/RuleRef' }
+        status: { $ref: '#/components/schemas/AlertStatus' }
+        severity: { $ref: '#/components/schemas/Severity' }
+        color: { $ref: '#/components/schemas/ColorToken' }
+        title: { type: string, description: Plain text; the UI escapes it }
+        body: { type: string, description: Plain text; the UI escapes it }
+        fields: { type: array, items: { $ref: '#/components/schemas/AlertField' } }
+        count: { type: integer, minimum: 1, description: Dedup counter }
+        first_seen: { $ref: '#/components/schemas/Timestamp' }
+        last_seen: { $ref: '#/components/schemas/Timestamp' }
+        source: { type: string, examples: ['kafka:workflows'] }
+        schema: { type: string, examples: [workflow.failed] }
+        acked_by: { type: [string, 'null'] }
+        acked_at: { oneOf: [ { $ref: '#/components/schemas/Timestamp' }, { type: 'null' } ] }
+        resolved_by: { type: [string, 'null'] }
+        resolved_at: { oneOf: [ { $ref: '#/components/schemas/Timestamp' }, { type: 'null' } ] }
+        resolved_reason: { type: [string, 'null'], examples: [user, recovered, quiet_for] }
+    FeedPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/FeedAlert' } }
+        next_cursor: { type: [string, 'null'] }
+    EventSample:
+      type: object
+      required: [event_id, received_at, raw]
+      properties:
+        event_id: { type: string }
+        received_at: { $ref: '#/components/schemas/Timestamp' }
+        raw: { description: The original payload, untouched }
+    TimelineEntry:
+      type: object
+      required: [at, actor, kind, message]
+      properties:
+        at: { $ref: '#/components/schemas/Timestamp' }
+        actor: { type: string, examples: ['user:erop', system] }
+        kind:
+          type: string
+          description: Open set; render unknown kinds generically.
+          examples: [opened, deduplicated, acked, resolved, reopened, notified, step_run, approval, comment]
+        message: { type: string }
+    RunbookView:
+      type: object
+      description: Placeholder until M5 (runbooks).
+      required: [id, revision, title, format, steps]
+      properties:
+        id: { type: string }
+        revision: { type: integer }
+        title: { type: string }
+        format: { type: string, enum: [yaml, markdown, link, text] }
+        steps: { type: array, items: {} }
+    DeliveryStatus:
+      type: object
+      description: Placeholder until M4 (delivery).
+      required: [recipient, channel, state, updated_at]
+      properties:
+        recipient: { type: string }
+        channel: { type: string }
+        state: { type: string }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    AlertDetail:
+      allOf:
+        - { $ref: '#/components/schemas/FeedAlert' }
+        - type: object
+          required: [samples, runbook, deliveries, timeline]
+          properties:
+            samples: { type: array, items: { $ref: '#/components/schemas/EventSample' } }
+            runbook: { oneOf: [ { $ref: '#/components/schemas/RunbookView' }, { type: 'null' } ] }
+            deliveries: { type: array, items: { $ref: '#/components/schemas/DeliveryStatus' } }
+            timeline: { type: array, items: { $ref: '#/components/schemas/TimelineEntry' } }
+    TransitionRequest:
+      type: object
+      required: [expected_version]
+      properties:
+        expected_version: { type: integer }
+        note: { type: string, maxLength: 2000 }
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              examples: [version_conflict, invalid_transition, not_found, forbidden, csrf, bad_request, internal]
+            message: { type: string }
+            current: { $ref: '#/components/schemas/FeedAlert' }
+    Session:
+      type: object
+      required: [user, teams, csrf_token]
+      properties:
+        user:
+          type: object
+          required: [id, name]
+          properties: { id: { type: string }, name: { type: string } }
+        teams:
+          type: array
+          items:
+            type: object
+            required: [id, name]
+            properties: { id: { type: string }, name: { type: string } }
+        csrf_token: { type: string }
+    SnapshotEvent:
+      type: object
+      required: [team, items, next_cursor, server_time]
+      properties:
+        team: { type: [string, 'null'] }
+        items: { type: array, items: { $ref: '#/components/schemas/FeedAlert' } }
+        next_cursor: { type: [string, 'null'] }
+        server_time: { $ref: '#/components/schemas/Timestamp' }
+    RemoveEvent:
+      type: object
+      required: [id, version, reason]
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        reason: { type: string, enum: [deleted, out_of_scope, expired] }
