@@ -37,12 +37,13 @@
 //! - Errors: `{error: {code, message}}` with 400/401/404/413. 500s are always the fixed
 //!   `{code: "internal", message: "internal error"}` (the real error is logged, never leaked).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -51,7 +52,9 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tokio_stream::wrappers::BroadcastStream;
@@ -127,6 +130,14 @@ pub struct GatewayState {
     /// `Some` → the control endpoints require `Authorization: Bearer <token>`; `None` →
     /// no auth (dev; `serve` warns about it once).
     token: Option<String>,
+    /// M5b (agent C): where `POST /api/simulator/reply` forwards replies (`None` → the
+    /// endpoint answers `503 unavailable`).
+    reply_forward_url: Option<String>,
+    /// M5b (agent C): HMAC key for the forwarded replies' `X-Beacon-Signature`.
+    reply_secret: Option<Vec<u8>>,
+    /// M5b (agent B): mock action-target outcomes + call log (see the **Mock targets**
+    /// section of `crate::actions`). In-memory only, shared by every handler.
+    mocks: Arc<RwLock<MockState>>,
 }
 
 impl GatewayState {
@@ -137,6 +148,9 @@ impl GatewayState {
             outages: Arc::new(RwLock::new(HashMap::new())),
             tx,
             token: None,
+            reply_forward_url: None,
+            reply_secret: None,
+            mocks: Arc::new(RwLock::new(MockState::default())),
         }
     }
 
@@ -194,8 +208,21 @@ impl GatewayState {
 /// and `POST /api/simulator/reply`), for beacon-api to mount on its origin (board #171). The
 /// `/provider/*` and `/mock/*` routes stay on the gateway role.
 pub fn simulator_router(state: GatewayState) -> axum::Router {
-    let _ = state;
-    todo!("agent C")
+    axum::Router::new()
+        .route("/api/simulator/messages", get(messages_handler))
+        .route("/api/simulator/stream", get(stream_handler))
+        .route(
+            "/api/simulator/outage",
+            post(outage_post_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
+        .route("/api/simulator/outage", get(outage_get_handler))
+        .route("/api/simulator/outage", delete(outage_delete_handler))
+        .route(
+            "/api/simulator/reply",
+            post(simulator_reply_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
+        .fallback(fallback_404)
+        .with_state(state)
 }
 
 impl GatewayState {
@@ -203,14 +230,18 @@ impl GatewayState {
     /// `POST {url}/api/replies` with `X-Beacon-Signature: hex(hmac_sha256(secret, body))`.
     /// `None` → the reply endpoint answers `503 {error:{code:"unavailable"}}`.
     pub fn with_reply_forward(self, url: Option<String>, secret: Option<Vec<u8>>) -> Self {
-        let _ = (url, secret);
-        todo!("agent C")
+        Self {
+            reply_forward_url: url,
+            reply_secret: secret,
+            ..self
+        }
     }
 
-    /// M5b (agent B): base URL the gateway's own mock targets are reached at (for logs/tests);
+    /// M5b (agent B): reset the mock action targets (in-memory outcomes + call log);
     /// mock outcomes default to `ok`.
     pub fn with_mocks(self) -> Self {
-        todo!("agent B")
+        *self.mocks.write().expect("mock lock") = MockState::default();
+        self
     }
 }
 
@@ -231,6 +262,29 @@ pub fn router(state: GatewayState) -> axum::Router {
         )
         .route("/api/simulator/outage", get(outage_get_handler))
         .route("/api/simulator/outage", delete(outage_delete_handler))
+        // M5b (agent B): mock action targets + the mock control API. The health route
+        // is a wildcard so both `/mock/health/<name>` and deeper alias-mapped paths
+        // (e.g. `/mock/health/counterparty-service/health`) answer.
+        .route("/mock/health/{*rest}", get(mock_health_handler))
+        .route(
+            "/mock/workflows/{id}/retry",
+            post(mock_workflow_retry_handler),
+        )
+        .route(
+            "/mock/services/{name}/restart",
+            post(mock_service_restart_handler),
+        )
+        .route("/mock/tickets", post(mock_ticket_handler))
+        .route("/api/simulator/mock", get(mock_status_handler))
+        .route(
+            "/api/simulator/mock",
+            post(mock_set_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
+        // M5b (agent C): the fake phone's reply endpoint, forwarded to the delivery API.
+        .route(
+            "/api/simulator/reply",
+            post(simulator_reply_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
         .fallback(fallback_404)
         .with_state(state)
 }
@@ -794,6 +848,164 @@ async fn outage_delete_handler(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Simulator: SMS replies (agent C)
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /api/simulator/reply {from, text}` — the fake phone's reply path. Requires the
+/// gateway token like the other control endpoints; `from` is an E.164 phone, `text` at most
+/// one SMS segment. Forwards the exact request bytes to `{reply_forward_url}/api/replies`
+/// (signed with the reply secret) and relays that endpoint's status + JSON body.
+#[derive(Debug, Deserialize)]
+struct SimulatorReply {
+    from: String,
+    text: String,
+}
+
+async fn simulator_reply_handler(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Auth first, like the other simulator control endpoints.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    let reply: SimulatorReply = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("invalid JSON body: {e}"),
+            );
+        }
+    };
+    if reply.from.chars().count() > 32
+        || !reply
+            .from
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == ' ')
+        || !reply.from.chars().any(|c| c.is_ascii_digit())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "from must be an E.164 phone number (digits, optional +)",
+        );
+    }
+    if reply.text.contains('\0') {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "text must not contain NUL bytes",
+        );
+    }
+    if reply.text.trim().is_empty() || reply.text.chars().count() > 160 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "text must be 1..=160 chars",
+        );
+    }
+    // The reply is recorded as a `simulator.message`-style log line (no new table: receipts
+    // are for messages the provider accepts, a reply never becomes one).
+    tracing::info!(
+        from = %reply.from,
+        text = %reply.text,
+        "simulator.message: sms reply accepted"
+    );
+
+    let (Some(forward_url), Some(secret)) = (
+        state.reply_forward_url.as_deref(),
+        state.reply_secret.as_deref(),
+    ) else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "no delivery API configured to receive SMS replies",
+        );
+    };
+
+    // Sign the exact bytes we forward, so `/api/replies` verifies what it reads.
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(&body);
+    let signature = hex::encode(mac.finalize().into_bytes());
+
+    // No redirects, 5 s timeout: a broken delivery API must not park the simulator.
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "cannot build the reply forwarding http client");
+            return internal_error_response();
+        }
+    };
+    let url = format!("{}/api/replies", forward_url.trim_end_matches('/'));
+    let forwarded = client
+        .post(&url)
+        .header("X-Beacon-Signature", signature)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body.as_ref().to_vec())
+        .send()
+        .await;
+
+    let mut resp = match forwarded {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(url = %url, error = %e, "cannot forward the simulator reply");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "cannot reach the delivery API to forward this reply",
+            );
+        }
+    };
+    let status = match StatusCode::from_u16(resp.status().as_u16()) {
+        Ok(s) => s,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the delivery API answered with an invalid status",
+            );
+        }
+    };
+    // The relayed body is bounded (4 KiB): a hostile or broken upstream must not be buffered
+    // whole.
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < FORWARD_BODY_MAX_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = FORWARD_BODY_MAX_BYTES - buf.len();
+                if chunk.len() > room {
+                    buf.extend_from_slice(&chunk[..room]);
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    match serde_json::from_slice::<serde_json::Value>(&buf) {
+        Ok(value) => (status, Json(value)).into_response(),
+        Err(e) => {
+            warn!(url = %url, error = %e, "the delivery API did not answer with JSON");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the delivery API did not answer with JSON",
+            )
+        }
+    }
+}
+
+// Cap on the bytes read from the delivery API's relayed response (its bodies are tiny).
+const FORWARD_BODY_MAX_BYTES: usize = 4096;
+
+// ---------------------------------------------------------------------------------------------
 // Base64 (standard alphabet; decode also accepts URL-safe chars and missing padding so that
 // cursors survive query-string round trips).
 // ---------------------------------------------------------------------------------------------
@@ -855,6 +1067,214 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let unpadded = s.bytes().filter(|&b| b != b'=').count();
     out.truncate(unpadded * 6 / 8);
     Some(out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mock action targets (M5b, agent B; owned by `crate::actions`)
+// ---------------------------------------------------------------------------------------------
+
+/// Outcome of one mock target. `Default` (and any unset target) is `ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MockMode {
+    #[default]
+    Ok,
+    Fail,
+}
+
+impl MockMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            MockMode::Ok => "ok",
+            MockMode::Fail => "fail",
+        }
+    }
+}
+
+/// One recorded mock-target call, oldest first in `GET /api/simulator/mock`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MockCall {
+    /// `workflows` | `services` | `health` | `tickets`.
+    target: String,
+    method: String,
+    path: String,
+    at: DateTime<Utc>,
+}
+
+/// In-memory mock state: per-target outcomes + the call log. Modes default to `ok`.
+#[derive(Debug, Clone, Default)]
+struct MockState {
+    modes: HashMap<String, MockMode>,
+    calls: VecDeque<MockCall>,
+}
+
+/// The call log is bounded; the oldest entries drop first.
+const MAX_MOCK_CALLS: usize = 5000;
+
+fn is_mock_target(target: &str) -> bool {
+    matches!(target, "workflows" | "services" | "health" | "tickets")
+}
+
+/// Record one mock call and return that target's current mode (`ok` when unset).
+fn record_mock_call(state: &GatewayState, target: &str, method: &str, path: &str) -> MockMode {
+    let mut mocks = state.mocks.write().expect("mock lock");
+    while mocks.calls.len() >= MAX_MOCK_CALLS {
+        mocks.calls.pop_front();
+    }
+    mocks.calls.push_back(MockCall {
+        target: target.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        at: Utc::now(),
+    });
+    mocks.modes.get(target).copied().unwrap_or_default()
+}
+
+/// Every mock failure is the same body: `500 {"error": "mock failure"}`.
+fn mock_failure_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "mock failure" })),
+    )
+        .into_response()
+}
+
+async fn mock_health_handler(
+    State(state): State<GatewayState>,
+    Path(name): Path<String>,
+) -> Response {
+    let mode = record_mock_call(&state, "health", "GET", &format!("/mock/health/{name}"));
+    match mode {
+        MockMode::Ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "healthy" })),
+        )
+            .into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+async fn mock_workflow_retry_handler(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    _body: Bytes,
+) -> Response {
+    let mode = record_mock_call(
+        &state,
+        "workflows",
+        "POST",
+        &format!("/mock/workflows/{id}/retry"),
+    );
+    match mode {
+        MockMode::Ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "workflow": id })),
+        )
+            .into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+async fn mock_service_restart_handler(
+    State(state): State<GatewayState>,
+    Path(name): Path<String>,
+    _body: Bytes,
+) -> Response {
+    let mode = record_mock_call(
+        &state,
+        "services",
+        "POST",
+        &format!("/mock/services/{name}/restart"),
+    );
+    match mode {
+        MockMode::Ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "service": name })),
+        )
+            .into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+async fn mock_ticket_handler(State(state): State<GatewayState>, _body: Bytes) -> Response {
+    let mode = record_mock_call(&state, "tickets", "POST", "/mock/tickets");
+    match mode {
+        MockMode::Ok => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MockSetRequest {
+    target: String,
+    mode: String,
+}
+
+/// Switch one mock target's outcome. Needs the gateway token exactly like the outage
+/// control endpoints; unknown targets and modes are `400 bad_request`.
+async fn mock_set_handler(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Result<Json<MockSetRequest>, JsonRejection>,
+) -> Response {
+    // Auth first, like the outage control endpoints.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(e) => return json_rejection_response(e),
+    };
+    if !is_mock_target(&req.target) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!(
+                "unknown mock target {:?}; expected workflows|services|health|tickets",
+                req.target
+            ),
+        );
+    }
+    let mode = match req.mode.as_str() {
+        "ok" => MockMode::Ok,
+        "fail" => MockMode::Fail,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("unknown mock mode {:?}; expected ok|fail", req.mode),
+            );
+        }
+    };
+    state
+        .mocks
+        .write()
+        .expect("mock lock")
+        .modes
+        .insert(req.target.clone(), mode);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "target": req.target, "mode": mode.as_str() })),
+    )
+        .into_response()
+}
+
+/// `GET /api/simulator/mock` → `{modes, calls}`. Open (no auth), like the other
+/// simulator read endpoints.
+async fn mock_status_handler(State(state): State<GatewayState>) -> Response {
+    let mocks = state.mocks.read().expect("mock lock");
+    let mode_of = |target: &str| mocks.modes.get(target).copied().unwrap_or_default();
+    let modes = serde_json::json!({
+        "workflows": mode_of("workflows"),
+        "services": mode_of("services"),
+        "health": mode_of("health"),
+        "tickets": mode_of("tickets"),
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "modes": modes, "calls": mocks.calls })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

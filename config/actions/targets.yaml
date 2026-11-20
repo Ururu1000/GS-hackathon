@@ -1,0 +1,14 @@
+# `config/actions/targets.yaml` — alias → base URL for the `http_get` runbook action.
+#
+# Format:
+#   targets:
+#     <alias>: <base_url>      # the runbook step's `http://<alias>/<path>` maps here:
+#                              # the alias base REPLACES `http://<alias>` and the rest of the
+#                              # path is appended, unless the base already ends with that path.
+#                              # Only `http://<alias>/...` URLs map; any other host is refused
+#                              # ("target not allowed") without a request being made.
+#
+# Example: the step `url: "http://counterparty-service/health"` reaches the gateway's
+# mock `GET /mock/health/counterparty-service/health`.
+targets:
+  counterparty-service: "http://localhost:8070/mock/health/counterparty-service"

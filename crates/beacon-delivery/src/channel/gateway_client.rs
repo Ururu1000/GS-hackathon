@@ -175,6 +175,37 @@ fn render_phone(severity: &str, title: &str) -> String {
     )
 }
 
+/// The approval prompt an sms job with `route_info.approval` renders to, instead of the
+/// normal link text:
+/// `[SEV] Approve <action> for <title>? Reply "Y <code>" to approve, "N <code>" to reject.`
+/// The title is truncated first (with `…`, on a char boundary) so the whole text stays
+/// within [`SMS_MAX_CHARS`]; with no room for a title at all the question becomes a colon.
+fn render_approval_sms(severity: &str, action: &str, title: &str, code: &str) -> String {
+    let prefix = format!("[{}] Approve {} for ", severity_abbr(severity), action);
+    let suffix = format!("? Reply \"Y {code}\" to approve, \"N {code}\" to reject.");
+    let fixed = prefix.chars().count() + suffix.chars().count();
+    let budget = SMS_MAX_CHARS.saturating_sub(fixed);
+    if budget > 1 && title.chars().count() > budget {
+        let title_out = format!("{}…", title.chars().take(budget - 1).collect::<String>());
+        format!("{prefix}{title_out}{suffix}")
+    } else if title.chars().count() <= budget {
+        format!("{prefix}{title}{suffix}")
+    } else {
+        // No room for the title: keep the instruction, lead with a colon.
+        let bare = format!(
+            "[{}] Approve {}: Reply \"Y {code}\" to approve, \"N {code}\" to reject.",
+            severity_abbr(severity),
+            action
+        );
+        // Paranoia bound (a pathological action name): never exceed the segment.
+        if bare.chars().count() > SMS_MAX_CHARS {
+            format!("{}…", bare.chars().take(SMS_MAX_CHARS - 1).collect::<String>())
+        } else {
+            bare
+        }
+    }
+}
+
 /// Map a `reqwest` transport error to a [`SendError`]: connection-level failures are transient,
 /// timeouts after the request was sent are ambiguous (the provider may have accepted it).
 fn classify_reqwest_error(e: &reqwest::Error) -> SendError {
@@ -278,9 +309,14 @@ impl Channel for GatewayChannel {
     }
 
     /// SMS: `[SEV] <title> <public_url>/a/<alert_id>`, title truncated (with `…`) so the whole
-    /// text is <= SMS_MAX_CHARS chars; SEV = CRIT|ERR|WARN|INFO. Phone: a short TTS script,
-    /// e.g. "Beacon alert. Severity critical. <title>. Details were sent to the Beacon app."
-    /// `subject` is empty for both.
+    /// text is <= SMS_MAX_CHARS chars; SEV = CRIT|ERR|WARN|INFO. An sms job carrying
+    /// `route_info.approval` (an approval prompt) instead renders
+    /// `[SEV] Approve <action> for <title>? Reply "Y <code>" to approve, "N <code>" to reject.`
+    /// and puts the provider's challenge (`Y <code>`) in `subject`, which is otherwise unused
+    /// on this channel — `send` copies it into `ProviderRequest.approval_challenge` (the
+    /// `Channel`/`OutboundMessage` contract has no dedicated field). Phone: a short TTS
+    /// script, e.g. "Beacon alert. Severity critical. <title>. Details were sent to the
+    /// Beacon app." Phone jobs never carry approvals. `subject` is otherwise empty.
     fn render(&self, alert: &AlertView, job: &DeliveryJob) -> OutboundMessage {
         let mut msg = OutboundMessage {
             job_id: job.id,
@@ -291,15 +327,34 @@ impl Channel for GatewayChannel {
             subject: String::new(),
             body: String::new(),
         };
-        msg.body = match self.kind {
-            GatewayKind::Sms => render_sms(
-                &alert.severity,
-                &alert.title,
-                &job.alert_id,
-                &self.cfg.public_url,
-            ),
-            GatewayKind::Phone => render_phone(&alert.severity, &alert.title),
-        };
+        // An approval prompt rides only on sms jobs, and only with a code; phone jobs never
+        // carry approvals.
+        if self.kind == GatewayKind::Sms
+            && let Some(approval) = job.route_info.get("approval").filter(|a| a.is_object())
+            && let Some(code) = approval
+                .get("code")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+        {
+            let action = approval
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("action");
+            msg.body = render_approval_sms(&alert.severity, action, &alert.title, code);
+            // The provider challenge (`Y <code>`) travels in `subject`, otherwise unused on
+            // this channel: `send` copies it into `ProviderRequest.approval_challenge`.
+            msg.subject = format!("Y {code}");
+        } else {
+            msg.body = match self.kind {
+                GatewayKind::Sms => render_sms(
+                    &alert.severity,
+                    &alert.title,
+                    &job.alert_id,
+                    &self.cfg.public_url,
+                ),
+                GatewayKind::Phone => render_phone(&alert.severity, &alert.title),
+            };
+        }
         msg
     }
 
@@ -310,13 +365,19 @@ impl Channel for GatewayChannel {
                 self.cfg.base_url.trim_end_matches('/'),
                 self.kind.as_str()
             );
+            // For approval prompts (sms only) `render` stashed the provider's challenge in
+            // `subject`; phone jobs never carry one.
+            let approval_challenge = match self.kind {
+                GatewayKind::Sms if !msg.subject.is_empty() => Some(msg.subject.clone()),
+                _ => None,
+            };
             let req_body = ProviderRequest {
                 job_id: msg.job_id,
                 alert_id: msg.alert_id,
                 recipient: format!("user:{}", msg.recipient_id),
                 to: msg.address.clone(),
                 text: msg.body.clone(),
-                approval_challenge: None,
+                approval_challenge,
             };
             let mut request = self
                 .client
@@ -500,6 +561,109 @@ mod tests {
             "phone script must not contain a URL: {}",
             msg.body
         );
+    }
+
+    #[test]
+    fn approval_sms_renders_prompt_and_carries_the_challenge() {
+        let ch = sms_channel();
+        let alert_id = Uuid::new_v4();
+        let mut with_approval = job(Uuid::new_v4(), alert_id);
+        with_approval.route_info = serde_json::json!({
+            "target": "approval",
+            "approval": { "id": Uuid::new_v4(), "code": "4821", "step_id": "s3",
+                          "action": "escalate" },
+        });
+        let alert = AlertView {
+            id: alert_id,
+            status: "open".to_string(),
+            severity: "critical".to_string(),
+            title: "Settlement workflow wf-9 failed".to_string(),
+            body: "b".to_string(),
+        };
+        let msg = ch.render(&alert, &with_approval);
+        assert_eq!(
+            msg.body,
+            "[CRIT] Approve escalate for Settlement workflow wf-9 failed? \
+             Reply \"Y 4821\" to approve, \"N 4821\" to reject."
+        );
+        // `subject` is the channel's out-of-band carriage for the provider challenge.
+        assert_eq!(msg.subject, "Y 4821");
+        assert!(msg.body.chars().count() <= SMS_MAX_CHARS);
+        assert!(!msg.body.contains("/a/"), "prompt replaces the link text");
+
+        // A long title is truncated first (with `…`), never the instruction.
+        let alert = AlertView {
+            id: alert_id,
+            status: "open".to_string(),
+            severity: "warning".to_string(),
+            title: "x".repeat(120),
+            body: "b".to_string(),
+        };
+        let msg = ch.render(&alert, &with_approval);
+        assert!(msg.body.contains('…'), "title truncation: {}", msg.body);
+        assert!(
+            msg.body.contains("Approve escalate for "),
+            "prefix survives: {}",
+            msg.body
+        );
+        assert!(
+            msg.body.contains("Reply \"Y 4821\" to approve, \"N 4821\" to reject."),
+            "instruction must survive: {}",
+            msg.body
+        );
+        assert!(msg.body.chars().count() <= SMS_MAX_CHARS);
+
+        // A gigantic action name leaves no room for the title at all: the question becomes
+        // a colon and the instruction still fits the segment.
+        let mut huge_action = job(Uuid::new_v4(), alert_id);
+        huge_action.route_info = serde_json::json!({
+            "target": "approval",
+            "approval": { "id": Uuid::new_v4(), "code": "4821", "step_id": "s3",
+                          "action": "x".repeat(95) },
+        });
+        let msg = ch.render(&alert, &huge_action);
+        assert!(
+            msg.body.contains(": Reply \"Y 4821\" to approve, \"N 4821\" to reject."),
+            "colon fallback: {}",
+            msg.body
+        );
+        assert!(!msg.body.contains(" for "), "no title fit: {}", msg.body);
+        assert!(msg.body.chars().count() <= SMS_MAX_CHARS);
+        assert_eq!(msg.subject, "Y 4821");
+    }
+
+    #[test]
+    fn approval_route_info_is_ignored_on_phone_and_codeless_sms() {
+        let ch = GatewayChannel::new(GatewayKind::Phone, GatewayClientConfig::default())
+            .expect("build phone channel");
+        let alert_id = Uuid::new_v4();
+        let mut with_approval = job(Uuid::new_v4(), alert_id);
+        with_approval.route_info = serde_json::json!({
+            "target": "approval",
+            "approval": { "id": Uuid::new_v4(), "code": "4821", "step_id": "s3",
+                          "action": "escalate" },
+        });
+        let alert = AlertView {
+            id: alert_id,
+            status: "open".to_string(),
+            severity: "critical".to_string(),
+            title: "DB down".to_string(),
+            body: "b".to_string(),
+        };
+        let msg = ch.render(&alert, &with_approval);
+        assert_eq!(msg.subject, "", "phone jobs never carry approvals");
+        assert!(msg.body.starts_with("Beacon alert."), "TTS script: {}", msg.body);
+
+        // An sms approval object without a code is not a prompt (defensive).
+        let ch = sms_channel();
+        let mut codeless = job(Uuid::new_v4(), alert_id);
+        codeless.route_info = serde_json::json!({
+            "target": "approval",
+            "approval": { "id": Uuid::new_v4(), "step_id": "s3", "action": "escalate" },
+        });
+        let msg = ch.render(&alert, &codeless);
+        assert_eq!(msg.subject, "");
+        assert!(msg.body.ends_with(&format!("/a/{alert_id}")), "{}", msg.body);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+# Team Rates: a link runbook (SPEC §6.1): stored, never fetched server-side.
+runbook: trade-rejected
+title: Rejected trades (wiki)
+url: https://wiki.example.test/rates/trade-rejected
+team: rates
