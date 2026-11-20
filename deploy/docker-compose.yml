@@ -1,0 +1,49 @@
+# Infrastructure for local development and the demo.
+#   docker compose -f deploy/docker-compose.yml up -d
+# Redpanda (Kafka API): localhost:19092   Postgres: localhost:5432 (beacon/beacon/beacon)
+# Mailpit: SMTP localhost:1025, inbox UI http://localhost:8025
+
+name: beacon
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.2.10
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=2
+      - --memory=2G
+      - --overprovisioned
+      - --default-log-level=warn
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  postgres:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_DB: beacon
+      POSTGRES_USER: beacon
+      POSTGRES_PASSWORD: beacon
+    command: ["postgres", "-c", "max_connections=200", "-c", "synchronous_commit=on", "-c", "shared_buffers=512MB"]
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beacon -d beacon"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "1025:1025"
+      - "8025:8025"
