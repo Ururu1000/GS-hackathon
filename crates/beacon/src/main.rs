@@ -17,6 +17,9 @@
 //! | `MATCHER_WORKERS`    | `2` (consumers in the matcher group)      | matcher           |
 //! | `AGGREGATOR_WORKERS` | `2` (consumers in the aggregator group)   | aggregator        |
 //! | `RELAY_WORKERS`      | `1`                                       | relay             |
+//! | `API_ADDR`           | `0.0.0.0:8080`                            | api               |
+//! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
+//! | `BEACON_UI_DIR`      | `ui/dist` if it exists (static UI)        | api               |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,13 +44,15 @@ enum Role {
     Aggregator,
     /// outbox 'alert_update' rows -> alerts.updates (part a)
     Relay,
+    /// REST + SSE for the UI, serves the built UI (beacon-api)
+    Api,
     /// outbox 'notify' rows -> delivery_jobs (part b)
     Router,
     /// channel workers: delivery_jobs -> email (part b)
     Delivery,
 }
 
-const ROLES: &str = "ingest, sources, matcher, aggregator, relay, router, delivery";
+const ROLES: &str = "ingest, sources, matcher, aggregator, relay, api, router, delivery";
 
 impl Role {
     fn parse(s: &str) -> Result<Self> {
@@ -57,6 +62,7 @@ impl Role {
             "matcher" => Self::Matcher,
             "aggregator" => Self::Aggregator,
             "relay" => Self::Relay,
+            "api" => Self::Api,
             "router" => Self::Router,
             "delivery" => Self::Delivery,
             other => bail!("unknown role {other:?} (known: {ROLES})"),
@@ -64,7 +70,7 @@ impl Role {
     }
 
     fn uses_kafka(self) -> bool {
-        matches!(self, Self::Ingest | Self::Sources | Self::Matcher | Self::Aggregator | Self::Relay)
+        matches!(self, Self::Ingest | Self::Sources | Self::Matcher | Self::Aggregator | Self::Relay | Self::Api)
     }
 }
 
@@ -226,6 +232,44 @@ async fn main() -> Result<()> {
                         beacon_engine::aggregator::run_aggregator(kafka.clone(), pool.clone(), rx.clone())
                     }));
                 }
+            }
+            Role::Api => {
+                let addr = env_or("API_ADDR", "0.0.0.0:8080");
+                let session = std::sync::Arc::new(
+                    beacon_api::Session::demo(&config_dir, &env_or("BEACON_DEMO_USER", "anna"))
+                        .context("building the demo session from config/people and config/teams")?,
+                );
+                let (updates, _) = tokio::sync::broadcast::channel(beacon_api::feed::CHANNEL_CAPACITY);
+                let (ready_tx, ready) = tokio::sync::watch::channel(false);
+                let ui_dir = std::env::var("BEACON_UI_DIR")
+                    .map(PathBuf::from)
+                    .ok()
+                    .or_else(|| Some(PathBuf::from("ui/dist")).filter(|p| p.join("index.html").exists()));
+                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session };
+                let app = beacon_api::router(state, ui_dir.clone());
+                let listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .with_context(|| format!("binding {addr}"))?;
+                info!(%addr, ui = ?ui_dir, "api listening");
+                {
+                    let (kafka, rx) = (kafka.clone(), shutdown_rx.clone());
+                    let ready_tx = std::sync::Arc::new(ready_tx);
+                    tasks.spawn(supervise("api-feed", rx.clone(), move || {
+                        let ready_tx = (*ready_tx).clone();
+                        beacon_api::feed::run_feed(kafka.clone(), updates.clone(), ready_tx, rx.clone())
+                    }));
+                }
+                let mut rx = shutdown_rx.clone();
+                tasks.spawn(async move {
+                    let served = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            let _ = rx.changed().await;
+                        })
+                        .await;
+                    if let Err(e) = served {
+                        tracing::error!(error = %e, "api server failed");
+                    }
+                });
             }
             Role::Relay => {
                 for _ in 0..workers("RELAY_WORKERS", "1")? {
