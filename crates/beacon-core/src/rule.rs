@@ -107,6 +107,11 @@ pub struct AutoResolveSpec {
     pub quiet_for: Option<Duration>,
 }
 
+/// Caps that keep a match far below the Kafka record limit (each copied value
+/// is also capped at 4 KiB in the matcher).
+pub const MAX_FIELDS: usize = 32;
+pub const MAX_DEDUP_KEY: usize = 8;
+
 pub const COLORS: &[&str] = &["red", "orange", "amber", "yellow", "green", "blue", "purple", "grey"];
 
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +154,8 @@ pub enum RuleError {
     Route { rule: String, to: String },
     #[error("rule id must be non-empty and use [a-z0-9-_.]")]
     BadId,
+    #[error("rule `{rule}`: at most {MAX_FIELDS} presented fields and {MAX_DEDUP_KEY} dedup key paths")]
+    TooMany { rule: String },
 }
 
 /// A rule ready to run: conditions compiled, paths parsed. Templates live in
@@ -172,6 +179,9 @@ impl CompiledRule {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.".contains(c))
         {
             return Err(RuleError::BadId);
+        }
+        if spec.present.fields.len() > MAX_FIELDS || spec.dedup.key.len() > MAX_DEDUP_KEY {
+            return Err(RuleError::TooMany { rule });
         }
         let when = Condition::compile(&spec.when).map_err(|source| RuleError::When {
             rule: rule.clone(),
