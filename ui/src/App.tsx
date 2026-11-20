@@ -177,19 +177,17 @@ export function App() {
   return (
     <div className={`app ${selected ? 'has-detail' : ''}`}>
       <header className="topbar">
-        <div className="brand">
-          <span className="logo" aria-hidden="true" />
-          Beacon
-        </div>
-        <label className="team-pick">
+        <div className="brand">Beacon</div>
+        <label>
           <span className="sr-only">Team</span>
-          <select value={team ?? ''} onChange={(e) => changeTeam(e.target.value || null)}>
+          <select className="select" value={team ?? ''} onChange={(e) => changeTeam(e.target.value || null)}>
             <option value="">All teams</option>
             {session?.teams.map((t) => (
               <option key={t.id} value={t.id}>{t.name}</option>
             ))}
           </select>
         </label>
+        <div className="spacer" />
         <div className={`conn conn-${connection}`} role="status" title={state.snapshotAt ? `Last snapshot ${new Date(state.snapshotAt).toLocaleTimeString()}. ${state.stats.upserts.toLocaleString()} updates applied, ${state.stats.stale} stale updates dropped.` : undefined}>
           <span className="conn-dot" aria-hidden="true" />
           {CONNECTION_LABEL[connection]}
@@ -266,7 +264,7 @@ export function App() {
               <dt><kbd>Esc</kbd></dt><dd>Close the detail</dd>
               <dt><kbd>?</kbd></dt><dd>This help</dd>
             </dl>
-            <button className="btn" onClick={() => setHelp(false)} autoFocus>Close</button>
+            <button className="btn btn-primary" onClick={() => setHelp(false)} autoFocus>Close</button>
           </div>
         </div>
       )}

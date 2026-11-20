@@ -1,6 +1,6 @@
 import { forwardRef } from 'react'
 import { SEVERITIES, STATUSES, type AlertStatus, type Severity } from '../api/types'
-import { SEVERITY_LABEL, STATUS_LABEL } from '../alert/badges'
+import { SEVERITY_LABEL, SeverityIcon, STATUS_LABEL } from '../alert/badges'
 import type { Filters } from './filters'
 
 interface Props {
@@ -45,13 +45,14 @@ export const FilterBar = forwardRef<HTMLInputElement, Props>(function FilterBar(
             aria-pressed={filters.severity.has(s)}
             onClick={() => onChange({ ...filters, severity: toggle(filters.severity, s) })}
           >
+            <SeverityIcon severity={s} size={13} />
             {SEVERITY_LABEL[s]} <span className="chip-n">{counts.severity[s]}</span>
           </button>
         ))}
       </fieldset>
       <label className="field">
         <span className="field-label">Rule</span>
-        <select value={filters.rule} onChange={(e) => onChange({ ...filters, rule: e.target.value })}>
+        <select className="select" value={filters.rule} onChange={(e) => onChange({ ...filters, rule: e.target.value })}>
           <option value="">All rules</option>
           {[...counts.rules.entries()]
             .sort((a, b) => a[1].name.localeCompare(b[1].name))
@@ -66,9 +67,10 @@ export const FilterBar = forwardRef<HTMLInputElement, Props>(function FilterBar(
       <label className="field field-grow">
         <span className="field-label">Search</span>
         <input
+          className="input"
           ref={searchRef}
           type="search"
-          placeholder="Title, body or field value"
+          placeholder="Search title, body or field value  /"
           value={filters.query}
           onChange={(e) => onChange({ ...filters, query: e.target.value })}
           onKeyDown={(e) => {

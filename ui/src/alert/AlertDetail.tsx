@@ -61,39 +61,36 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
 
   return (
     <article className={`detail tok-${colorToken(a.color)}`} aria-labelledby="detail-title">
-      <header className="card">
-        <div className="card-stripe" aria-hidden="true" />
-        <div className="card-main">
-          <div className="card-top">
-            <SeverityBadge severity={a.severity} />
-            <StatusPill alert={a} />
-            <CountBadge count={a.count} />
-            <button className="icon-btn close" onClick={onClose} aria-label="Close detail (Esc)" title="Close (Esc)">
-              ✕
-            </button>
-          </div>
-          <h2 id="detail-title" ref={headingRef} tabIndex={-1}>
-            {a.title}
-          </h2>
-          {a.body && <p className="card-body">{a.body}</p>}
-          <div className="actions">
-            <button
-              className="btn btn-ack"
-              disabled={a.status !== 'open' || pending !== null}
-              onClick={() => onAct('ack')}
-              aria-keyshortcuts="a"
-            >
-              {pending === 'ack' ? 'Acknowledging…' : 'Acknowledge'} <kbd>a</kbd>
-            </button>
-            <button
-              className="btn btn-resolve"
-              disabled={a.status === 'resolved' || pending !== null}
-              onClick={() => onAct('resolve')}
-              aria-keyshortcuts="r"
-            >
-              {pending === 'resolve' ? 'Resolving…' : 'Resolve'} <kbd>r</kbd>
-            </button>
-          </div>
+      <header className="head">
+        <div className="head-top">
+          <SeverityBadge severity={a.severity} withLabel />
+          <StatusPill alert={a} />
+          <CountBadge count={a.count} />
+          <button className="icon-btn close" onClick={onClose} aria-label="Close detail (Esc)" title="Close (Esc)">
+            ✕
+          </button>
+        </div>
+        <h2 id="detail-title" ref={headingRef} tabIndex={-1}>
+          {a.title}
+        </h2>
+        {a.body && <p className="head-body">{a.body}</p>}
+        <div className="actions">
+          <button
+            className="btn btn-primary"
+            disabled={a.status !== 'open' || pending !== null}
+            onClick={() => onAct('ack')}
+            aria-keyshortcuts="a"
+          >
+            {pending === 'ack' ? 'Acknowledging…' : 'Acknowledge'} <kbd>a</kbd>
+          </button>
+          <button
+            className="btn"
+            disabled={a.status === 'resolved' || pending !== null}
+            onClick={() => onAct('resolve')}
+            aria-keyshortcuts="r"
+          >
+            {pending === 'resolve' ? 'Resolving…' : 'Resolve'} <kbd>r</kbd>
+          </button>
         </div>
       </header>
 

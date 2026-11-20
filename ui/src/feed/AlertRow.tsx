@@ -21,18 +21,19 @@ export const AlertRow = memo(function AlertRow({ alert: a, selected, fresh, now,
       className={`row tok-${colorToken(a.color)} ${a.status === 'resolved' ? 'is-resolved' : ''} ${selected ? 'is-selected' : ''} ${fresh ? 'is-fresh' : ''}`}
       onClick={() => onSelect(a.id)}
     >
-      <div className="row-stripe" aria-hidden="true" />
+      <SeverityBadge severity={a.severity} />
       <div className="row-main">
-        <div className="row-top">
-          <SeverityBadge severity={a.severity} />
-          <span className="row-title">{a.title}</span>
+        <div className="row-title">
+          <span className="row-title-text">{a.title}</span>
+          <StatusPill alert={a} quiet />
         </div>
-        <div className="row-body">{a.body}</div>
-        <div className="row-meta">{a.rule.name}</div>
+        <div className="row-sub">
+          <span className="row-body">{a.body}</span>
+          <span className="row-rule">{a.rule.name}</span>
+        </div>
       </div>
       <div className="row-side">
         <CountBadge count={a.count} />
-        <StatusPill alert={a} />
         <span className="row-last" title={`Last event ${a.last_seen}`}>
           {relTime(a.last_seen, now)}
         </span>
