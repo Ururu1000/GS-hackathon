@@ -45,3 +45,25 @@ Setup:
 - **Caveats:**
   - Delivery roles were not running in these runs.
   - The UI/SSE hop is not included yet.
+
+## Scenario e: kill the engine mid-run (exact counts)
+
+Setup:
+- Ingest, relay and API run in one process.
+- Matcher and aggregator run in a second process: 4 matcher workers and 4 aggregator workers.
+- 10,000 events/s for 25 s, keys namespaced per run.
+- About 10 s into the run, the matcher/aggregator process is killed with `kill -9` and restarted 2 s later.
+
+| Measure | Value |
+|---|---|
+| Events accepted (202) | 250,000 |
+| Matching events accepted | 199,999 |
+| Sum of alert counts after drain | **200,000** (199,999 + 1 warm-up probe) |
+| Lost or double-counted | **0** |
+| Processing gap after the kill | about 10 s (open Kafka transaction timeout) |
+
+How this works:
+- **Matcher:** it produces matches and commits its `events.raw` offsets in one Kafka transaction.
+- **Aggregator:** it advances an epoch-fenced checkpoint in the same Postgres transaction as its alert writes, and skips anything below the checkpoint on replay.
+
+Latency percentiles in this run include the crash and the recovery, so they are not comparable with the steady-state rows above.
