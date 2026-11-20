@@ -1,0 +1,18 @@
+{
+  "order": [
+    "alt_01JB3Q8YQ5T0V7",
+    "alt_01JB3Q7A2M4N8P"
+  ],
+  "versions": {
+    "alt_01JB3Q8YQ5T0V7": 2,
+    "alt_01JB3Q7A2M4N8P": 5
+  },
+  "counts": {
+    "alt_01JB3Q7A2M4N8P": 37
+  },
+  "statuses": {
+    "alt_01JB3Q8YQ5T0V7": "acked",
+    "alt_01JB3Q7A2M4N8P": "open"
+  },
+  "stale_dropped": 2
+}
