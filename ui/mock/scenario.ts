@@ -2,7 +2,7 @@
 // hand-written stand-ins for the seed rules (spec §4.3). The real backend does
 // matching and rendering; this only needs to look plausible in the feed.
 
-import type { AlertField, ColorToken, Severity } from '../src/api/types.ts'
+import type { AlertField, ColorToken, DeliveryStatus, FeedAlert, Severity } from '../src/api/types.ts'
 
 export interface MockRule {
   id: string
@@ -231,4 +231,47 @@ export function randomEvent(at: Date): { source: string; raw: unknown } {
   if (r < 0.8) return { source: 'kafka:workflows', raw: workflowFailed(at) }
   if (r < 0.96) return { source: 'kafka:trades', raw: tradeRejected(at) }
   return { source: 'http:ci', raw: deployment(at) }
+}
+
+// ---- Deliveries (Appendix A routing, simulated) ----------------------------
+
+const PEOPLE: Record<string, { email: string; phone: string }> = {
+  'user:anna': { email: 'anna@example.test', phone: '+44 7700 900123' },
+  'user:sam': { email: 'sam@example.test', phone: '+44 7700 900456' },
+  'user:ilya': { email: 'ilya@example.test', phone: '+44 7700 900789' },
+  'user:alexey': { email: 'alexey@example.test', phone: '+44 7700 900321' },
+}
+
+const ROUTES: Record<string, [string, string][]> = {
+  // on-call phone + SMS
+  'settlements-workflow-failed': [['user:sam', 'phone'], ['user:sam', 'sms']],
+  // Anna: SMS 08:00–20:00 (simplified: always SMS here), plus the on-call by email
+  'payments-high-error-rate': [['user:anna', 'sms'], ['user:alexey', 'email']],
+  // email + UI
+  'rates-rejected-trades': [['user:ilya', 'email']],
+}
+
+const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7)
+
+/** Deterministic fake delivery_jobs rows derived from the alert. */
+export function deliveriesFor(a: FeedAlert, now = Date.now()): DeliveryStatus[] {
+  const opened = Date.parse(a.first_seen)
+  const stopped = a.acked_at ?? a.resolved_at
+  return (ROUTES[a.rule.id] ?? []).map(([recipient, channel], i) => {
+    const h = hash(a.id + i)
+    const p = PEOPLE[recipient]!
+    const address = channel === 'email' ? p.email : p.phone
+    const sendAt = opened + 1000 + (h % 2500)
+    const base = { id: `dj_${a.id.slice(4)}_${i}`, recipient, channel, address }
+    if (stopped && Date.parse(stopped) < sendAt)
+      return { ...base, state: 'cancelled', attempts: 0, last_error: null, sent_at: null, updated_at: stopped }
+    if (channel === 'sms' && h % 6 === 0) {
+      // Fake SMS gateway outage: retried, then dead-lettered.
+      const at = new Date(Math.min(now, sendAt + 90_000)).toISOString()
+      return { ...base, state: now < sendAt + 90_000 ? 'in_flight' : 'dead', attempts: now < sendAt + 90_000 ? 3 : 5, last_error: 'fake-sms-gateway: 503 Service Unavailable', sent_at: null, updated_at: at }
+    }
+    if (now < sendAt) return { ...base, state: 'pending', attempts: 0, last_error: null, sent_at: null, updated_at: a.first_seen }
+    const sent = new Date(sendAt).toISOString()
+    return { ...base, state: 'sent', attempts: 1 + (h % 4 === 0 ? 1 : 0), last_error: null, sent_at: sent, updated_at: sent }
+  })
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { getAlert } from '../api/client'
-import type { AlertDetail as Detail, FeedAlert } from '../api/types'
+import type { AlertDetail as Detail, DeliveryStatus, FeedAlert } from '../api/types'
 import type { TransitionOp } from '../api/client'
 import { absTime, relTime } from '../lib/time'
 import { colorToken, CountBadge, SeverityBadge, StatusPill } from './badges'
@@ -153,7 +153,11 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
             ))}
           </ol>
         )}
-        <div className="placeholder subtle">Delivery status per recipient and channel lands with delivery (M4).</div>
+      </section>
+
+      <section className="section">
+        <h3>Deliveries</h3>
+        {detail && <Deliveries items={detail.deliveries} now={now} />}
       </section>
 
       {detail && detail.samples.length > 0 && (
@@ -170,5 +174,47 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
         </section>
       )}
     </article>
+  )
+}
+
+const STATE_LABEL: Record<string, string> = {
+  pending: 'Pending',
+  in_flight: 'Sending',
+  sent: 'Sent',
+  cancelled: 'Cancelled',
+  dead: 'Failed',
+}
+const CHANNEL_LABEL: Record<string, string> = { email: 'Email', sms: 'SMS', phone: 'Phone call', ui: 'UI' }
+const STATE_HINT: Record<string, string> = {
+  cancelled: 'Not sent: the alert was acknowledged or resolved first',
+  dead: 'Gave up after retries',
+}
+
+function Deliveries({ items, now }: { items: DeliveryStatus[]; now: number }) {
+  if (items.length === 0) return <div className="placeholder">No external notifications for this alert: it is shown in the UI only.</div>
+  const sorted = [...items].sort((a, b) => a.recipient.localeCompare(b.recipient) || a.channel.localeCompare(b.channel))
+  return (
+    <table className="deliveries">
+      <thead>
+        <tr><th>Recipient</th><th>Channel</th><th>Status</th><th>When</th></tr>
+      </thead>
+      <tbody>
+        {sorted.map((d) => (
+          <tr key={d.id}>
+            <td>
+              {d.recipient.replace(/^user:/, '')}
+              <div className="muted small">{d.address}</div>
+            </td>
+            <td>{CHANNEL_LABEL[d.channel] ?? d.channel}</td>
+            <td>
+              <span className={`dstate dstate-${d.state}`} title={STATE_HINT[d.state]}>{STATE_LABEL[d.state] ?? d.state}</span>
+              {d.attempts > 1 && <span className="muted small"> · {d.attempts} attempts</span>}
+              {d.last_error && <div className="small err-text">{d.last_error}</div>}
+            </td>
+            <td className="muted small" title={absTime(d.sent_at ?? d.updated_at)}>{relTime(d.sent_at ?? d.updated_at, now)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
