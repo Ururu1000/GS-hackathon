@@ -137,18 +137,18 @@ async fn main() -> Result<()> {
                 let Some(Ok(a)) = m.payload().map(serde_json::from_slice::<FeedAlert>) else { continue };
                 let now = Instant::now();
                 updates_seen.fetch_add(1, Ordering::Relaxed);
-                let first_update = alerts_seen.lock().unwrap().insert(a.id);
-                if first_update {
+                // Only alerts carrying an event from this run are sampled, so
+                // unrelated traffic on the shared feed is ignored.
+                let Some(eid) = a.last_event_id.as_deref() else { continue };
+                let Some(t0) = sent_at.lock().unwrap().get(eid).copied() else { continue };
+                let us = now.duration_since(t0).as_micros() as u64;
+                let _ = latency.lock().unwrap().record(us.max(1));
+                if alerts_seen.lock().unwrap().insert(a.id) {
                     // Opening latency on the server clock: ingest receipt (first_seen)
                     // to the first update observed for this alert. Unaffected by the
                     // relay coalescing the opening with later duplicates.
                     let open_us = (chrono::Utc::now() - a.first_seen).num_microseconds().unwrap_or(0);
                     let _ = first_alert.lock().unwrap().record(open_us.max(1) as u64);
-                }
-                let Some(eid) = a.last_event_id.as_deref() else { continue };
-                if let Some(t0) = sent_at.lock().unwrap().get(eid).copied() {
-                    let us = now.duration_since(t0).as_micros() as u64;
-                    let _ = latency.lock().unwrap().record(us.max(1));
                 }
             }
         })
@@ -184,6 +184,7 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     println!("pipeline warm after {:.1}s", warm_start.elapsed().as_secs_f64());
+    sent_at.lock().unwrap().remove(&probe_id);
     *latency.lock().unwrap() = Histogram::<u64>::new_with_bounds(1, 120_000_000, 3)?;
     *first_alert.lock().unwrap() = Histogram::<u64>::new_with_bounds(1, 120_000_000, 3)?;
     updates_seen.store(0, Ordering::Relaxed);

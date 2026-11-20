@@ -65,8 +65,9 @@ pub async fn run_matcher(
                         }
                         matched += matches.len() as u64;
                         for rec in matches {
-                            let payload = serde_json::to_vec(&rec)?;
-                            pending.push(send(&producer, &rec.fingerprint, payload).await?);
+                            let payload = encode_bounded(rec)?;
+                            let (key, payload) = payload;
+                            pending.push(send(&producer, &key, payload).await?);
                         }
                     }
                     Some(Err(e)) => error!(offset = m.offset(), error = %e, "undecodable event in events.raw; skipped"),
@@ -82,6 +83,24 @@ pub async fn run_matcher(
     flush(&consumer, &mut pending, &mut offsets).await?;
     let _ = consumer.commit_consumer_state(CommitMode::Sync);
     Ok(())
+}
+
+/// Stay well under the broker's 1 MiB record limit, including JSON escaping.
+const MAX_MATCH_BYTES: usize = 900 * 1024;
+
+/// Serialize a match; if escaping still makes it too large, drop the copied
+/// card fields and key preview (the fingerprint is already computed from the
+/// full key, so dedup is unaffected) and say so in the diagnostics.
+fn encode_bounded(mut rec: beacon_core::MatchRecord) -> Result<(String, Vec<u8>)> {
+    let payload = serde_json::to_vec(&rec)?;
+    if payload.len() <= MAX_MATCH_BYTES {
+        return Ok((rec.fingerprint, payload));
+    }
+    warn!(rule = %rec.rule_id, bytes = payload.len(), "match too large; dropping copied fields");
+    rec.fields.clear();
+    rec.key.clear();
+    rec.diagnostics.push(format!("match was {} bytes; card fields dropped", payload.len()));
+    Ok((rec.fingerprint.clone(), serde_json::to_vec(&rec)?))
 }
 
 /// Enqueue without blocking; if the local queue is full, wait and retry. Any
