@@ -33,6 +33,8 @@ export function resolvedReasonText(reason: string | null): string | null {
       return 'no new events for a while'
     case 'recovered':
       return 'the source reported it recovered'
+    case 'runbook':
+      return 'a runbook step fixed it'
     default:
       return reason.replace(/_/g, ' ')
   }

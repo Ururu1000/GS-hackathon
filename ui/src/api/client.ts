@@ -1,4 +1,20 @@
-import type { AlertDetail, ApiError, FeedAlert, Session, TransitionRequest } from './types'
+import type {
+  AlertDetail,
+  ApiError,
+  FeedAlert,
+  PersonView,
+  Preference,
+  Proposal,
+  ProposalCreate,
+  RecentEvent,
+  RuleItem,
+  RuleSpec,
+  RuleTestResult,
+  RunbookSummary,
+  Session,
+  TeamView,
+  TransitionRequest,
+} from './types'
 
 // Same-origin by default; set VITE_API_BASE for a UI served from elsewhere.
 export const API_BASE: string = import.meta.env.VITE_API_BASE ?? ''
@@ -15,7 +31,7 @@ export class HttpError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const write = init?.method !== undefined && init.method !== 'GET'
   const res = await fetch(API_BASE + path, {
     credentials: 'same-origin',
@@ -65,7 +81,7 @@ export async function transition(id: string, op: TransitionOp, expectedVersion: 
     })
     return { ok: true, alert }
   } catch (e) {
-    if (e instanceof HttpError) return { ok: false, message: e.message, current: e.body?.error.current }
+    if (e instanceof HttpError) return { ok: false, message: e.message, current: e.body?.error.current as FeedAlert | undefined }
     return { ok: false, message: e instanceof Error ? e.message : String(e) }
   }
 }
@@ -73,3 +89,80 @@ export async function transition(id: string, op: TransitionOp, expectedVersion: 
 export function streamUrl(team: string | null): string {
   return `${API_BASE}/api/stream${team ? `?team=${encodeURIComponent(team)}` : ''}`
 }
+
+const enc = encodeURIComponent
+const post = <T>(path: string, body: unknown = {}, signal?: AbortSignal) =>
+  request<T>(path, { method: 'POST', body: JSON.stringify(body), signal })
+const put = <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
+
+/** Message for a failed call, in the server's words when it sent some. */
+export function errorText(e: unknown): string {
+  if (e instanceof HttpError) {
+    const d = e.body?.error.details
+    return d?.length ? `${e.message}: ${d.map((x) => `${x.path || 'rule'} ${x.message}`).join('; ')}` : e.message
+  }
+  return e instanceof Error ? e.message : String(e)
+}
+
+export const isConflict = (e: unknown): e is HttpError => e instanceof HttpError && e.status === 409
+
+// ---- rules -------------------------------------------------------------------
+
+export const listRules = (team?: string | null) =>
+  request<{ items: RuleItem[] }>(`/api/rules${team ? `?team=${enc(team)}` : ''}`).then((r) => r.items)
+export const getRule = (id: string) => request<RuleItem>(`/api/rules/${enc(id)}`)
+export const createRule = (rule: RuleSpec) => post<RuleItem>('/api/rules', { rule })
+export const updateRule = (rule: RuleSpec, expectedRevision: number) =>
+  put<RuleItem>(`/api/rules/${enc(rule.id)}`, { rule, expected_revision: expectedRevision })
+export const deleteRule = (id: string, expectedRevision: number) =>
+  request<{ deleted: string }>(`/api/rules/${enc(id)}?expected_revision=${expectedRevision}`, { method: 'DELETE' })
+export const testRule = (rule: RuleSpec, event: unknown, signal?: AbortSignal) =>
+  post<RuleTestResult>('/api/rules/test', { rule, event }, signal)
+export const listRunbooks = () => request<{ items: RunbookSummary[] }>('/api/runbooks').then((r) => r.items)
+export const recentEvents = (limit = 20) =>
+  request<{ items: RecentEvent[] }>(`/api/events/recent?limit=${limit}`).then((r) => r.items)
+
+// ---- people & teams ------------------------------------------------------------
+
+export const listPeople = () => request<{ items: PersonView[] }>('/api/people').then((r) => r.items)
+export const savePreferences = (id: string, preferences: Preference[], expectedRevision: number) =>
+  put<PersonView>(`/api/people/${enc(id)}/preferences`, { preferences, expected_revision: expectedRevision })
+export const listTeams = () => request<{ items: TeamView[] }>('/api/teams').then((r) => r.items)
+export const saveTeam = (t: TeamView) =>
+  put<TeamView>(`/api/teams/${enc(t.id)}`, {
+    members: t.members,
+    lead: t.lead,
+    oncall: t.oncall,
+    default_channels: t.default_channels,
+    expected_revision: t.revision,
+  })
+
+// ---- proposals ---------------------------------------------------------------------
+
+export const listProposals = () => request<{ items: Proposal[] }>('/api/proposals').then((r) => r.items)
+export const createProposal = (p: ProposalCreate) => post<Proposal>('/api/proposals', p)
+export const decideProposal = (id: string, op: 'accept' | 'reject') => post<Proposal>(`/api/proposals/${enc(id)}/${op}`)
+
+// ---- runbook steps & approvals ---------------------------------------------------------
+
+export type RunResult = { kind: 'started'; execution_id: string } | { kind: 'approval'; approval_id: string }
+
+/** Run an action step. `409 approval_required` is a normal outcome, not an error. */
+export async function runStep(alertId: string, step: string, expectedVersion: number): Promise<RunResult> {
+  try {
+    const r = await post<{ execution_id: string }>(`/api/alerts/${enc(alertId)}/steps/${enc(step)}/run`, { expected_version: expectedVersion })
+    return { kind: 'started', execution_id: r.execution_id }
+  } catch (e) {
+    if (e instanceof HttpError && e.body?.error.code === 'approval_required' && e.body.error.approval_id)
+      return { kind: 'approval', approval_id: e.body.error.approval_id }
+    throw e
+  }
+}
+export const checkStep = (alertId: string, step: string, done: boolean) =>
+  post<{ ok: true }>(`/api/alerts/${enc(alertId)}/steps/${enc(step)}/check`, { done })
+export const decideApproval = (id: string, op: 'approve' | 'reject', note?: string) =>
+  post<{ execution_id?: string }>(`/api/approvals/${enc(id)}/${op}`, note ? { note } : {})
+
+/** Ingest a raw event on a source, as an external system would. */
+export const ingest = (source: string, raw: unknown) =>
+  post<{ id: string; matched_alerts: string[] }>(`/ingest/${enc(source)}`, raw)

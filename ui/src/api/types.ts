@@ -100,13 +100,93 @@ export interface TimelineEntry {
   message: string
 }
 
-/** Placeholder until runbooks land (M5). */
+// ---- Runbooks (spec §6), as attached to one alert instance ---------------
+
+export type RunbookFormat = 'yaml' | 'markdown' | 'link' | 'text'
+
+/** Where a step is. `idle` = not started; `done` = manual step ticked;
+ * `queued`/`running`/`ok`/`failed`/`uncertain` follow the latest execution;
+ * `awaiting_approval`/`rejected` follow the latest approval request. */
+export type StepState =
+  | 'idle'
+  | 'done'
+  | 'queued'
+  | 'running'
+  | 'ok'
+  | 'failed'
+  | 'uncertain'
+  | 'awaiting_approval'
+  | 'rejected'
+
+export interface StepAction {
+  /** Registered action name: `http_get`, `retry_workflow`, `escalate`, … */
+  name: string
+  /** Human label, e.g. "Retry workflow". */
+  label: string
+  /** Rendered from the pinned event context; secrets already redacted. */
+  params: Record<string, string>
+  /** Risk sets the minimum approval level. */
+  risk: 'low' | 'high'
+}
+
+export interface Execution {
+  id: string
+  state: 'queued' | 'running' | 'ok' | 'failed' | 'uncertain'
+  requested_by: string
+  started_at: string | null
+  finished_at: string | null
+  /** Short, redacted outcome ("200 OK", "workflow engine: 503"). */
+  output: string | null
+}
+
+export interface ApprovalRequest {
+  id: string
+  state: 'pending' | 'approved' | 'rejected' | 'expired'
+  requested_by: string
+  requested_at: string
+  expires_at: string
+  /** `user:<id>` who may decide. */
+  eligible: string[]
+  /** Whether the session user is one of `eligible`. */
+  can_decide: boolean
+  /** SMS challenge code if the request was also sent by SMS ("Y 4821"). */
+  sms_code: string | null
+  decided_by: string | null
+  decided_at: string | null
+  note: string | null
+}
+
+export interface RunbookStep {
+  /** Stable across revisions. */
+  id: string
+  kind: 'manual' | 'condition' | 'action'
+  /** Rendered text with event values filled in. */
+  text: string
+  /** Guidance that is shown but not enforced ("needs approval from the team lead"). */
+  hint: string | null
+  action: StepAction | null
+  approval: 'none' | 'required'
+  state: StepState | (string & {})
+  /** Set when the step can't run right now (invalid action, condition not met). */
+  disabled_reason: string | null
+  done_by: string | null
+  done_at: string | null
+  /** All executions of this step on this alert, oldest first. */
+  runs: Execution[]
+  /** The latest approval request, if any. */
+  approval_request: ApprovalRequest | null
+}
+
 export interface RunbookView {
   id: string
   revision: number
   title: string
-  format: 'yaml' | 'markdown' | 'link' | 'text'
-  steps: unknown[]
+  format: RunbookFormat | (string & {})
+  /** `link` runbooks: the wiki/Confluence URL (http/https only). */
+  url: string | null
+  /** `text` and `markdown` runbooks: the original, verbatim. */
+  text: string | null
+  steps: RunbookStep[]
 }
 
 /** `cancelled`: the alert was acked/resolved before the send. Unknown states
@@ -133,7 +213,7 @@ export interface DeliveryStatus {
 export interface AlertDetail extends FeedAlert {
   /** First N and latest matching events (raw, untouched payloads). */
   samples: EventSample[]
-  /** Null until runbooks ship. */
+  /** The runbook selected for this alert, with per-step state, or null. */
   runbook: RunbookView | null
   /** Delivery jobs for this alert, any order; the UI sorts them. */
   deliveries: DeliveryStatus[]
@@ -158,13 +238,21 @@ export type ErrorCode =
   | 'csrf'
   | 'bad_request'
   | 'internal'
+  | 'revision_conflict'
+  | 'approval_required'
+  | 'invalid'
 
 export interface ApiError {
   error: {
     code: ErrorCode | (string & {})
     message: string
-    /** Present on `version_conflict` and `invalid_transition`. */
-    current?: FeedAlert
+    /** Present on `version_conflict` and `invalid_transition` (a FeedAlert)
+     * and on `revision_conflict` (the current RuleItem / PersonView / TeamView). */
+    current?: unknown
+    /** `approval_required`: the approval request that was opened. */
+    approval_id?: string
+    /** `invalid`: per-field problems, e.g. `{path: "when.all.0.value", message}`. */
+    details?: { path: string; message: string }[]
   }
 }
 
@@ -203,3 +291,220 @@ export type StreamEvent =
   | { type: 'alert.remove'; data: RemoveEvent }
 
 export const STREAM_EVENT_TYPES = ['snapshot', 'alert.upsert', 'alert.remove'] as const
+
+// ---- Rules (spec §4.3): the JSON form of config/rules/*.yaml ---------------
+
+export type CondOp =
+  | 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+  | 'in' | 'not_in' | 'contains' | 'starts_with' | 'regex'
+  | 'exists' | 'not_exists'
+export const COND_OPS: readonly CondOp[] = [
+  'eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'not_in', 'contains', 'starts_with', 'regex', 'exists', 'not_exists',
+]
+
+export type Scalar = string | number | boolean | null
+
+export interface Leaf {
+  /** `raw.<json path>`, `fields.<normalized field>`, `source` or `schema`. */
+  path: string
+  op: CondOp
+  value?: Scalar | Scalar[]
+}
+export type Condition = { all: Condition[] } | { any: Condition[] } | { not: Condition } | Leaf
+
+export interface RouteSpec {
+  /** `team:<id>`, `user:<id>` or `oncall:<schedule>`. */
+  to: string
+  /** Explicit channels; omitted = the recipients' preferences decide (§4.4). */
+  channels?: string[]
+}
+
+export interface FieldSpec {
+  path: string
+  label: string
+}
+
+export interface RuleSpec {
+  id: string
+  name?: string
+  team: string
+  enabled?: boolean
+  when: Condition
+  /** Omitted = the event's normalized `fields.severity`. */
+  severity?: Severity
+  route: RouteSpec[]
+  present: {
+    title: string
+    body?: string
+    fields?: (FieldSpec | string)[]
+    color?: ColorToken
+  }
+  dedup?: { key: string[]; window: string }
+  group?: { by: string[]; window: string | number }
+  throttle?: { max: number; per: string }
+  runbook?: string
+  auto_resolve?: { recover_when?: Condition; quiet_for?: string }
+  escalate_after?: string
+  /** Unknown keys are kept as-is. */
+  [k: string]: unknown
+}
+
+export interface RuleStats {
+  fires_24h: number
+  open_alerts: number
+  last_fired_at: string | null
+  /** Matching events per hour for the last 24 h, oldest first. */
+  hourly: number[]
+}
+
+/** `GET /api/rules` item and `GET/PUT /api/rules/{id}` result. */
+export interface RuleItem {
+  rule: RuleSpec
+  /** Compare-and-set token: send it back as `expected_revision`. */
+  revision: number
+  updated_at: string
+  updated_by: string
+  stats: RuleStats
+}
+
+export interface RuleWrite {
+  rule: RuleSpec
+  /** PUT only; 409 `revision_conflict` if the rule moved on. */
+  expected_revision?: number
+}
+
+export type NodeResult = 'match' | 'no_match' | 'skipped' | 'error'
+
+export interface NodeDiagnostic {
+  /** Child indexes from the root `when` node, dot-separated; `""` = root. */
+  node: string
+  result: NodeResult
+  /** The value found at the leaf's path (JSON), or absent when missing. */
+  actual?: unknown
+  message?: string
+}
+
+export interface RuleTestRequest {
+  rule: RuleSpec
+  /** Any JSON: the raw event body as a source would send it. */
+  event: unknown
+  /** Source the event arrives on, e.g. `kafka:workflows` (optional). */
+  source?: string
+}
+
+/** `POST /api/rules/test`. Zero writes, zero dispatches. */
+export interface RuleTestResult {
+  matched: boolean
+  /** Detected schema and normalized fields, as the rule sees them. */
+  schema: string
+  fields: Record<string, unknown>
+  nodes: NodeDiagnostic[]
+  /** The alert card the rule would produce (null if the rule is invalid). */
+  card: {
+    title: string
+    body: string
+    severity: Severity
+    color: ColorToken
+    fields: AlertField[]
+    dedup_key: string[]
+  } | null
+  /** Template and dedup warnings, e.g. "raw.payload.ccy is missing". */
+  warnings: string[]
+  /** Validation errors that would block publishing. */
+  errors: { path: string; message: string }[]
+}
+
+/** `GET /api/events/recent`: recently ingested events, for the test panel. */
+export interface RecentEvent extends EventSample {
+  source: string
+  schema: string
+}
+
+export interface RunbookSummary {
+  id: string
+  title: string
+  format: RunbookFormat | (string & {})
+  team: string | null
+  steps: number
+}
+
+// ---- People, teams, preferences (spec §4.4) ------------------------------
+
+export interface TimeWindow {
+  /** Half-open local-time window "HH:MM-HH:MM"; may wrap midnight. */
+  between: string
+  /** IANA zone, e.g. `Europe/London`. */
+  tz: string
+}
+
+export interface PreferenceMatch {
+  severity?: Severity | Severity[]
+  service?: string
+  team?: string
+}
+
+/** One personal preference line; the first match wins. */
+export type Preference =
+  | { match: PreferenceMatch; channels: string[]; when?: TimeWindow; otherwise?: string[] }
+  | { default: string[] }
+
+export interface PersonView {
+  id: string
+  name: string
+  contact: { email?: string; phone?: string }
+  teams: string[]
+  preferences: Preference[]
+  revision: number
+}
+
+export interface TeamView {
+  id: string
+  name: string
+  members: string[]
+  lead: string | null
+  /** Schedule name → rotation order; the first person is on call. */
+  oncall: Record<string, string[]>
+  /** Step 3 of routing precedence; omitted/empty = `[ui]`. */
+  default_channels: string[]
+  revision: number
+}
+
+export const CHANNELS = ['phone', 'sms', 'email', 'ui'] as const
+
+// ---- Proposals (spec §6.5) ------------------------------------------------
+
+export type ProposalKind = 'noisy' | 'reroute' | 'template' | 'other'
+export type ProposalState = 'pending' | 'accepted' | 'rejected' | 'stale'
+
+export interface Proposal {
+  id: string
+  rule_id: string
+  rule_name: string
+  kind: ProposalKind | (string & {})
+  /** One line: "Group by instrument every 5 minutes". */
+  summary: string
+  note: string
+  /** The rule revision the change was written against. */
+  base_revision: number
+  base_rule: RuleSpec
+  proposed_rule: RuleSpec
+  author: string
+  /** True when the system suggested it (e.g. "fired 400× this week, 95% acked with no action"). */
+  auto: boolean
+  /** Alert the suggestion came from, if any. */
+  alert_id: string | null
+  created_at: string
+  state: ProposalState
+  decided_by: string | null
+  decided_at: string | null
+}
+
+export interface ProposalCreate {
+  rule_id: string
+  base_revision: number
+  kind: ProposalKind
+  summary: string
+  note: string
+  proposed_rule: RuleSpec
+  alert_id?: string
+}
