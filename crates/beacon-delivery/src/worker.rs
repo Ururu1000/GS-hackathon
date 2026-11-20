@@ -128,7 +128,7 @@ pub async fn claim_batch(
 ///
 /// At most one row, ever:
 /// - `fallback_of IS NULL` on the dead job means a fallback never falls back again (one hop);
-/// - `ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING` skips the insert
+/// - `ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING` skips the insert
 ///   when the person already has any job on the fallback channel for the same notification.
 ///
 /// The fallback job's `route_info` keeps the provenance chain: `target`, `rule_id` and
@@ -142,7 +142,8 @@ async fn insert_fallback_job(
 ) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "INSERT INTO delivery_jobs \
-             (alert_id, notify_seq, recipient_id, channel, address, route_info, fallback_of) \
+             (alert_id, notify_seq, recipient_id, channel, address, route_info, fallback_of, \
+              escalation_step) \
          SELECT j.alert_id, j.notify_seq, j.recipient_id, \
                 j.route_info->'fallback'->>'channel', \
                 j.route_info->'fallback'->>'address', \
@@ -151,13 +152,13 @@ async fn insert_fallback_job(
                                     'reason', j.route_info->'reason', \
                                     'fallback_from', j.channel, \
                                     'fallback_reason', j.last_error), \
-                j.id \
+                j.id, j.escalation_step \
          FROM delivery_jobs j \
          WHERE j.id = $1 AND j.status = 'dead' AND j.fallback_of IS NULL \
            AND j.route_info ? 'fallback' \
            AND j.route_info->'fallback'->>'channel' IS NOT NULL \
            AND j.route_info->'fallback'->>'address' IS NOT NULL \
-         ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING",
+         ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING",
     )
     .bind(dead_id)
     .execute(&mut *tx)

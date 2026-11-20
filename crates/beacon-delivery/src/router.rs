@@ -264,7 +264,7 @@ pub async fn insert_jobs(
             "INSERT INTO delivery_jobs \
                (alert_id, notify_seq, recipient_id, channel, address, route_info, escalation_step) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING",
+             ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING",
         )
         .bind(alert_id)
         .bind(notify_seq)
@@ -272,7 +272,7 @@ pub async fn insert_jobs(
         .bind(&job.channel)
         .bind(&job.address)
         .bind(&job.route_info)
-        .bind(escalation_step)
+        .bind(escalation_step.unwrap_or(0))
         .execute(&mut **tx)
         .await?;
         inserted += res.rows_affected();

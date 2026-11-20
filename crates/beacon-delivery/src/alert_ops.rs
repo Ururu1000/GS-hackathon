@@ -5,7 +5,7 @@
 //! switches to the beacon-engine implementation once the PR stacks merge. Delivery code only
 //! ever uses the `AlertOps` trait.
 
-use sqlx::{Postgres, Transaction};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::channel::BoxFuture;
@@ -27,11 +27,12 @@ pub enum TransitionOutcome {
 }
 
 pub trait AlertOps: Send + Sync {
-    /// Ack/resolve inside the caller's tx; `expected_version: None` skips the conflict check
+    /// Ack/resolve on the caller's connection (pass `&mut *tx` to run inside a transaction;
+    /// same shape as `beacon_engine::alerts::transition`); `expected_version: None` skips the conflict check
     /// (system actors such as SMS replies or runbook steps).
     fn transition<'a>(
         &'a self,
-        tx: &'a mut Transaction<'static, Postgres>,
+        conn: &'a mut PgConnection,
         alert_id: Uuid,
         t: Transition,
         actor: &'a str,
@@ -40,7 +41,7 @@ pub trait AlertOps: Send + Sync {
     /// Bump `version` and write an `alert_update` outbox row so the feed and detail refetch.
     fn touch<'a>(
         &'a self,
-        tx: &'a mut Transaction<'static, Postgres>,
+        conn: &'a mut PgConnection,
         alert_id: Uuid,
     ) -> BoxFuture<'a, Result<(), sqlx::Error>>;
 }
@@ -52,7 +53,7 @@ pub struct SqlAlertOps;
 impl AlertOps for SqlAlertOps {
     fn transition<'a>(
         &'a self,
-        tx: &'a mut Transaction<'static, Postgres>,
+        conn: &'a mut PgConnection,
         alert_id: Uuid,
         t: Transition,
         actor: &'a str,
@@ -61,7 +62,7 @@ impl AlertOps for SqlAlertOps {
             let status: Option<(String,)> =
                 sqlx::query_as("SELECT status FROM alerts WHERE id = $1 FOR UPDATE")
                     .bind(alert_id)
-                    .fetch_optional(&mut **tx)
+                    .fetch_optional(&mut *conn)
                     .await?;
             let Some((status,)) = status else {
                 return Ok(TransitionOutcome::Invalid("alert not found".into()));
@@ -91,11 +92,11 @@ impl AlertOps for SqlAlertOps {
                 .bind(alert_id)
                 .bind(actor)
                 .bind(reason)
-                .execute(&mut **tx)
+                .execute(&mut *conn)
                 .await?;
             sqlx::query("INSERT INTO outbox (kind, alert_id) VALUES ('alert_update', $1)")
                 .bind(alert_id)
-                .execute(&mut **tx)
+                .execute(&mut *conn)
                 .await?;
             Ok(TransitionOutcome::Applied)
         })
@@ -103,17 +104,17 @@ impl AlertOps for SqlAlertOps {
 
     fn touch<'a>(
         &'a self,
-        tx: &'a mut Transaction<'static, Postgres>,
+        conn: &'a mut PgConnection,
         alert_id: Uuid,
     ) -> BoxFuture<'a, Result<(), sqlx::Error>> {
         Box::pin(async move {
             sqlx::query("UPDATE alerts SET version = version + 1 WHERE id = $1")
                 .bind(alert_id)
-                .execute(&mut **tx)
+                .execute(&mut *conn)
                 .await?;
             sqlx::query("INSERT INTO outbox (kind, alert_id) VALUES ('alert_update', $1)")
                 .bind(alert_id)
-                .execute(&mut **tx)
+                .execute(&mut *conn)
                 .await?;
             Ok(())
         })
