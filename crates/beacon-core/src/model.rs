@@ -27,6 +27,23 @@ pub enum NotifyReason {
     Renotify,
 }
 
+/// Canonical facts about the event that opened (or escalated) an alert, for
+/// delivery preferences such as "critical + payments-api" (board #100).
+/// Absent values are omitted; delivery treats them as non-matching.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotifyContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+}
+
 /// Payload of an outbox row with `kind = 'notify'` (board #27/#35, spec §13).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotifyPayload {
@@ -41,6 +58,8 @@ pub struct NotifyPayload {
     pub route: Vec<RouteSpec>,
     #[serde(with = "rfc3339_ms")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub context: NotifyContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

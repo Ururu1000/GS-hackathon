@@ -12,7 +12,7 @@ use crate::condition::{Condition, Op};
 use crate::config::ConfigSnapshot;
 use crate::event::Event;
 use crate::mapping::{Diagnostic, structural_signature};
-use crate::model::AlertField;
+use crate::model::{AlertField, NotifyContext};
 use crate::path::Path;
 use crate::rule::{CompiledRule, RouteSpec};
 use crate::severity::Severity;
@@ -53,6 +53,9 @@ pub struct MatchRecord {
     pub ingested_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// Canonical event facts passed on to delivery in the notify payload.
+    #[serde(default)]
+    pub context: NotifyContext,
 }
 
 /// Values copied from the event into a match (dedup key values, card fields)
@@ -322,8 +325,23 @@ impl ConfigSnapshot {
             schema: event.schema.clone(),
             ingested_at: event.ingested_at,
             diagnostics,
+            context: NotifyContext {
+                service: field_str(event, "service"),
+                environment: field_str(event, "environment"),
+                event_type: field_str(event, "type"),
+                source: Some(event.source.clone()),
+                schema: Some(event.schema.clone()),
+            },
         }
     }
+}
+
+fn field_str(event: &Event, name: &str) -> Option<String> {
+    event.fields.get(name).and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
+        _ => None,
+    })
 }
 
 /// Incident identity: rule id + dedup key values. When a key field is missing

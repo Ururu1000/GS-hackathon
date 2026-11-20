@@ -37,6 +37,10 @@ fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> Mat
         schema: "envelope.meta-payload".into(),
         ingested_at: at,
         diagnostics: vec![],
+        context: beacon_core::model::NotifyContext {
+            service: Some("trade-gateway".into()),
+            ..Default::default()
+        },
     }
 }
 
@@ -70,6 +74,8 @@ async fn dedup_across_batches(pool: PgPool) {
     assert_eq!(n.alert_id, rows[0].0);
     assert_eq!(n.notify_seq, 1);
     assert_eq!(n.route[0].channels.as_deref(), Some(&["email".to_string(), "ui".to_string()][..]));
+    assert_eq!(n.context.service.as_deref(), Some("trade-gateway"));
+    assert!(notify[0]["context"].get("environment").is_none(), "absent keys are omitted");
 
     let notify_seq: i32 = sqlx::query_scalar("SELECT notify_seq FROM alerts").fetch_one(&pool).await.unwrap();
     assert_eq!(notify_seq, 1);

@@ -76,6 +76,9 @@ fn anna_fires_and_recovers_on_same_fingerprint() {
     assert_eq!(fire[0].kind, MatchKind::Fire);
     assert_eq!(fire[0].route[0].to, "user:anna");
     assert_eq!(fire[0].title, "HighErrorRate on payments-api (eu-west)");
+    assert_eq!(fire[0].context.service.as_deref(), Some("payments-api"));
+    assert_eq!(fire[0].context.event_type.as_deref(), Some("HighErrorRate"));
+    assert_eq!(fire[0].context.schema.as_deref(), Some("prometheus.alert"));
 
     let (_, rec) = run(&cfg, "http:alertmanager", sample("high-error-rate-resolved.json"));
     assert_eq!(rec.len(), 1, "{rec:?}");
