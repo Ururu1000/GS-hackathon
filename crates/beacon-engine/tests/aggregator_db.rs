@@ -176,3 +176,30 @@ async fn rules_reload_live(pool: PgPool) {
     let (_, m, _) = rx.borrow().process(ev);
     assert_eq!(m[0].rule_id, "disk-full", "the new rule matches without a restart");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn fenced_checkpoints(pool: PgPool) {
+    use beacon_engine::aggregator::{Fence, Fenced, apply_batch_fenced, claim_partition};
+    let now = Utc::now();
+    let (e1, next) = claim_partition(&pool, 3).await.unwrap();
+    assert_eq!((e1, next), (1, -1));
+    let b1: Vec<_> = (0..10).map(|i| rec(&format!("a{i}"), "fp", MatchKind::Fire, now)).collect();
+    apply_batch_fenced(&pool, &b1, &[Fence { partition: 3, epoch: e1, next_offset: 10 }]).await.unwrap().unwrap();
+
+    // A new owner claims the partition (e.g. after a rebalance or a crash).
+    let (e2, next) = claim_partition(&pool, 3).await.unwrap();
+    assert_eq!((e2, next), (2, 10), "the new owner resumes after what was applied");
+
+    // The stale owner's next write is rejected and leaves no trace.
+    let b2: Vec<_> = (0..5).map(|i| rec(&format!("b{i}"), "fp", MatchKind::Fire, now)).collect();
+    let r = apply_batch_fenced(&pool, &b2, &[Fence { partition: 3, epoch: e1, next_offset: 15 }]).await.unwrap();
+    assert!(matches!(r, Err(Fenced)));
+    let count: i64 = sqlx::query_scalar("SELECT count FROM alerts").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 10, "a fenced batch changes nothing");
+
+    apply_batch_fenced(&pool, &b2, &[Fence { partition: 3, epoch: e2, next_offset: 15 }]).await.unwrap().unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count FROM alerts").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 15);
+    let next: i64 = sqlx::query_scalar("SELECT next_offset FROM checkpoints WHERE partition = 3").fetch_one(&pool).await.unwrap();
+    assert_eq!(next, 15);
+}
