@@ -9,6 +9,7 @@ mod common;
 
 use std::collections::HashMap;
 
+use beacon_delivery::RouterConfig;
 use beacon_delivery::alert_ops::SqlAlertOps;
 use beacon_delivery::approvals::{
     self, DecideError, DecideOutcome, Decision, MAX_SMS_ATTEMPTS, ReplyOutcome, Via,
@@ -16,6 +17,7 @@ use beacon_delivery::approvals::{
 use beacon_delivery::audit;
 use beacon_delivery::config::{Contact, Directory, Person, Team};
 use beacon_delivery::model::DeliveryJob;
+use beacon_delivery::router::route_once;
 use common::job_rows;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -277,47 +279,85 @@ async fn a_second_request_returns_the_same_id_and_sends_nothing(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn prompt_jobs_never_collide_with_an_existing_sms_job(pool: PgPool) {
+async fn prompt_reuses_the_alerts_seq_and_a_renotify_still_pages(pool: PgPool) {
     let dir = approvals_dir();
     let alert = insert_alert(&pool, "open").await;
-    // The original notification already paged bob on sms at notify_seq 1.
+    // The original notification already paged carol on sms at the alert's current seq (1).
     sqlx::query(
         "INSERT INTO delivery_jobs (alert_id, notify_seq, recipient_id, channel, address) \
-         VALUES ($1, 1, 'bob', 'sms', '+44 7700 900124')",
+         VALUES ($1, 1, 'carol', 'sms', '+44 7700 900125')",
     )
     .bind(alert)
     .execute(&pool)
     .await
-    .expect("bob's original sms job");
+    .expect("carol's original sms page");
 
     request_approval(&pool, &dir, alert, "s3").await;
 
-    // Both prompts exist despite bob's existing job: the prompt seq moves past it.
+    // Both prompts reuse the alert's current notify_seq: the idempotency key includes
+    // escalation_step, so carol's prompt is a SECOND sms job next to her page (step 0).
     let jobs = prompt_jobs(&pool, alert).await;
-    let bob = jobs
-        .iter()
-        .find(|j| j.recipient_id == "bob")
-        .expect("bob prompt");
-    assert_eq!(
-        bob.notify_seq, 2,
-        "bumped past the taken (alert, bob, sms, 1) key"
-    );
-    assert_eq!(bob.escalation_step, Some(201));
     let carol = jobs
         .iter()
         .find(|j| j.recipient_id == "carol")
         .expect("carol prompt");
-    assert_eq!(carol.notify_seq, 1, "free seq used as-is");
-    // Bob now owns two sms jobs on this alert: the page and the prompt.
-    let bob_sms: i64 = sqlx::query_scalar(
+    assert_eq!(carol.notify_seq, 1, "the alert's current notify_seq");
+    assert_eq!(carol.escalation_step, Some(200));
+    let bob = jobs
+        .iter()
+        .find(|j| j.recipient_id == "bob")
+        .expect("bob prompt");
+    assert_eq!(bob.notify_seq, 1, "the alert's current notify_seq");
+    assert_eq!(bob.escalation_step, Some(201));
+    let carol_sms: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM delivery_jobs \
-         WHERE alert_id = $1 AND recipient_id = 'bob' AND channel = 'sms'",
+         WHERE alert_id = $1 AND recipient_id = 'carol' AND channel = 'sms'",
     )
     .bind(alert)
     .fetch_one(&pool)
     .await
-    .expect("count bob sms");
-    assert_eq!(bob_sms, 2);
+    .expect("count carol sms");
+    assert_eq!(carol_sms, 2, "the page (step 0) plus the prompt (step 200)");
+
+    // A real renotify one seq later still creates carol's sms job: the prompt did not
+    // swallow the seq.
+    sqlx::query("UPDATE alerts SET notify_seq = 2 WHERE id = $1")
+        .bind(alert)
+        .execute(&pool)
+        .await
+        .expect("bump the alert's notify_seq");
+    common::insert_outbox_raw(
+        &pool,
+        "notify",
+        alert,
+        json!({
+            "alert_id": alert,
+            "notify_seq": 2,
+            "rule_id": "settlements-workflow-failed",
+            "rule_revision": 1,
+            "team": "settlements",
+            "severity": "critical",
+            "reason": "renotify",
+            "route": [{ "to": "user:carol", "channels": ["sms"] }],
+            "created_at": chrono::Utc::now(),
+        }),
+    )
+    .await;
+    let stats = route_once(&pool, &dir, &RouterConfig::default())
+        .await
+        .expect("route_once");
+    assert_eq!(stats.jobs_inserted, 1, "{stats:?}");
+
+    let renotify: Vec<DeliveryJob> = sqlx::query_as(
+        "SELECT * FROM delivery_jobs \
+         WHERE alert_id = $1 AND recipient_id = 'carol' AND channel = 'sms' AND notify_seq = 2",
+    )
+    .bind(alert)
+    .fetch_all(&pool)
+    .await
+    .expect("carol's renotify jobs");
+    assert_eq!(renotify.len(), 1, "{renotify:?}");
+    assert_eq!(renotify[0].escalation_step, Some(0), "a plain job");
 }
 
 // ---------------------------------------------------------------------------------------------

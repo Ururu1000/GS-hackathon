@@ -19,7 +19,8 @@
 //! - `escalate` (risk high): `{team}` → notify every member of `team` (Directory) on their
 //!   resolved channels (prefs) for this alert: insert delivery jobs via `router::insert_jobs`
 //!   with `route_info.target = "escalate:<team>"`, using `notify_seq` = the alert's current
-//!   `notify_seq` and `escalation_step = 100 + n` to stay unique; audit kind `escalated`.
+//!   `notify_seq` and `escalation_step = 100 + n` (the idempotency key includes the step, so
+//!   a member already paged for this notification still gets the job); audit kind `escalated`.
 //! - `notify` (risk low): `{to}` (route target) → same as escalate for one target.
 //!
 //! **Mock targets** live on the gateway role (`gateway::router`), owned here:
@@ -29,7 +30,7 @@
 //! the outage endpoints). They record calls in memory only.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
@@ -386,23 +387,6 @@ struct ClaimedExecution {
     lease_token: Uuid,
 }
 
-/// `AlertOps` takes `Transaction<'static, Postgres>`, but `run_once` only holds `&PgPool`.
-/// One leaked pool clone per distinct database funds those transactions; clones share the
-/// underlying connection pool, so no extra connections are opened.
-static STATIC_POOLS: LazyLock<Mutex<HashMap<String, &'static PgPool>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn static_pool(pool: &PgPool) -> &'static PgPool {
-    let key = format!("{:?}", pool.connect_options());
-    let mut pools = STATIC_POOLS.lock().expect("static pool cache");
-    if let Some(found) = pools.get(&key) {
-        return found;
-    }
-    let leaked: &'static PgPool = Box::leak(Box::new(pool.clone()));
-    pools.insert(key, leaked);
-    leaked
-}
-
 /// Claim and run one batch (module doc).
 pub async fn run_once(
     pool: &PgPool,
@@ -412,14 +396,12 @@ pub async fn run_once(
     cfg: &ActionsWorkerConfig,
 ) -> Result<ActionStats, sqlx::Error> {
     let mut stats = ActionStats::default();
-    // `AlertOps` needs `'static` transactions; every finalize below shares one pool clone.
-    let spool = static_pool(pool);
 
     // 1. Expired `running` leases past the attempt budget go `uncertain` ("lease expired")
     //    with the same audit + touch a normal finalize writes. Every UPDATE sets
     //    `updated_at = now()`.
     {
-        let mut tx = spool.begin().await?;
+        let mut tx = pool.begin().await?;
         let expired: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
             "UPDATE action_executions SET state = 'uncertain', output = 'lease expired', \
                 finished_at = now(), lease_token = NULL, locked_until = NULL, locked_by = NULL, \
@@ -499,7 +481,7 @@ pub async fn run_once(
         };
         let state = outcome.state();
         let output = truncate_output(outcome.output());
-        let mut ftx = spool.begin().await?;
+        let mut ftx = pool.begin().await?;
         let res = sqlx::query(
             "UPDATE action_executions SET state = $2, finished_at = now(), output = $3, \
                 lease_token = NULL, locked_until = NULL, locked_by = NULL, updated_at = now() \
@@ -560,7 +542,7 @@ pub async fn run_once(
 /// True when the frozen runbook snapshot (`alert_runbooks.steps`) marks `step_id` with
 /// `resolves: true`. Tolerates a missing row or foreign shapes (agent A owns the writer).
 async fn step_resolves(
-    tx: &mut Transaction<'static, Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
     alert_id: Uuid,
     step_id: &str,
 ) -> Result<bool, sqlx::Error> {

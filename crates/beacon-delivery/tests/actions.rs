@@ -533,6 +533,86 @@ async fn escalate_pages_every_team_member(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// 4b. escalate still pages a member already paged for this notification: the idempotency
+//     key's escalation_step column (100 + n) tells the two jobs apart.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn escalate_pages_a_member_already_paged_for_this_notification(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_mock_gateway(pool.clone()).await;
+    let registry = ActionRegistry::builtin(actions_config(&base_url));
+    let dir = Directory::from_parts(
+        vec![person_with_email("d1"), person_with_email("d2")],
+        vec![Team {
+            id: "counterparty-support".to_string(),
+            members: vec!["d1".to_string(), "d2".to_string()],
+            lead: None,
+            oncall: HashMap::new(),
+            default_channels: None,
+        }],
+    )
+    .expect("directory");
+    let alert = common::insert_alert(&pool, "open", "escalate collision test").await;
+
+    // The original notification already paged d1 at the alert's current notify_seq: a plain
+    // job with escalation_step 0.
+    sqlx::query(
+        "INSERT INTO delivery_jobs (alert_id, notify_seq, recipient_id, channel, address) \
+         VALUES ($1, 1, 'd1', 'email', 'd1@example.test')",
+    )
+    .bind(alert)
+    .execute(&pool)
+    .await
+    .expect("d1's original page");
+
+    let id = queue_exec(
+        &pool,
+        alert,
+        "s3",
+        "escalate",
+        json!({"team": "counterparty-support"}),
+    )
+    .await
+    .expect("queue");
+    let stats = run(&pool, &dir, &registry).await;
+    assert_eq!(stats.ok, 1);
+    let (state, output, _) = exec_state(&pool, id).await;
+    assert_eq!(state, "ok");
+    assert_eq!(
+        output.as_deref(),
+        Some("escalated to counterparty-support: 2 job(s)")
+    );
+
+    // d1's escalate job was not swallowed by the original page: same (alert, recipient,
+    // channel, notify_seq), different escalation_step.
+    let d1_jobs: Vec<(Option<i32>, i32)> = sqlx::query_as(
+        "SELECT escalation_step, notify_seq FROM delivery_jobs \
+         WHERE alert_id = $1 AND recipient_id = 'd1' ORDER BY escalation_step",
+    )
+    .bind(alert)
+    .fetch_all(&pool)
+    .await
+    .expect("d1 jobs");
+    assert_eq!(
+        d1_jobs,
+        vec![(Some(0), 1), (Some(100), 1)],
+        "the original page (step 0) plus the escalate job (step >= 100)"
+    );
+    let d2_step: Option<i32> = sqlx::query_scalar(
+        "SELECT escalation_step FROM delivery_jobs \
+         WHERE alert_id = $1 AND recipient_id = 'd2'",
+    )
+    .bind(alert)
+    .fetch_one(&pool)
+    .await
+    .expect("d2's job");
+    assert!(
+        d2_step.unwrap_or(0) >= 100,
+        "d2's escalate job exists too: {d2_step:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // 5. Leases: expired reclaimed, stale token fenced, 3 attempts → uncertain.
 // ---------------------------------------------------------------------------------------------
 

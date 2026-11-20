@@ -15,11 +15,10 @@
 //!   `notify_seq` = the alert's current `notify_seq`, `escalation_step = 200 + n` (unique key).
 //!   Audit `approval` "requested <action> (step <id>)".
 //!
-//!   Deviation from the doc above, forced by the schema: `delivery_jobs`' unique key is
-//!   (alert, recipient, channel, notify_seq), which does NOT include `escalation_step`, so a
-//!   prompt for someone this notification already paged on sms (the demo's on-call bob) cannot
-//!   reuse that seq — `request` bumps the prompt's seq past any existing sms job of that person.
-//!   The seq equals the alert's current `notify_seq` whenever it is free.
+//!   The old schema-forced deviation is gone: the unique key now includes `escalation_step`,
+//!   so a prompt for someone this notification already paged on sms (the demo's on-call bob)
+//!   simply reuses the alert's current `notify_seq` — the step column keeps it a second job
+//!   next to the original page (step 0), and a later real renotify is never swallowed.
 //! - **Decide** (`decide`): ONE tx: `SELECT ... FOR UPDATE`; not found → `NotFound`; actor not in
 //!   `eligible` → `Forbidden`; state not `pending` → `AlreadyDecided(state)`; `expires_at <=
 //!   now()` → set `expired`, `Expired`; alert not `open` (resolved) → `InvalidTransition`.
@@ -148,31 +147,6 @@ fn code_hash(id: Uuid, code: &str) -> String {
     hex::encode(Sha256::digest(format!("{id}:{code}").as_bytes()))
 }
 
-/// The `notify_seq` for one approval prompt job. The table's unique key is
-/// (alert, recipient, channel, notify_seq) and does not include `escalation_step`, so a prompt
-/// for someone this notification already paged on sms cannot reuse that seq: bump past any
-/// existing sms job of that person (see the module doc's deviation note).
-async fn free_prompt_seq(
-    tx: &mut Transaction<'_, Postgres>,
-    alert_id: Uuid,
-    person_id: &str,
-    base: i32,
-) -> Result<i32, sqlx::Error> {
-    let taken: Vec<(i32,)> = sqlx::query_as(
-        "SELECT notify_seq FROM delivery_jobs \
-         WHERE alert_id = $1 AND recipient_id = $2 AND channel = 'sms'",
-    )
-    .bind(alert_id)
-    .bind(person_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let mut seq = base;
-    while taken.iter().any(|(s,)| *s == seq) {
-        seq += 1;
-    }
-    Ok(seq)
-}
-
 /// Create (or return the pending) approval request; returns its id. See module doc.
 pub async fn request(
     tx: &mut Transaction<'static, Postgres>,
@@ -250,11 +224,10 @@ pub async fn request(
                 "action": action,
             },
         });
-        let seq = free_prompt_seq(tx, alert_id, person_id, notify_seq).await?;
         crate::router::insert_jobs(
             tx,
             alert_id,
-            seq,
+            notify_seq,
             person_id,
             &[PlannedJob {
                 channel: "sms".to_string(),
