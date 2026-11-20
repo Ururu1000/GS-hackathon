@@ -68,16 +68,30 @@ pub enum PathError {
 impl Path {
     /// Parse a fully-qualified path (`raw.a.b`, `fields.type`, `raw/a/b`).
     pub fn parse(s: &str) -> Result<Path, PathError> {
-        Self::parse_inner(s, None)
+        Self::parse_inner(s)
     }
 
-    /// Parse a path where a missing or unknown root means `default` (used by
-    /// schema mappings, whose paths are relative to the raw payload).
+    /// Parse a path that is entirely relative to `default` (schema mappings:
+    /// `id` or `source` there mean payload keys, not envelope fields).
     pub fn parse_with_default_root(s: &str, default: Root) -> Result<Path, PathError> {
-        Self::parse_inner(s, Some(default))
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(PathError::Empty);
+        }
+        let (sep, body) = match s.strip_prefix('/') {
+            Some(rest) => ("/", rest),
+            None => (".", s),
+        };
+        let segments = split_segments(sep, body, s)?;
+        let text = render(default, &segments);
+        Ok(Path {
+            root: default,
+            segments,
+            text,
+        })
     }
 
-    fn parse_inner(s: &str, default: Option<Root>) -> Result<Path, PathError> {
+    fn parse_inner(s: &str) -> Result<Path, PathError> {
         let s = s.trim();
         if s.is_empty() {
             return Err(PathError::Empty);
@@ -96,14 +110,7 @@ impl Path {
                 };
                 (root, segs)
             }
-            None => match default {
-                Some(root) => {
-                    let sep = if s.starts_with('/') { "/" } else { "." };
-                    let body = s.strip_prefix('/').unwrap_or(s);
-                    (root, split_segments(sep, body, s)?)
-                }
-                None => return Err(PathError::UnknownRoot(head.to_string())),
-            },
+            None => return Err(PathError::UnknownRoot(head.to_string())),
         };
         if matches!(root, Root::Schema | Root::Source | Root::Id) && !segments.is_empty() {
             return Err(PathError::ScalarRoot(root.as_str().to_string()));
@@ -233,8 +240,12 @@ mod tests {
     fn default_root_for_mappings() {
         let p = Path::parse_with_default_root("labels.severity", Root::Raw).unwrap();
         assert_eq!(p.as_str(), "raw.labels.severity");
-        let p = Path::parse_with_default_root("raw.x", Root::Raw).unwrap();
-        assert_eq!(p.as_str(), "raw.x");
+        // Envelope names are ordinary payload keys in a mapping (CloudEvents has `id`, `source`).
+        let e = ev(json!({"id": "ce-1", "source": "/svc"}));
+        let p = Path::parse_with_default_root("id", Root::Raw).unwrap();
+        assert_eq!(p.resolve(&e).unwrap().as_ref(), &json!("ce-1"));
+        let p = Path::parse_with_default_root("source", Root::Raw).unwrap();
+        assert_eq!(p.resolve(&e).unwrap().as_ref(), &json!("/svc"));
     }
 
     #[test]

@@ -94,15 +94,24 @@ pub struct Plan {
     pub outbox: Vec<OutboxRow>,
     /// Matches folded into an existing or new alert (for metrics).
     pub folded: usize,
+    /// Fires older than a recovery already seen for their incident key.
+    pub suppressed: usize,
+    /// Latest recovery time per (rule_id, fingerprint), to upsert.
+    pub recoveries: Vec<(String, String, DateTime<Utc>)>,
 }
+
+/// Latest recovery seen per (rule_id, fingerprint). Fire and recovery events
+/// have different event ids, so they can reach the aggregator out of order.
+pub type Recoveries = HashMap<(String, String), DateTime<Utc>>;
 
 fn rank(s: &str) -> u8 {
     Severity::normalize(s).map(Severity::rank).unwrap_or(0)
 }
 
-/// Plan the effect of `batch` given the currently active alerts for its
-/// fingerprints. Pure: no I/O, deterministic except for new alert ids.
-pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, now: DateTime<Utc>) -> Plan {
+/// Plan the effect of `batch` given the currently active alerts and the latest
+/// recoveries for its fingerprints. Pure: no I/O, deterministic except for new
+/// alert ids.
+pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Recoveries, now: DateTime<Utc>) -> Plan {
     let mut states: Vec<AlertState> = existing;
     // (rule_id, fingerprint) → index of the active alert, if any.
     let mut active: HashMap<(String, String), usize> = states
@@ -110,13 +119,18 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, now: DateTime<Utc>
         .enumerate()
         .map(|(i, s)| ((s.rule_id.clone(), s.fingerprint.clone()), i))
         .collect();
-    let mut notifies: Vec<(usize, NotifyReason, &MatchRecord)> = Vec::new();
+    let mut notifies: Vec<(usize, NotifyReason, i32, &MatchRecord)> = Vec::new();
     let mut plan = Plan::default();
+    let mut recovered_dirty = std::collections::HashSet::new();
 
     for m in batch {
         let key = (m.rule_id.clone(), m.fingerprint.clone());
         let current = active.get(&key).copied();
         match m.kind {
+            MatchKind::Fire if recovered.get(&key).is_some_and(|&at| m.ingested_at <= at) => {
+                // The incident already recovered after this fire happened.
+                plan.suppressed += 1;
+            }
             MatchKind::Fire => {
                 if let Some(i) = current.filter(|&i| within(&states[i], m)) {
                     let s = &mut states[i];
@@ -129,7 +143,7 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, now: DateTime<Utc>
                     if rank(&m.severity) > rank(&s.severity) {
                         s.severity = m.severity.clone();
                         s.notify_seq += 1;
-                        notifies.push((i, NotifyReason::SeverityUp, m));
+                        notifies.push((i, NotifyReason::SeverityUp, s.notify_seq, m));
                     }
                     plan.folded += 1;
                 } else {
@@ -145,11 +159,17 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, now: DateTime<Utc>
                     states.push(new_alert(m, generation));
                     let i = states.len() - 1;
                     active.insert(key, i);
-                    notifies.push((i, NotifyReason::New, m));
+                    notifies.push((i, NotifyReason::New, 1, m));
                 }
             }
             MatchKind::Recover => {
-                if let Some(i) = current {
+                let latest = recovered.entry(key.clone()).or_insert(m.ingested_at);
+                if m.ingested_at > *latest {
+                    *latest = m.ingested_at;
+                }
+                recovered_dirty.insert(key.clone());
+                // A recovery older than the alert's latest fire does not close it.
+                if let Some(i) = current.filter(|&i| m.ingested_at >= states[i].last_seen) {
                     let s = &mut states[i];
                     s.status = "resolved".into();
                     s.resolved_at = Some(m.ingested_at);
@@ -173,16 +193,11 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, now: DateTime<Utc>
         }
     }
 
-    for (i, reason, m) in notifies {
+    // One notify per opened alert (and per severity escalation, §5.3); delivery
+    // re-checks eligibility before sending, so an alert resolved in the same
+    // batch is still recorded.
+    for (i, reason, seq, m) in notifies {
         let s = &states[i];
-        // A new alert resolved within the same batch is not paged.
-        if s.status == "resolved" {
-            continue;
-        }
-        let seq = match reason {
-            NotifyReason::New => 1,
-            _ => s.notify_seq,
-        };
         let payload = NotifyPayload {
             alert_id: s.id,
             notify_seq: seq,
@@ -199,6 +214,10 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, now: DateTime<Utc>
             alert_id: s.id,
             payload: serde_json::to_value(payload).expect("notify payload serializes"),
         });
+    }
+    for key in recovered_dirty {
+        let at = recovered[&key];
+        plan.recoveries.push((key.0, key.1, at));
     }
     for s in states.into_iter().filter(|s| s.touched) {
         plan.outbox.push(OutboxRow {
@@ -311,6 +330,22 @@ async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> 
         .collect()
 }
 
+async fn load_recoveries(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> Result<Recoveries> {
+    let (rules, fps): (Vec<String>, Vec<String>) = keys.iter().cloned().unzip();
+    let rows = sqlx::query(
+        "SELECT rule_id, fingerprint, recovered_at FROM recoveries
+         WHERE (rule_id, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[]))",
+    )
+    .bind(&rules)
+    .bind(&fps)
+    .fetch_all(&mut *tx)
+    .await
+    .context("loading recoveries")?;
+    rows.into_iter()
+        .map(|r| Ok(((r.try_get("rule_id")?, r.try_get("fingerprint")?), r.try_get("recovered_at")?)))
+        .collect()
+}
+
 /// Apply one batch in a single transaction. Returns the plan that was written.
 pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
     // Lookup by (rule_id, fingerprint) so the partial unique index is used.
@@ -319,7 +354,8 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
     keys.dedup();
     let mut tx = pool.begin().await?;
     let existing = load_active(&mut tx, &keys).await?;
-    let plan = plan(batch, existing, Utc::now());
+    let recovered = load_recoveries(&mut tx, &keys).await?;
+    let plan = plan(batch, existing, recovered, Utc::now());
 
     if !plan.updates.is_empty() {
         sqlx::query(
@@ -352,6 +388,23 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
         .execute(&mut *tx)
         .await
         .context("inserting alerts")?;
+    }
+    if !plan.recoveries.is_empty() {
+        let (rules, rest): (Vec<String>, Vec<(String, DateTime<Utc>)>) =
+            plan.recoveries.iter().map(|(r, f, at)| (r.clone(), (f.clone(), *at))).unzip();
+        let (fps, ats): (Vec<String>, Vec<DateTime<Utc>>) = rest.into_iter().unzip();
+        sqlx::query(
+            "INSERT INTO recoveries (rule_id, fingerprint, recovered_at)
+             SELECT * FROM unnest($1::text[], $2::text[], $3::timestamptz[])
+             ON CONFLICT (rule_id, fingerprint)
+             DO UPDATE SET recovered_at = GREATEST(recoveries.recovered_at, EXCLUDED.recovered_at)",
+        )
+        .bind(&rules)
+        .bind(&fps)
+        .bind(&ats)
+        .execute(&mut *tx)
+        .await
+        .context("recording recoveries")?;
     }
     if !plan.outbox.is_empty() {
         let rows: Vec<Value> = plan
@@ -492,7 +545,7 @@ mod tests {
     #[test]
     fn five_hundred_dupes_make_one_alert() {
         let batch: Vec<_> = (0..500).map(|i| fire(&format!("e{i}"), "fp", i / 10)).collect();
-        let p = plan(&batch, vec![], t(100));
+        let p = plan(&batch, vec![], Recoveries::new(), t(100));
         assert_eq!(p.inserts.len(), 1);
         assert_eq!(p.inserts[0].count, 500);
         assert_eq!(p.inserts[0].version, 1);
@@ -507,7 +560,7 @@ mod tests {
 
     #[test]
     fn distinct_fingerprints_make_distinct_alerts() {
-        let p = plan(&[fire("a", "fp1", 0), fire("b", "fp2", 0), fire("c", "fp1", 1)], vec![], t(5));
+        let p = plan(&[fire("a", "fp1", 0), fire("b", "fp2", 0), fire("c", "fp1", 1)], vec![], Recoveries::new(), t(5));
         assert_eq!(p.inserts.len(), 2);
         let counts: Vec<i64> = p.inserts.iter().map(|s| s.count).collect();
         assert_eq!(counts, vec![2, 1]);
@@ -515,11 +568,11 @@ mod tests {
 
     #[test]
     fn bump_existing_alert_without_repaging() {
-        let existing = plan(&[fire("a", "fp", 0)], vec![], t(0)).inserts;
+        let existing = plan(&[fire("a", "fp", 0)], vec![], Recoveries::new(), t(0)).inserts;
         let mut ex = existing[0].clone();
         ex.is_new = false;
         ex.touched = false;
-        let p = plan(&[fire("b", "fp", 30), fire("c", "fp", 40)], vec![ex], t(41));
+        let p = plan(&[fire("b", "fp", 30), fire("c", "fp", 40)], vec![ex], Recoveries::new(), t(41));
         assert!(p.inserts.is_empty());
         assert_eq!(p.updates.len(), 1);
         assert_eq!(p.updates[0].count, 3);
@@ -529,10 +582,10 @@ mod tests {
 
     #[test]
     fn window_expiry_retires_and_opens_new_generation() {
-        let mut ex = plan(&[fire("a", "fp", 0)], vec![], t(0)).inserts.remove(0);
+        let mut ex = plan(&[fire("a", "fp", 0)], vec![], Recoveries::new(), t(0)).inserts.remove(0);
         ex.is_new = false;
         ex.touched = false;
-        let p = plan(&[fire("b", "fp", 61)], vec![ex.clone()], t(61));
+        let p = plan(&[fire("b", "fp", 61)], vec![ex.clone()], Recoveries::new(), t(61));
         assert_eq!(p.updates.len(), 1);
         assert!(!p.updates[0].dedup_active);
         assert_eq!(p.updates[0].status, "open", "retired alert stays open");
@@ -544,10 +597,10 @@ mod tests {
 
     #[test]
     fn severity_increase_pages_again() {
-        let mut ex = plan(&[fire("a", "fp", 0)], vec![], t(0)).inserts.remove(0);
+        let mut ex = plan(&[fire("a", "fp", 0)], vec![], Recoveries::new(), t(0)).inserts.remove(0);
         ex.is_new = false;
         ex.touched = false;
-        let p = plan(&[m("b", "fp", 5, MatchKind::Fire, "critical")], vec![ex], t(5));
+        let p = plan(&[m("b", "fp", 5, MatchKind::Fire, "critical")], vec![ex], Recoveries::new(), t(5));
         assert_eq!(p.updates[0].severity, "critical");
         assert_eq!(p.updates[0].notify_seq, 2);
         let n: NotifyPayload = serde_json::from_value(p.outbox[0].payload.clone()).unwrap();
@@ -557,10 +610,10 @@ mod tests {
 
     #[test]
     fn recovery_resolves_active_alert() {
-        let mut ex = plan(&[fire("a", "fp", 0)], vec![], t(0)).inserts.remove(0);
+        let mut ex = plan(&[fire("a", "fp", 0)], vec![], Recoveries::new(), t(0)).inserts.remove(0);
         ex.is_new = false;
         ex.touched = false;
-        let p = plan(&[m("r", "fp", 10, MatchKind::Recover, "error")], vec![ex], t(10));
+        let p = plan(&[m("r", "fp", 10, MatchKind::Recover, "error")], vec![ex], Recoveries::new(), t(10));
         let s = &p.updates[0];
         assert_eq!(s.status, "resolved");
         assert_eq!(s.resolved_reason.as_deref(), Some("recovered"));
@@ -570,19 +623,42 @@ mod tests {
     }
 
     #[test]
-    fn recovery_without_alert_is_ignored_and_fire_after_recovery_opens_new() {
-        let p = plan(&[m("r", "fp", 0, MatchKind::Recover, "error")], vec![], t(0));
-        assert!(p.inserts.is_empty() && p.updates.is_empty() && p.outbox.is_empty());
-
+    fn fire_after_recovery_opens_new_and_both_are_notified() {
         let p = plan(
             &[fire("a", "fp", 0), m("r", "fp", 1, MatchKind::Recover, "error"), fire("b", "fp", 2)],
             vec![],
+            Recoveries::new(),
             t(2),
         );
         assert_eq!(p.inserts.len(), 2);
         assert_eq!(p.inserts[0].status, "resolved");
         assert_eq!(p.inserts[1].status, "open");
-        // The resolved-in-batch alert is not paged; the new one is.
-        assert_eq!(kinds(&p).iter().filter(|k| **k == "notify").count(), 1);
+        // One notify per opened alert; delivery re-checks eligibility.
+        assert_eq!(kinds(&p).iter().filter(|k| **k == "notify").count(), 2);
+    }
+
+    #[test]
+    fn recovery_overtaking_its_fire_suppresses_the_fire() {
+        // The recovery (t=10) reaches the aggregator before the fire it ends (t=5).
+        let p = plan(&[m("r", "fp", 10, MatchKind::Recover, "error")], vec![], Recoveries::new(), t(10));
+        assert!(p.inserts.is_empty() && p.outbox.is_empty());
+        assert_eq!(p.recoveries, vec![("r".to_string(), "fp".to_string(), t(10))]);
+
+        let recovered: Recoveries = [(("r".to_string(), "fp".to_string()), t(10))].into();
+        let p = plan(&[fire("late", "fp", 5)], vec![], recovered.clone(), t(11));
+        assert!(p.inserts.is_empty(), "an incident that already recovered is not reopened");
+        assert_eq!(p.suppressed, 1);
+
+        let p = plan(&[fire("new", "fp", 12)], vec![], recovered, t(12));
+        assert_eq!(p.inserts.len(), 1, "a fire after the recovery opens a new alert");
+    }
+
+    #[test]
+    fn stale_recovery_does_not_close_a_newer_fire() {
+        let mut ex = plan(&[fire("a", "fp", 0), fire("b", "fp", 8)], vec![], Recoveries::new(), t(8)).inserts.remove(0);
+        ex.is_new = false;
+        ex.touched = false;
+        let p = plan(&[m("r", "fp", 5, MatchKind::Recover, "error")], vec![ex], Recoveries::new(), t(9));
+        assert!(p.updates.is_empty(), "recovery at t=5 is older than the fire at t=8");
     }
 }

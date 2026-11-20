@@ -68,12 +68,13 @@ struct Args {
 }
 
 /// Generate one event; `matching` false produces a near-miss that no rule matches.
-fn make_event(rng: &mut impl Rng, keys: u64, matching: bool) -> Value {
-    let k = rng.random_range(0..keys);
+fn make_event(rng: &mut impl Rng, run: &str, keys: u64, matching: bool) -> Value {
+    // Keys are namespaced per run so alerts from earlier runs are never reused.
+    let k = format!("{run}-{:06}", rng.random_range(0..keys));
     match rng.random_range(0..4) {
         0 => json!({
             "type": "WORKFLOW_FAILED",
-            "workflowId": format!("WF-LG-{k:06}"),
+            "workflowId": format!("WF-LG-{k}"),
             "workflowName": "order-settlement",
             "step": "validate-counterparty",
             "severity": "ERROR",
@@ -83,12 +84,12 @@ fn make_event(rng: &mut impl Rng, keys: u64, matching: bool) -> Value {
         }),
         1 => json!({
             "meta": {"schema": "trade.rejected.v1", "producer": "trade-gateway", "ts": chrono::Utc::now().timestamp_millis()},
-            "payload": {"tradeId": format!("T-LG-{k:06}"), "desk": if matching { "rates" } else { "fx" },
+            "payload": {"tradeId": format!("T-LG-{k}"), "desk": if matching { "rates" } else { "fx" },
                         "notional": 25_000_000, "currency": "EUR", "reason": "LIMIT_BREACH"}
         }),
         2 => json!({
             "ts": chrono::Utc::now().to_rfc3339(), "level": if matching { "WARN" } else { "INFO" },
-            "logger": "pricing-engine", "instrument": format!("INS{k:05}"), "msg": "Quote latency over budget"
+            "logger": "pricing-engine", "instrument": format!("INS-{k}"), "msg": "Quote latency over budget"
         }),
         _ => json!({
             "alertname": "HighErrorRate",
@@ -136,12 +137,15 @@ async fn main() -> Result<()> {
                 let Some(Ok(a)) = m.payload().map(serde_json::from_slice::<FeedAlert>) else { continue };
                 let now = Instant::now();
                 updates_seen.fetch_add(1, Ordering::Relaxed);
-                alerts_seen.lock().unwrap().insert(a.id);
+                let first_update = alerts_seen.lock().unwrap().insert(a.id);
                 let Some(eid) = a.last_event_id.as_deref() else { continue };
                 if let Some(t0) = sent_at.lock().unwrap().get(eid).copied() {
                     let us = now.duration_since(t0).as_micros() as u64;
                     let _ = latency.lock().unwrap().record(us.max(1));
-                    if a.version == 1 {
+                    // First update seen for this alert. If the relay coalesced the
+                    // opening with later duplicates, this times the newest folded
+                    // event, so it is a lower bound for that alert.
+                    if first_update {
                         let _ = first_alert.lock().unwrap().record(us.max(1));
                     }
                 }
@@ -192,7 +196,7 @@ async fn main() -> Result<()> {
     let total_batches = (batches_per_sec * args.duration as f64).round() as u64;
     let start = Instant::now();
     println!(
-        "loadgen {run_id}: {} ev/s for {}s in batches of {} ({total_batches} requests), keys={}, match={}",
+        "loadgen {run_id}: {} ev/s for {}s in batches of {} ({total_batches} requests), keys={}/type/run, match={}",
         args.rate, args.duration, args.batch, args.distinct_keys, args.match_ratio
     );
 
@@ -204,24 +208,22 @@ async fn main() -> Result<()> {
         let events: Vec<Value> = (0..args.batch)
             .map(|_| {
                 let matching = rng.random_bool(args.match_ratio.clamp(0.0, 1.0));
-                make_event(&mut rng, args.distinct_keys, matching)
+                make_event(&mut rng, &run_id, args.distinct_keys, matching)
             })
             .collect();
         let key = format!("{run_id}-{b}");
+        // Open loop: never wait for a slot. Over the concurrency budget the
+        // batch is shed on the client side and reported, and the clock keeps going.
+        let Ok(permit) = sem.clone().try_acquire_owned() else {
+            late.fetch_add(events.len() as u64, Ordering::Relaxed);
+            continue;
+        };
         {
             let mut map = sent_at.lock().unwrap();
             for i in 0..events.len() {
                 map.insert(format!("http:lg:{key}-{i}"), intended);
             }
         }
-        let permit = match sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                // Over the concurrency budget: still send (open loop), but count it.
-                late.fetch_add(1, Ordering::Relaxed);
-                sem.clone().acquire_owned().await?
-            }
-        };
         let (client, url, counters) = (client.clone(), args.url.clone(), counters.clone());
         let n = events.len() as u64;
         handles.push(tokio::spawn(async move {
@@ -344,7 +346,7 @@ impl Report {
         s.push_str(&format!("| Host | {host} |\n| Ingest URL | {} |\n\n", a.url));
         s.push_str("## Throughput\n\n| Metric | Value |\n|---|---|\n");
         s.push_str(&format!(
-            "| Sent | {} |\n| Accepted (202) | {} |\n| Rejected (429) | {} |\n| Failed | {} |\n| Accepted rate | {:.0} events/s |\n| Requests over concurrency budget | {} |\n| Alert updates observed | {} |\n| Distinct alerts observed | {} |\n| Drain after send stopped | {:.1} s |\n\n",
+            "| Sent | {} |\n| Accepted (202) | {} |\n| Rejected (429) | {} |\n| Failed | {} |\n| Accepted rate | {:.0} events/s |\n| Shed by client (over concurrency budget) | {} events |\n| Alert updates observed | {} |\n| Distinct alerts observed | {} |\n| Drain after send stopped | {:.1} s |\n\n",
             self.sent,
             self.accepted,
             self.rejected_429,

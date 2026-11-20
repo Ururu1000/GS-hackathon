@@ -14,6 +14,7 @@ use beacon_core::{ConfigSnapshot, Event};
 use beacon_ingest::kafka::{self, ALERTS_MATCHES, EVENTS_RAW};
 use futures::future::join_all;
 use rdkafka::Message;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord};
 use tokio::sync::watch;
@@ -65,7 +66,9 @@ pub async fn run_matcher(
                         matched += matches.len() as u64;
                         for rec in matches {
                             let payload = serde_json::to_vec(&rec)?;
-                            pending.push(send(&producer, &rec.fingerprint, payload).await);
+                            if let Some(f) = send(&producer, &rec.fingerprint, payload).await {
+                                pending.push(f);
+                            }
                         }
                     }
                     Some(Err(e)) => error!(offset = m.offset(), error = %e, "undecodable event in events.raw; skipped"),
@@ -84,13 +87,19 @@ pub async fn run_matcher(
 }
 
 /// Enqueue without blocking; if the local queue is full, wait and retry.
-async fn send(producer: &FutureProducer, key: &str, payload: Vec<u8>) -> DeliveryFuture {
+/// A permanent rejection (e.g. a match over the record size limit) is logged
+/// and dropped rather than retried forever.
+async fn send(producer: &FutureProducer, key: &str, payload: Vec<u8>) -> Option<DeliveryFuture> {
     loop {
         match producer.send_result(FutureRecord::to(ALERTS_MATCHES).key(key).payload(&payload)) {
-            Ok(f) => return f,
-            Err((e, _)) => {
-                warn!(error = %e, "producer queue full; backing off");
+            Ok(f) => return Some(f),
+            Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) => {
+                warn!("producer queue full; backing off");
                 tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err((e, _)) => {
+                error!(fingerprint = key, bytes = payload.len(), error = %e, "match rejected by producer; dropped");
+                return None;
             }
         }
     }

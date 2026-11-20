@@ -177,20 +177,6 @@ impl Condition {
         out[idx].result = result;
         result
     }
-
-    /// Visit every leaf (used for rule pre-indexing and UI field pickers).
-    pub fn leaves(&self) -> Vec<&Leaf> {
-        let mut out = Vec::new();
-        fn go<'a>(c: &'a Condition, out: &mut Vec<&'a Leaf>) {
-            match c {
-                Condition::All(cs) | Condition::Any(cs) => cs.iter().for_each(|c| go(c, out)),
-                Condition::Not(c) => go(c, out),
-                Condition::Leaf(l) => out.push(l),
-            }
-        }
-        go(self, &mut out);
-        out
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

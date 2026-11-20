@@ -91,26 +91,23 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
             .payload()
             .ok_or_else(|| "empty payload".to_string())
             .and_then(|p| serde_json::from_slice::<serde_json::Value>(p).map_err(|e| e.to_string()));
+        // Undecodable or oversized payloads go to quarantine; either way the
+        // upstream offset is stored only after the broker acknowledged a write.
+        let mut quarantine_reason: Option<String> = parsed.as_ref().err().cloned();
         let mut backoff = Duration::from_millis(100);
         loop {
-            let res = match &parsed {
-                Ok(raw) => publisher.publish(&Event::new(id.clone(), spec.id.clone(), raw.clone())).await,
-                Err(reason) => quarantine(&publisher, &id, msg.payload().unwrap_or_default(), reason).await,
+            let res = match (&parsed, &quarantine_reason) {
+                (_, Some(reason)) => quarantine(&publisher, &id, msg.payload().unwrap_or_default(), reason).await,
+                (Ok(raw), None) => publisher.publish(&Event::new(id.clone(), spec.id.clone(), raw.clone())).await,
+                (Err(_), None) => unreachable!("parse errors always set a quarantine reason"),
             };
             match res {
                 Ok(()) => break,
-                Err(PublishError::TooLarge) => {
-                    // Retrying can never succeed: quarantine a truncated copy and move on.
-                    let p = msg.payload().unwrap_or_default();
-                    let head = &p[..p.len().min(64 * 1024)];
-                    let reason = format!("too large for events.raw ({} bytes); payload truncated to {} bytes", p.len(), head.len());
-                    if let Err(e) = quarantine(&publisher, &id, head, &reason).await {
-                        error!(source = %spec.id, error = %e, "quarantine of oversized payload failed; skipping");
-                    }
-                    break;
+                Err(PublishError::TooLarge) if quarantine_reason.is_none() => {
+                    let len = msg.payload().map_or(0, <[u8]>::len);
+                    quarantine_reason = Some(format!("too large for events.raw ({len} bytes)"));
                 }
                 Err(e) => {
-                    // Never skip: the upstream offset is not stored until the publish succeeds.
                     warn!(source = %spec.id, error = %e, "publish failed, retrying");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -128,8 +125,12 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
     Ok(())
 }
 
+/// Quarantined copies are capped so the quarantine write itself always fits.
+const QUARANTINE_MAX: usize = 64 * 1024;
+
 async fn quarantine(publisher: &EventPublisher, id: &str, payload: &[u8], reason: &str) -> Result<(), PublishError> {
-    warn!(%id, %reason, "quarantining undecodable payload");
+    warn!(%id, %reason, "quarantining payload");
+    let payload = &payload[..payload.len().min(QUARANTINE_MAX)];
     let headers = OwnedHeaders::new().insert(Header { key: "reason", value: Some(reason) });
     let record = FutureRecord::to(EVENTS_QUARANTINE).key(id).payload(payload).headers(headers);
     publisher
