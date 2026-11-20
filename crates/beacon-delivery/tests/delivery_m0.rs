@@ -2,7 +2,7 @@
 //!
 //! Needs Postgres (`DATABASE_URL`, sqlx creates a throwaway database per test) and, for the
 //! tests that touch email, Mailpit (SMTP `SMTP_HOST:SMTP_PORT`, default localhost:1025, and
-//! API `MAILPIT_URL`, default http://localhost:8025). See `deploy/compose.delivery-dev.yml`.
+//! API `MAILPIT_URL`, default http://localhost:8025). Infra: `docker compose -f deploy/docker-compose.yml up -d postgres mailpit`.
 //!
 //! Run: `cargo test -p beacon-delivery --test delivery_m0 -- --nocapture`
 //!
@@ -96,7 +96,7 @@ async fn db_now_gt(pool: &PgPool, job_id: Uuid, column: &str) -> bool {
 // 1. Router
 // ---------------------------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn router_expands_team_and_is_idempotent(pool: PgPool) {
     let dir = directory();
     let cfg = RouterConfig::default();
@@ -171,7 +171,7 @@ async fn router_expands_team_and_is_idempotent(pool: PgPool) {
     assert_eq!(job_rows(&pool, alert).await.len(), 6);
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn router_skips_bad_targets_and_marks_malformed_processed(pool: PgPool) {
     let dir = directory();
     let cfg = RouterConfig::default();
@@ -234,7 +234,7 @@ async fn router_skips_bad_targets_and_marks_malformed_processed(pool: PgPool) {
 // 2. Worker + real EmailChannel -> Mailpit
 // ---------------------------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn worker_sends_through_mailpit(pool: PgPool) {
     let tag = unique_tag();
     let title = alert_title(&tag);
@@ -276,7 +276,7 @@ async fn worker_sends_through_mailpit(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn end_to_end_router_then_worker_then_mailpit(pool: PgPool) {
     let tag = unique_tag();
     let title = alert_title(&tag);
@@ -323,7 +323,7 @@ async fn end_to_end_router_then_worker_then_mailpit(pool: PgPool) {
 // 3. Ack / resolve before the worker runs
 // ---------------------------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn acked_or_resolved_alert_cancels_job_without_sending(pool: PgPool) {
     for status in ["acked", "resolved"] {
         let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
@@ -344,17 +344,20 @@ async fn acked_or_resolved_alert_cancels_job_without_sending(pool: PgPool) {
         assert_eq!(fake.calls(), 0, "{status}: channel must not be called");
         assert!(fake.sent().is_empty());
     }
-
-    // An alert row that does not exist at all is also cancelled, never sent.
+    // A job for a missing alert can no longer exist: delivery_jobs_alert_fk enforces it.
     let missing = Uuid::new_v4();
-    let job_id = insert_job(&pool, missing, "anna", "anna@example.test").await;
-    let (fake, channel) = FakeChannel::new().into_channel();
-    work_once_bounded(&pool, &channel, &worker_cfg("w-cancel")).await;
-    assert_eq!(job_row(&pool, job_id).await.status, "cancelled");
-    assert_eq!(fake.calls(), 0);
+    let err = sqlx::query(
+        "INSERT INTO delivery_jobs (alert_id, notify_seq, recipient_id, channel, address) \
+         VALUES ($1, 1, 'anna', 'email', 'anna@example.test')",
+    )
+    .bind(missing)
+    .execute(&pool)
+    .await
+    .expect_err("FK must reject a job for a missing alert");
+    assert!(err.to_string().contains("delivery_jobs_alert_fk"), "{err}");
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn acked_or_resolved_alert_sends_no_email(pool: PgPool) {
     let channel = email_channel();
     for status in ["acked", "resolved"] {
@@ -380,7 +383,7 @@ async fn acked_or_resolved_alert_sends_no_email(pool: PgPool) {
 // 4. Failures and retries
 // ---------------------------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn smtp_down_is_retried_with_backoff_then_sent(pool: PgPool) {
     let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let job_id = insert_job(&pool, alert, "anna", "anna@example.test").await;
@@ -426,7 +429,7 @@ async fn smtp_down_is_retried_with_backoff_then_sent(pool: PgPool) {
     assert_eq!(fake.sent(), vec![job_id]);
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn transient_failure_on_last_attempt_is_dead(pool: PgPool) {
     let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let job_id = insert_job_max(&pool, alert, "anna", "anna@example.test", 1).await;
@@ -457,7 +460,7 @@ async fn transient_failure_on_last_attempt_is_dead(pool: PgPool) {
     assert_eq!(again.claimed, 0);
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn permanent_error_is_dead_at_once(pool: PgPool) {
     let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let job_id = insert_job(&pool, alert, "anna", "anna@example.test").await; // max_attempts 8
@@ -479,7 +482,7 @@ async fn permanent_error_is_dead_at_once(pool: PgPool) {
 // 5. Leases
 // ---------------------------------------------------------------------------------------------
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn expired_lease_is_reclaimed_and_stale_finalize_is_fenced(pool: PgPool) {
     let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let job_id = insert_job(&pool, alert, "anna", "anna@example.test").await;
@@ -581,7 +584,7 @@ async fn expired_lease_is_reclaimed_and_stale_finalize_is_fenced(pool: PgPool) {
     assert!(!finalize_sent(&pool, job_id, token_b, &r).await.unwrap());
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn expired_lease_without_attempts_left_is_dead_lettered(pool: PgPool) {
     let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let exhausted: Uuid = sqlx::query_scalar(
@@ -685,7 +688,7 @@ async fn drain(pool: &PgPool, channel: &Arc<dyn Channel>, workers: usize, limit:
     );
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_workers_send_each_job_exactly_once_fake(pool: PgPool) {
     let pool = big_pool(&pool, 20).await;
     let alert = insert_many_jobs(&pool, &alert_title(&unique_tag()), LOAD_JOBS).await;
@@ -717,7 +720,7 @@ async fn concurrent_workers_send_each_job_exactly_once_fake(pool: PgPool) {
     assert_eq!(fake.calls() as i64, LOAD_JOBS);
 }
 
-#[sqlx::test(migrations = "../../migrations", fixtures("stub_alerts_outbox"))]
+#[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_workers_deliver_1000_emails_to_mailpit(pool: PgPool) {
     let pool = big_pool(&pool, 20).await;
     let tag = unique_tag();

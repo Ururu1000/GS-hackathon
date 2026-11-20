@@ -78,30 +78,13 @@ pub struct DeliveryJob {
     pub updated_at: DateTime<Utc>,
 }
 
-/// `outbox.payload` for `kind = 'notify'`, written by the aggregator (part (a)), board #27.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotifyPayload {
-    pub alert_id: Uuid,
-    pub notify_seq: i32,
-    pub rule_id: String,
-    pub rule_revision: i64,
-    pub severity: String,
-    /// `new | severity_up | renotify`.
-    pub reason: String,
-    /// The rule's `route:` as configured, unexpanded.
-    pub route: Vec<RouteEntry>,
-    pub created_at: DateTime<Utc>,
-}
+/// `outbox.payload` for `kind = 'notify'`, written by the aggregator (part (a)), board #27/#91.
+/// The wire type is owned by `beacon-core` so both sides compile against one definition.
+pub use beacon_core::model::{NotifyPayload, NotifyReason};
 
-/// One entry of a rule's `route:` list (SPEC §4.3).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteEntry {
-    /// `team:<id>`, `user:<id>` or `oncall:<schedule>`.
-    pub to: String,
-    /// Explicit channel restriction. When present it takes precedence (PR #1 review, finding 4).
-    #[serde(default)]
-    pub channels: Option<Vec<String>>,
-}
+/// One entry of a rule's `route:` list (SPEC §4.3): `to` is `team:<id>`, `user:<id>` or
+/// `oncall:<schedule>`; explicit `channels` take precedence (PR #1 review, finding 4).
+pub use beacon_core::rule::RouteSpec as RouteEntry;
 
 /// Alert status as stored in `alerts.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
