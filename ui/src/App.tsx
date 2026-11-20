@@ -3,9 +3,10 @@ import { getSession, transition, type TransitionOp } from './api/client'
 import type { FeedAlert, Session } from './api/types'
 import { AlertDetail } from './alert/AlertDetail'
 import { FeedList } from './feed/FeedList'
-import { FilterBar } from './feed/FilterBar'
+import { FilterChips, SearchBox } from './feed/FilterBar'
 import { defaultFilters, facetCounts, loadFilters, matches, saveFilters, type Filters } from './feed/filters'
 import { useFeedStream, type Connection } from './feed/useFeedStream'
+import { BeaconLogo, KeyboardIcon, MoonIcon, SunIcon } from './lib/icons'
 import { useNow } from './lib/time'
 
 // ---- tiny hash router: #/alerts/<id> selects an alert ----------------------
@@ -49,7 +50,7 @@ function useToasts() {
   return { toasts, push }
 }
 
-// ---- persisted team scope -----------------------------------------------------
+// ---- persisted team scope & theme --------------------------------------------
 
 const TEAM_KEY = 'beacon.team'
 function loadTeam(): string | null {
@@ -60,9 +61,56 @@ function loadTeam(): string | null {
   }
 }
 
+type ThemePref = 'system' | 'light' | 'dark'
+const THEME_KEY = 'beacon.theme'
+
+function loadTheme(): ThemePref {
+  try {
+    const v = localStorage.getItem(THEME_KEY)
+    return v === 'light' || v === 'dark' ? v : 'system'
+  } catch {
+    return 'system'
+  }
+}
+
+function useTheme(): ['light' | 'dark', () => void] {
+  const [pref, setPref] = useState<ThemePref>(loadTheme)
+  const [systemDark, setSystemDark] = useState(() =>
+    typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)').matches : true,
+  )
+
+  useEffect(() => {
+    if (typeof matchMedia !== 'function') return
+    const mq = matchMedia('(prefers-color-scheme: dark)')
+    const on = () => setSystemDark(mq.matches)
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
+  }, [])
+
+  const resolved: 'light' | 'dark' = pref === 'system' ? (systemDark ? 'dark' : 'light') : pref
+
+  useEffect(() => {
+    const root = document.documentElement
+    if (pref === 'system') delete root.dataset.theme
+    else root.dataset.theme = pref
+    try {
+      if (pref === 'system') localStorage.removeItem(THEME_KEY)
+      else localStorage.setItem(THEME_KEY, pref)
+    } catch {
+      /* ignore */
+    }
+  }, [pref])
+
+  const toggle = useCallback(() => {
+    setPref(resolved === 'dark' ? 'light' : 'dark')
+  }, [resolved])
+
+  return [resolved, toggle]
+}
+
 const CONNECTION_LABEL: Record<Connection, string> = {
   connecting: 'Connecting…',
-  live: 'Live',
+  live: '',
   reconnecting: 'Reconnecting…',
 }
 
@@ -74,6 +122,7 @@ export function App() {
   const [selectedId, select] = useSelection()
   const [pending, setPending] = useState<{ id: string; op: TransitionOp } | null>(null)
   const [help, setHelp] = useState(false)
+  const [theme, toggleTheme] = useTheme()
   const searchRef = useRef<HTMLInputElement>(null)
   const { toasts, push } = useToasts()
   const now = useNow(15_000)
@@ -107,7 +156,7 @@ export function App() {
     async (alert: FeedAlert, op: TransitionOp) => {
       if (pending) return
       if (op === 'ack' && alert.status !== 'open') {
-        push('warn', alert.status === 'acked' ? 'Already acknowledged.' : 'Resolved alerts can’t be acknowledged.')
+        push('warn', alert.status === 'acked' ? 'Already acknowledged.' : 'This alert is already resolved.')
         return
       }
       if (op === 'resolve' && alert.status === 'resolved') {
@@ -177,7 +226,10 @@ export function App() {
   return (
     <div className={`app ${selected ? 'has-detail' : ''}`}>
       <header className="topbar">
-        <div className="brand">Beacon</div>
+        <div className="brand">
+          <BeaconLogo size={26} />
+          <span>Beacon</span>
+        </div>
         <label>
           <span className="sr-only">Team</span>
           <select className="select" value={team ?? ''} onChange={(e) => changeTeam(e.target.value || null)}>
@@ -187,18 +239,41 @@ export function App() {
             ))}
           </select>
         </label>
+        <FilterChips filters={filters} counts={counts} onChange={changeFilters} />
         <div className="spacer" />
-        <div className={`conn conn-${connection}`} role="status" title={state.snapshotAt ? `Last snapshot ${new Date(state.snapshotAt).toLocaleTimeString()}. ${state.stats.upserts.toLocaleString()} updates applied, ${state.stats.stale} stale updates dropped.` : undefined}>
-          <span className="conn-dot" aria-hidden="true" />
-          {CONNECTION_LABEL[connection]}
+        {/* Shown only when the stream is down: a live feed needs no badge. */}
+        <div className={`conn conn-${connection}`} role="status">
+          {connection !== 'live' && (
+            <>
+              <span className="conn-dot" aria-hidden="true" />
+              {CONNECTION_LABEL[connection]}
+            </>
+          )}
         </div>
-        <div className="user">{session?.user.name ?? (sessionError ? 'API unreachable' : '…')}</div>
-        <button className="icon-btn" onClick={() => setHelp(true)} aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
+        <div className="user">{session?.user.name ?? (sessionError ? 'Can’t reach the server' : '…')}</div>
+        <div className="topbar-actions">
+          <button
+            className="icon-btn"
+            onClick={toggleTheme}
+            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+            title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          >
+            {theme === 'dark' ? <SunIcon size={15} /> : <MoonIcon size={15} />}
+          </button>
+          <button
+            className="icon-btn"
+            onClick={() => setHelp((h) => !h)}
+            aria-label="Keyboard shortcuts (?)"
+            title="Keyboard shortcuts (?)"
+          >
+            <KeyboardIcon size={15} />
+          </button>
+        </div>
       </header>
 
       <main className="layout">
         <section className="feed" aria-label={`Live feed: ${teamName}`}>
-          <FilterBar ref={searchRef} filters={filters} counts={counts} onChange={changeFilters} />
+          <SearchBox ref={searchRef} filters={filters} onChange={changeFilters} onReset={() => changeFilters(defaultFilters)} />
           <FeedList
             alerts={visible}
             inserted={state.inserted}
@@ -210,10 +285,10 @@ export function App() {
                 {connection !== 'live' && state.stats.snapshots === 0 ? (
                   <p>Connecting to the live feed…</p>
                 ) : all.length === 0 ? (
-                  <p>No alerts for {teamName} yet. New alerts appear here as they fire.</p>
+                  <p>No alerts for {teamName} right now. New ones appear here automatically.</p>
                 ) : (
                   <>
-                    <p>{all.length} alert{all.length === 1 ? '' : 's'} hidden by the filters.</p>
+                    <p>No alerts match your filters. {all.length} alert{all.length === 1 ? ' is' : 's are'} hidden.</p>
                     <button className="btn" onClick={() => changeFilters({ ...defaultFilters, status: new Set(['open', 'acked', 'resolved']) })}>
                       Show everything
                     </button>
@@ -258,11 +333,10 @@ export function App() {
             <dl className="shortcuts">
               <dt><kbd>j</kbd> <kbd>↓</kbd></dt><dd>Next alert</dd>
               <dt><kbd>k</kbd> <kbd>↑</kbd></dt><dd>Previous alert</dd>
-              <dt><kbd>a</kbd></dt><dd>Acknowledge the selected alert</dd>
-              <dt><kbd>r</kbd></dt><dd>Resolve the selected alert</dd>
+              <dt><kbd>a</kbd></dt><dd>Acknowledge</dd>
+              <dt><kbd>r</kbd></dt><dd>Resolve</dd>
               <dt><kbd>/</kbd></dt><dd>Search</dd>
-              <dt><kbd>Esc</kbd></dt><dd>Close the detail</dd>
-              <dt><kbd>?</kbd></dt><dd>This help</dd>
+              <dt><kbd>Esc</kbd></dt><dd>Close</dd>
             </dl>
             <button className="btn btn-primary" onClick={() => setHelp(false)} autoFocus>Close</button>
           </div>

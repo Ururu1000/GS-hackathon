@@ -1,3 +1,4 @@
+import { useId } from 'react'
 import { COLOR_TOKENS, type AlertStatus, type ColorToken, type FeedAlert, type Severity } from '../api/types'
 import { fmtCount } from '../lib/time'
 
@@ -10,62 +11,91 @@ export const SEVERITY_LABEL: Record<Severity, string> = {
 
 export const STATUS_LABEL: Record<AlertStatus, string> = {
   open: 'Open',
-  acked: 'Acked',
+  acked: 'Acknowledged',
   resolved: 'Resolved',
+}
+
+/** Actor ids as people read them: `user:sam` → "sam", `system` → "Beacon". */
+export function actorName(actor: string | null): string {
+  if (!actor) return 'someone'
+  if (actor === 'system') return 'Beacon'
+  if (actor.startsWith('rule:')) return 'an alert rule'
+  return actor.replace(/^user:/, '')
+}
+
+/** `resolved_reason` codes in plain words; null when a person resolved it by hand. */
+export function resolvedReasonText(reason: string | null): string | null {
+  switch (reason) {
+    case null:
+    case 'user':
+      return null
+    case 'quiet_for':
+      return 'no new events for a while'
+    case 'recovered':
+      return 'the source reported it recovered'
+    default:
+      return reason.replace(/_/g, ' ')
+  }
+}
+
+/** "Resolved by sam", or "Resolved automatically: no new events for a while". */
+export function resolvedText(by: string | null, reason: string | null): string {
+  const why = resolvedReasonText(reason)
+  if (by === 'system') return why ? `Resolved automatically: ${why}` : 'Resolved automatically'
+  return `Resolved by ${actorName(by)}${why ? `: ${why}` : ''}`
 }
 
 /** Unknown colour tokens fall back to grey (contract: render, don't fail). */
 export const colorToken = (c: string): ColorToken => ((COLOR_TOKENS as readonly string[]).includes(c) ? (c as ColorToken) : 'grey')
 
-/** Severity is carried by silhouette (octagon / circle-x / triangle / circle-i), not by colour alone. */
-const GLYPH: Record<Severity, React.ReactNode> = {
+/** Severity reads from silhouette and weight, not colour alone: solid octagon,
+ * solid circle, solid triangle, then an outlined circle for info. The glyph is
+ * cut out with a mask so it shows the row background in every state. */
+const SHAPE: Record<Exclude<Severity, 'info'>, React.ReactNode> = {
+  critical: <path d="M8.3 2.75h7.4l5.55 5.55v7.4l-5.55 5.55H8.3l-5.55-5.55V8.3z" />,
+  error: <circle cx="12" cy="12" r="9.75" />,
+  warning: <path d="M12 3.25 21.75 20.25H2.25z" />,
+}
+const CUT: Record<Exclude<Severity, 'info'>, React.ReactNode> = {
   critical: (
-    // Solid, with the "!" cut out: the heaviest glyph for the heaviest severity.
-    <path
-      d="M8.6 2.5h6.8l6.1 6.1v6.8l-6.1 6.1H8.6l-6.1-6.1V8.6zM11 6.8h2v6.4h-2zM12 14.9a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 0 0 0-2.6z"
-      fill="currentColor"
-      fillRule="evenodd"
-      strokeWidth="1.2"
-    />
-  ),
-  error: (
     <>
-      <circle cx="12" cy="12" r="9.5" fill="currentColor" fillOpacity=".16" />
-      <path d="M8.8 8.8l6.4 6.4M15.2 8.8l-6.4 6.4" />
+      <path d="M12 7.25v5.5" />
+      <circle cx="12" cy="16.6" r="1.4" fill="#000" stroke="none" />
     </>
   ),
+  error: <path d="M8.75 8.75l6.5 6.5M15.25 8.75l-6.5 6.5" />,
   warning: (
     <>
-      <path d="M12 3 22 20.5H2z" fill="currentColor" fillOpacity=".16" />
-      <path d="M12 9.5v4.5M12 17.2h.01" />
-    </>
-  ),
-  info: (
-    <>
-      <circle cx="12" cy="12" r="9.5" fill="currentColor" fillOpacity=".16" />
-      <path d="M12 11v5.5M12 7.6h.01" />
+      <path d="M12 9.5v4.25" />
+      <circle cx="12" cy="17.05" r="1.3" fill="#000" stroke="none" />
     </>
   ),
 }
 
 export function SeverityIcon({ severity, size = 16 }: { severity: Severity; size?: number }) {
   const label = SEVERITY_LABEL[severity] ?? severity
+  const mask = `sev-${useId().replace(/[^\w-]/g, '')}`
+  const sev = severity in CUT ? (severity as keyof typeof CUT) : null
   return (
-    <svg
-      className={`sev-icon sev-${severity}`}
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      role="img"
-      aria-label={label}
-    >
+    <svg className={`sev-icon sev-${severity}`} width={size} height={size} viewBox="0 0 24 24" role="img" aria-label={label}>
       <title>{label}</title>
-      {GLYPH[severity] ?? GLYPH.info}
+      {sev ? (
+        <>
+          <mask id={mask}>
+            <rect width="24" height="24" fill="#fff" />
+            <g fill="none" stroke="#000" strokeWidth="2.4" strokeLinecap="round">{CUT[sev]}</g>
+          </mask>
+          <g mask={`url(#${mask})`} fill="currentColor" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+            {SHAPE[sev]}
+          </g>
+        </>
+      ) : (
+        <g fill="none" stroke="currentColor" strokeLinecap="round">
+          <circle cx="12" cy="12" r="9.25" strokeWidth="1.75" />
+          <path d="M12 11v5.5" strokeWidth="2.2" />
+          <circle cx="12" cy="7.6" r="1.3" fill="currentColor" stroke="none" />
+        </g>
+      )}
     </svg>
   )
 }
@@ -74,8 +104,8 @@ export function SeverityIcon({ severity, size = 16 }: { severity: Severity; size
 export function SeverityBadge({ severity, withLabel = false }: { severity: Severity; withLabel?: boolean }) {
   if (!withLabel) return <SeverityIcon severity={severity} />
   return (
-    <span className="sev-badge">
-      <SeverityIcon severity={severity} />
+    <span className={`sev-badge sev-${severity}`}>
+      <SeverityIcon severity={severity} size={14} />
       {SEVERITY_LABEL[severity] ?? severity}
     </span>
   )
@@ -85,20 +115,21 @@ export function SeverityBadge({ severity, withLabel = false }: { severity: Sever
 export function StatusPill({ alert, quiet = false }: { alert: FeedAlert; quiet?: boolean }) {
   if (quiet && alert.status === 'open') return <span className="sr-only">Open</span>
   const who = alert.status === 'acked' ? alert.acked_by : alert.status === 'resolved' ? alert.resolved_by : null
+  const title = alert.status === 'resolved' ? resolvedText(alert.resolved_by, alert.resolved_reason) : who ? `${STATUS_LABEL[alert.status]} by ${actorName(who)}` : undefined
   return (
-    <span className={`status status-${alert.status}`} title={who ? `${STATUS_LABEL[alert.status]} by ${who}` : undefined}>
+    <span className={`status status-${alert.status}`} title={title}>
       {STATUS_LABEL[alert.status] ?? alert.status}
-      {who ? <span className="status-who"> · {who.replace(/^user:/, '')}</span> : null}
+      {who && who !== 'system' ? <span className="status-who"> · {actorName(who)}</span> : null}
     </span>
   )
 }
 
-/** Live dedup counter. Keyed by value so the CSS pulse replays on change. */
+/** Live dedup counter ("3 times"). Keyed by value so the CSS pulse replays on change. */
 export function CountBadge({ count }: { count: number }) {
   if (count <= 1) return null
   return (
-    <span key={count} className="count count-bump" title={`${count.toLocaleString()} matching events folded into this alert`}>
-      ×{fmtCount(count)}
+    <span key={count} className="count count-bump" title={`${count.toLocaleString()} matching events`}>
+      {fmtCount(count)} times
     </span>
   )
 }

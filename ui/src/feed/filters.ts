@@ -15,6 +15,11 @@ export const defaultFilters: Filters = {
   query: '',
 }
 
+const sameSet = <T>(a: ReadonlySet<T>, b: ReadonlySet<T>) => a.size === b.size && [...a].every((x) => b.has(x))
+
+export const isDefault = (f: Filters) =>
+  sameSet(f.status, defaultFilters.status) && sameSet(f.severity, defaultFilters.severity) && !f.rule && !f.query
+
 export function matches(a: FeedAlert, f: Filters, skip?: 'status' | 'severity' | 'rule'): boolean {
   if (skip !== 'status' && !f.status.has(a.status)) return false
   if (skip !== 'severity' && !f.severity.has(a.severity)) return false

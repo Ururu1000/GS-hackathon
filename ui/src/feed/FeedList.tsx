@@ -3,7 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { FeedAlert } from '../api/types'
 import { AlertRow } from './AlertRow'
 
-export const ROW_H = 56
+export const ROW_H = 66
 const AT_TOP = ROW_H / 2
 
 interface Props {

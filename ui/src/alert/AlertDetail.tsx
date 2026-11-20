@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { getAlert } from '../api/client'
-import type { AlertDetail as Detail, DeliveryStatus, FeedAlert } from '../api/types'
+import type { AlertDetail as Detail, DeliveryStatus, FeedAlert, TimelineEntry } from '../api/types'
 import type { TransitionOp } from '../api/client'
 import { absTime, relTime } from '../lib/time'
-import { colorToken, CountBadge, SeverityBadge, StatusPill } from './badges'
+import { CheckIcon, CloseIcon, CopyIcon } from '../lib/icons'
+import { actorName, colorToken, CountBadge, resolvedReasonText, resolvedText, SeverityBadge, STATUS_LABEL } from './badges'
 
 interface Props {
   /** Live projection from the feed store (count/status update in place). */
@@ -64,44 +65,47 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
       <header className="head">
         <div className="head-top">
           <SeverityBadge severity={a.severity} withLabel />
-          <StatusPill alert={a} />
-          <CountBadge count={a.count} />
-          <button className="icon-btn close" onClick={onClose} aria-label="Close detail (Esc)" title="Close (Esc)">
-            ✕
+          <button className="icon-btn close" onClick={onClose} aria-label="Close (Esc)" title="Close (Esc)">
+            <CloseIcon />
           </button>
         </div>
         <h2 id="detail-title" ref={headingRef} tabIndex={-1}>
           {a.title}
         </h2>
         {a.body && <p className="head-body">{a.body}</p>}
-        <div className="actions">
-          <button
-            className="btn btn-primary"
-            disabled={a.status !== 'open' || pending !== null}
-            onClick={() => onAct('ack')}
-            aria-keyshortcuts="a"
-          >
-            {pending === 'ack' ? 'Acknowledging…' : 'Acknowledge'} <kbd>a</kbd>
-          </button>
-          <button
-            className="btn"
-            disabled={a.status === 'resolved' || pending !== null}
-            onClick={() => onAct('resolve')}
-            aria-keyshortcuts="r"
-          >
-            {pending === 'resolve' ? 'Resolving…' : 'Resolve'} <kbd>r</kbd>
-          </button>
-        </div>
+
+        <StatusLine alert={a} now={now} />
+
+        {a.status !== 'resolved' && (
+          <div className="actions">
+            {a.status === 'open' && (
+              <button className="btn btn-primary" disabled={pending !== null} onClick={() => onAct('ack')} aria-keyshortcuts="a" title="Shortcut: a">
+                {pending === 'ack' ? 'Acknowledging…' : <span><b className="key">A</b>cknowledge</span>}
+              </button>
+            )}
+            <button
+              className={`btn ${a.status === 'acked' ? 'btn-primary' : ''}`}
+              disabled={pending !== null}
+              onClick={() => onAct('resolve')}
+              aria-keyshortcuts="r"
+              title="Shortcut: r"
+            >
+              {pending === 'resolve' ? 'Resolving…' : <span>Mark <b className="key">R</b>esolved</span>}
+            </button>
+          </div>
+        )}
       </header>
 
       {a.fields.length > 0 && (
         <section className="section">
-          <h3>Fields</h3>
           <dl className="fields">
             {a.fields.map((f) => (
               <div key={f.path} className="kv">
-                <dt title={f.path}>{f.label}</dt>
-                <dd>{f.value}</dd>
+                <dt>{f.label}</dt>
+                <dd>
+                  {f.value}
+                  {isId(f.label) && <CopyButton value={f.value} label={f.label} />}
+                </dd>
               </div>
             ))}
           </dl>
@@ -109,108 +113,147 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
       )}
 
       <section className="section">
-        <h3>Runbook</h3>
-        <div className="placeholder">
-          {detail?.runbook ? (
-            <>Runbook “{detail.runbook.title}”, revision {detail.runbook.revision}.</>
-          ) : (
-            <>No runbook is attached to this rule.</>
-          )}
-        </div>
-      </section>
-
-      <section className="section">
-        <h3>About</h3>
-        <dl className="fields">
-          <div className="kv"><dt>Rule</dt><dd title={a.rule.id}>{a.rule.name} <span className="muted">rev {a.rule.revision}</span></dd></div>
-          <div className="kv"><dt>Team</dt><dd>{a.team}</dd></div>
-          <div className="kv"><dt>Source</dt><dd>{a.source} <span className="muted">· {a.schema}</span></dd></div>
-          <div className="kv"><dt>First seen</dt><dd>{absTime(a.first_seen)}</dd></div>
-          <div className="kv"><dt>Last seen</dt><dd>{absTime(a.last_seen)}</dd></div>
-          {a.acked_at && <div className="kv"><dt>Acked</dt><dd>{a.acked_by} · {absTime(a.acked_at)}</dd></div>}
-          {a.resolved_at && (
-            <div className="kv"><dt>Resolved</dt><dd>{a.resolved_by} · {absTime(a.resolved_at)} {a.resolved_reason && <span className="muted">({a.resolved_reason})</span>}</dd></div>
-          )}
-        </dl>
-      </section>
-
-      <section className="section">
-        <h3>Timeline</h3>
-        {error && <div className="placeholder error">Could not load details: {error}</div>}
+        {error && <div className="placeholder error">Couldn’t load this part. It will retry automatically.</div>}
         {!detail && !error && <div className="placeholder">Loading…</div>}
+        {detail && <Deliveries items={detail.deliveries} now={now} />}
+      </section>
+
+      <section className="section">
+        <h3>History</h3>
         {detail && (
           <ol className="timeline">
             {[...detail.timeline].reverse().map((t, i) => (
               <li key={`${t.at}-${i}`} className={`tl tl-${t.kind}`}>
                 <span className="tl-at" title={absTime(t.at)}>{relTime(t.at, now)}</span>
-                <span className="tl-msg">{t.message}</span>
-                <span className="tl-actor">{t.actor}</span>
+                <span className="tl-msg">{timelineText(t)}</span>
               </li>
             ))}
           </ol>
         )}
+        {!detail && !error && <div className="placeholder">Loading…</div>}
       </section>
 
       <section className="section">
-        <h3>Deliveries</h3>
-        {detail && <Deliveries items={detail.deliveries} now={now} />}
+        <dl className="fields">
+          <div className="kv"><dt>Team</dt><dd>{a.team}</dd></div>
+          <div className="kv"><dt>Alert rule</dt><dd>{a.rule.name}</dd></div>
+          {detail?.runbook && <div className="kv"><dt>Runbook</dt><dd>{detail.runbook.title}</dd></div>}
+          <div className="kv"><dt>Started</dt><dd>{absTime(a.first_seen)}</dd></div>
+          <div className="kv"><dt>Latest</dt><dd>{absTime(a.last_seen)}</dd></div>
+        </dl>
       </section>
 
-      {detail && detail.samples.length > 0 && (
-        <section className="section">
-          <h3>Event samples</h3>
-          {detail.samples.map((s) => (
-            <details key={s.event_id} className="sample">
-              <summary>
-                <code>{s.event_id}</code> <span className="muted">· {absTime(s.received_at)}</span>
-              </summary>
-              <pre>{JSON.stringify(s.raw, null, 2)}</pre>
-            </details>
+      <details className="section tech">
+        <summary>Technical details</summary>
+        <dl className="fields">
+          <div className="kv"><dt>Alert ID</dt><dd><code>{a.id}</code><CopyButton value={a.id} label="alert ID" /></dd></div>
+          <div className="kv"><dt>Rule</dt><dd><code>{a.rule.id}</code> <span className="muted">rev {a.rule.revision}</span></dd></div>
+          <div className="kv"><dt>Source</dt><dd><code>{a.source}</code></dd></div>
+          <div className="kv"><dt>Schema</dt><dd><code>{a.schema}</code></dd></div>
+          {a.fields.map((f) => (
+            <div key={f.path} className="kv"><dt>{f.label}</dt><dd><code>{f.path}</code></dd></div>
           ))}
-        </section>
-      )}
+        </dl>
+        {detail && detail.samples.length > 0 && (
+          <>
+            <h4>Raw events</h4>
+            {detail.samples.map((s) => (
+              <details key={s.event_id} className="sample">
+                <summary>
+                  <code>{s.event_id}</code> <span className="muted">· {absTime(s.received_at)}</span>
+                </summary>
+                <pre>{JSON.stringify(s.raw, null, 2)}</pre>
+              </details>
+            ))}
+          </>
+        )}
+      </details>
     </article>
   )
 }
 
-const STATE_LABEL: Record<string, string> = {
-  pending: 'Pending',
-  in_flight: 'Sending',
-  sent: 'Sent',
-  cancelled: 'Cancelled',
-  dead: 'Failed',
-}
-const CHANNEL_LABEL: Record<string, string> = { email: 'Email', sms: 'SMS', phone: 'Phone call', ui: 'UI' }
-const STATE_HINT: Record<string, string> = {
-  cancelled: 'Not sent: the alert was acknowledged or resolved first',
-  dead: 'Gave up after retries',
+/** "Open 17s ago · 6 times" in one line. */
+function StatusLine({ alert: a, now }: { alert: FeedAlert; now: number }) {
+  const at = (iso: string | null) => <span title={absTime(iso)}>{relTime(iso, now)}</span>
+  const why = a.status === 'resolved' ? resolvedReasonText(a.resolved_reason) : null
+  return (
+    <p className="state-line" role="status">
+      <strong className={`status-${a.status}`}>{STATUS_LABEL[a.status]}</strong>{' '}
+      {a.status === 'acked' && <>by {actorName(a.acked_by)} {at(a.acked_at)}</>}
+      {a.status === 'resolved' && <>{a.resolved_by === 'system' ? 'automatically' : `by ${actorName(a.resolved_by)}`} {at(a.resolved_at)}</>}
+      {a.status === 'open' && at(a.first_seen)}
+      {why && <span className="muted"> ({why})</span>}
+      {a.count > 1 && <span className="muted"> · <CountBadge count={a.count} /></span>}
+    </p>
+  )
 }
 
+/** Status changes are phrased from their kind; other entries use the server's message. */
+function timelineText(t: TimelineEntry): string {
+  if (t.kind === 'acked') return `Acknowledged by ${actorName(t.actor)}`
+  if (t.kind === 'resolved') {
+    const reason = t.message.match(/\((\w+)\)\s*$/)?.[1] ?? null
+    return resolvedText(t.actor, reason)
+  }
+  if (t.kind === 'reopened') return 'Reopened: the problem came back'
+  const person = t.actor !== 'system' && !t.actor.startsWith('rule:')
+  return person ? `${t.message} · ${actorName(t.actor)}` : t.message
+}
+
+/** Identifier fields ("Workflow ID", "Trade ID") get a copy button. */
+const isId = (label: string) => /\bid$/i.test(label.trim())
+
+function CopyButton({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const t = setTimeout(() => setCopied(false), 1500)
+    return () => clearTimeout(t)
+  }, [copied])
+  // navigator.clipboard exists only on https or localhost.
+  const copy = () => navigator.clipboard?.writeText(value).then(() => setCopied(true), () => {})
+  return (
+    <button className={`copy-btn ${copied ? 'is-copied' : ''}`} onClick={copy} aria-label={copied ? 'Copied' : `Copy ${label}`} title={copied ? 'Copied' : 'Copy'}>
+      {copied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+    </button>
+  )
+}
+
+const CHANNEL_LABEL: Record<string, string> = { email: 'Email', sms: 'SMS', phone: 'Call', ui: 'In-app' }
+const STATE_LABEL: Record<string, string> = {
+  pending: 'Queued',
+  in_flight: 'Sending…',
+  sent: 'Sent',
+  cancelled: 'Skipped',
+  dead: 'Failed',
+}
+const STATE_HINT: Record<string, string> = {
+  cancelled: 'Alert was handled before this went out',
+}
+
+/** One line per notification: "Email to alexey  alexey@…   Sent 2h ago". */
 function Deliveries({ items, now }: { items: DeliveryStatus[]; now: number }) {
-  if (items.length === 0) return <div className="placeholder">No notifications sent. This alert is shown in the UI only.</div>
+  if (items.length === 0) return <div className="placeholder">No notifications sent</div>
   const sorted = [...items].sort((a, b) => a.recipient.localeCompare(b.recipient) || a.channel.localeCompare(b.channel))
   return (
-    <table className="deliveries">
-      <thead>
-        <tr><th>Recipient</th><th>Channel</th><th>Status</th><th>When</th></tr>
-      </thead>
-      <tbody>
-        {sorted.map((d) => (
-          <tr key={d.id}>
-            <td>
-              {d.recipient.replace(/^user:/, '')}
-              <div className="muted small">{d.address}</div>
-            </td>
-            <td>{CHANNEL_LABEL[d.channel] ?? d.channel}</td>
-            <td>
-              <span className={`dstate dstate-${d.state}`} title={STATE_HINT[d.state]}>{STATE_LABEL[d.state] ?? d.state}</span>
-              {d.attempts > 1 && <span className="muted small"> · {d.attempts} attempts</span>}
+    <ul className="deliveries">
+      {sorted.map((d) => {
+        const at = d.sent_at ?? d.updated_at
+        return (
+          <li key={d.id} className="dl">
+            <div className="dl-main">
+              {CHANNEL_LABEL[d.channel] ?? d.channel} to <strong>{actorName(d.recipient)}</strong>
+              <span className="muted"> {d.address}</span>
               {d.last_error && <div className="small err-text">{d.last_error}</div>}
-            </td>
-            <td className="muted small" title={absTime(d.sent_at ?? d.updated_at)}>{relTime(d.sent_at ?? d.updated_at, now)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+            </div>
+            <div className="dl-side">
+              <span className={`dstate dstate-${d.state}`} title={STATE_HINT[d.state]}>{STATE_LABEL[d.state] ?? d.state}</span>
+              {d.attempts > 1 && <span className="muted"> after {d.attempts} tries</span>}
+              <span className="muted" title={absTime(at)}> · {relTime(at, now)}</span>
+            </div>
+          </li>
+        )
+      })}
+    </ul>
   )
 }

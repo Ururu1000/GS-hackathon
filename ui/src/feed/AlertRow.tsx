@@ -1,7 +1,7 @@
 import { memo } from 'react'
 import type { FeedAlert } from '../api/types'
 import { colorToken, CountBadge, SeverityBadge, StatusPill } from '../alert/badges'
-import { relTime } from '../lib/time'
+import { absTime, relTime } from '../lib/time'
 
 interface Props {
   alert: FeedAlert
@@ -34,8 +34,8 @@ export const AlertRow = memo(function AlertRow({ alert: a, selected, fresh, now,
       </div>
       <div className="row-side">
         <CountBadge count={a.count} />
-        <span className="row-last" title={`Last event ${a.last_seen}`}>
-          {relTime(a.last_seen, now)}
+        <span className="row-age" title={`Opened ${absTime(a.first_seen)}. Last event ${absTime(a.last_seen)}.`}>
+          {relTime(a.first_seen, now)}
         </span>
       </div>
     </div>
