@@ -138,6 +138,36 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
         });
     }
 
+    // Derived: off-hours holds (`crate::offhours`): held outside someone's working hours,
+    // then sent in their digest email when the hours started.
+    type HeldRow = (String, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>);
+    let held: Vec<HeldRow> = sqlx::query_as(
+        "SELECT recipient_id, created_at, release_at, released_at FROM offhours_held \
+         WHERE alert_id = $1 ORDER BY id",
+    )
+    .bind(alert_id)
+    .fetch_all(pool)
+    .await?;
+    for (recipient, at, release_at, released_at) in held {
+        entries.push(Entry {
+            at,
+            actor: "system".to_string(),
+            kind: "held".to_string(),
+            message: format!(
+                "held for {recipient}'s off-hours digest until {}",
+                release_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+            ),
+        });
+        if let Some(released) = released_at {
+            entries.push(Entry {
+                at: released,
+                actor: "system".to_string(),
+                kind: "digest".to_string(),
+                message: format!("sent to {recipient} in their off-hours digest"),
+            });
+        }
+    }
+
     entries.sort_by_key(|e| e.at);
     Ok(entries.iter().map(Entry::to_json).collect())
 }

@@ -1,0 +1,7 @@
+{
+  "alertname": "HighLatency",
+  "labels": { "service": "payments-api", "region": "eu-west", "severity": "warning" },
+  "annotations": { "summary": "p99 latency 1.4 s over the last 10 minutes" },
+  "startsAt": "2026-10-23T02:41:00Z",
+  "status": "firing"
+}

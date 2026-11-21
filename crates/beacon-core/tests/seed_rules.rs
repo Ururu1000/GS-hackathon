@@ -90,10 +90,28 @@ fn anna_fires_and_recovers_on_same_fingerprint() {
     assert_eq!(ev.fields["severity"], json!("warning"));
 
     let (_, rec) = run(&cfg, "http:alertmanager", sample("high-error-rate-resolved.json"));
+    // payments-api-warnings recovers on the same signal too (its own incident, if any).
+    let rec: Vec<_> = rec.into_iter().filter(|m| m.rule_id == "anna-payments-critical").collect();
     assert_eq!(rec.len(), 1, "{rec:?}");
     assert_eq!(rec[0].kind, MatchKind::Recover);
     assert_eq!(rec[0].fingerprint, fire[0].fingerprint);
     assert!(rec[0].event.is_none());
+}
+
+#[test]
+fn payments_warning_routes_to_the_team_by_preference() {
+    let cfg = snapshot();
+    let (_, fire) = run(&cfg, "http:alertmanager", sample("payments-latency-warning.json"));
+    assert_eq!(fire.len(), 1, "{fire:?}");
+    assert_eq!(fire[0].rule_id, "payments-api-warnings");
+    assert_eq!(fire[0].kind, MatchKind::Fire);
+    // No explicit channels: each member's preferences decide (Anna's off-hours digest).
+    assert_eq!(fire[0].route[0].to, "team:payments");
+    assert!(fire[0].route[0].channels.is_none());
+    assert_eq!(fire[0].title, "HighLatency on payments-api (eu-west)");
+    // The critical sample stays Anna's personal rule only.
+    let (_, crit) = run(&cfg, "http:alertmanager", sample("high-error-rate.json"));
+    assert!(crit.iter().all(|m| m.rule_id != "payments-api-warnings"), "{crit:?}");
 }
 
 #[test]

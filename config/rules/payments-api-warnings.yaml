@@ -1,0 +1,25 @@
+# Team Payments: warnings from payments-api go to every member on their own
+# preferred channel (no explicit channels here). Anna gets them by email in her
+# working hours and in ONE morning digest email outside them (`otherwise: [digest]`
+# in config/people/anna.yaml); Frank gets the team default, email.
+id: payments-api-warnings
+name: Warnings on payments-api
+team: payments
+when:
+  all:
+    - { path: fields.service, op: eq, value: payments-api }
+    - { path: fields.severity, op: eq, value: warning }
+    - { not: { path: fields.resolved, op: eq, value: true } }
+route:
+  - to: team:payments
+present:
+  title: "{{ fields.type }} on {{ fields.service }} ({{ fields.region }})"
+  body: "{{ raw.annotations.summary }}"
+  fields:
+    - { path: fields.region, label: Region }
+    - { path: raw.annotations.summary, label: Summary }
+dedup:
+  key: [fields.type, fields.service, fields.region]
+  window: 30m
+auto_resolve:
+  recover_when: { path: fields.resolved, op: eq, value: true }

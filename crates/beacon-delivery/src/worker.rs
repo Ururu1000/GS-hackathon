@@ -514,7 +514,11 @@ async fn process_job(
     };
     // A throttle digest summarizes several alerts: it is never cancelled because the
     // latest alert was acked or resolved, but the alert row must still exist.
-    let is_digest = job.route_info.get("digest").is_some_and(|v| v.is_object());
+    let is_offhours = job
+        .route_info
+        .get("offhours")
+        .is_some_and(|v| v.is_object());
+    let is_digest = is_offhours || job.route_info.get("digest").is_some_and(|v| v.is_object());
     // Only open alerts page people (SPEC §2.2) — with one exception: an acked alert is
     // still being worked on, so its approval-prompt jobs (`route_info.target =
     // "approval"`, frozen by `approvals::request`) stay deliverable; the approval stays
@@ -534,7 +538,18 @@ async fn process_job(
         return finalize_cancelled_logged(pool, &job, token, &format!("alert {status}")).await;
     }
 
-    let alert = if is_digest {
+    let alert = if is_offhours {
+        // The covered alerts' CURRENT state: some may have resolved while they were held.
+        let lines = crate::offhours::digest_lines(pool, &job.route_info).await?;
+        let (title, body) = crate::offhours::render(&lines);
+        AlertView {
+            id: job.alert_id,
+            status,
+            severity,
+            title,
+            body,
+        }
+    } else if is_digest {
         digest_alert_view(job.alert_id, status, severity, &job.route_info)
     } else {
         AlertView {
@@ -548,6 +563,7 @@ async fn process_job(
     // Email carries the filled-in runbook steps (SPEC §5.5); SMS keeps its short link.
     let mut alert = alert;
     if channel.name() == "email"
+        && !is_offhours
         && let Some(section) = crate::runbook::email_section(pool, job.alert_id).await?
     {
         alert.body = format!("{}\n\n{}", alert.body, section);

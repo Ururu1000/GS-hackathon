@@ -20,10 +20,17 @@
 //!   - default: [ui]                                          # matches everything
 //! ```
 //! A rule with `when` and no `otherwise` does not match outside its window (evaluation goes on to
-//! the next rule). `match` keys: `severity`, `service`, `team`, `rule`, `environment`; a key whose
+//! the next rule).
+//!
+//! **Off-hours digest.** `otherwise` may name the pseudo-channel `digest` (alone or next to real
+//! channels): outside the window, the notification is held and sent as part of ONE email at the
+//! window's next start ("overnight: 3 alerts, 1 resolved"), see `crate::offhours`. `digest` is
+//! only valid in `otherwise`, because the window's start is the release time. Critical alerts are
+//! never held (the router sends `digest` as email for them), and escalation steps and runbook
+//! actions, which are urgent by definition, resolve `digest` to email via [`resolve_channels`]. `match` keys: `severity`, `service`, `team`, `rule`, `environment`; a key whose
 //! context value is missing compares false (same as rules).
 
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::config::{ConfigError, Person, Team};
@@ -88,6 +95,35 @@ impl TimeWindow {
     }
 }
 
+impl TimeWindow {
+    /// The first instant strictly after `now` at which the window opens (local `start` in `tz`).
+    /// A start time that falls in a DST gap that day opens at the first valid local time after it
+    /// (an hour later); an ambiguous one (DST fold) opens at its earlier instant.
+    pub fn next_start(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let today = now.with_timezone(&self.tz).date_naive();
+        for day in 0..=2 {
+            let date = today + Duration::days(day);
+            let local = date.and_time(self.start);
+            let opens = self.tz.from_local_datetime(&local).earliest().or_else(|| {
+                // DST gap: the wall-clock start does not exist that day.
+                self.tz
+                    .from_local_datetime(&(local + Duration::hours(1)))
+                    .earliest()
+            });
+            if let Some(t) = opens.map(|t| t.with_timezone(&Utc))
+                && t > now
+            {
+                return t;
+            }
+        }
+        // Unreachable for real time zones (a start exists at least every other day).
+        now + Duration::days(1)
+    }
+}
+
+/// The pseudo-channel that holds a notification for the off-hours digest (`otherwise` only).
+pub const DIGEST: &str = "digest";
+
 /// `H:MM` or `HH:MM`, 24-hour.
 fn parse_hm(s: &str) -> Option<NaiveTime> {
     let (h, m) = s.split_once(':')?;
@@ -130,24 +166,40 @@ pub fn parse_preferences(
         ConfigError::Invalid(format!("person {person_id}: preferences must be a list"))
     })?;
 
-    let channels =
-        |i: usize, v: &serde_json::Value, what: &str| -> Result<Vec<String>, ConfigError> {
-            let list = v
-                .as_array()
-                .filter(|l| !l.is_empty())
-                .ok_or_else(|| at(i, &format!("{what} must be a non-empty list of channels")))?;
-            let mut out = Vec::with_capacity(list.len());
-            for c in list {
-                let name = c
-                    .as_str()
-                    .ok_or_else(|| at(i, &format!("{what} entries must be strings")))?;
-                if !known_channels.contains(&name) {
-                    return Err(at(i, &format!("unknown channel {name:?}")));
+    let channels = |i: usize,
+                    v: &serde_json::Value,
+                    what: &str,
+                    allow_digest: bool|
+     -> Result<Vec<String>, ConfigError> {
+        let list = v
+            .as_array()
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| at(i, &format!("{what} must be a non-empty list of channels")))?;
+        let mut out = Vec::with_capacity(list.len());
+        for c in list {
+            let name = c
+                .as_str()
+                .ok_or_else(|| at(i, &format!("{what} entries must be strings")))?;
+            if name == DIGEST {
+                if !allow_digest {
+                    return Err(at(
+                        i,
+                        &format!(
+                            "`digest` is only allowed in `otherwise` (it is sent when the \
+                                 `when` window next opens), not in {what}"
+                        ),
+                    ));
                 }
-                out.push(name.to_string());
+            } else if !known_channels.contains(&name) {
+                return Err(at(i, &format!("unknown channel {name:?}")));
             }
-            Ok(out)
-        };
+            if out.iter().any(|c| c == name) {
+                continue;
+            }
+            out.push(name.to_string());
+        }
+        Ok(out)
+    };
 
     let mut rules = Vec::with_capacity(entries.len());
     let mut have_default = false;
@@ -170,7 +222,7 @@ pub fn parse_preferences(
                 }
             }
             rules.push(PreferenceRule::Default {
-                channels: channels(i, default, "`default`")?,
+                channels: channels(i, default, "`default`", false)?,
             });
             have_default = true;
             continue;
@@ -218,7 +270,7 @@ pub fn parse_preferences(
         let channels_v = obj
             .get("channels")
             .ok_or_else(|| at(i, "missing `channels`"))?;
-        let rule_channels = channels(i, channels_v, "`channels`")?;
+        let rule_channels = channels(i, channels_v, "`channels`", false)?;
 
         let when = match obj.get("when") {
             None => None,
@@ -250,7 +302,7 @@ pub fn parse_preferences(
                 if when.is_none() {
                     return Err(at(i, "`otherwise` requires `when`"));
                 }
-                Some(channels(i, v, "`otherwise`")?)
+                Some(channels(i, v, "`otherwise`", true)?)
             }
         };
 
@@ -306,12 +358,39 @@ pub struct Resolution {
     /// May contain `ui`; the router skips it (UI delivery is the alert feed itself).
     pub channels: Vec<String>,
     pub decision: Decision,
+    /// Set when `channels` contains [`DIGEST`]: the instant the off-hours window reopens,
+    /// when the held notification is released in the person's digest email.
+    pub hold_until: Option<DateTime<Utc>>,
 }
 
 /// Steps 2–4 of the precedence above (step 1, explicit route channels, is the router's).
 /// `team` is the team whose default applies: the routed team for `team:`/`oncall:` targets,
 /// else the alert's team if the person is a member, else `None`.
 pub fn resolve_channels(
+    person: &Person,
+    team: Option<&Team>,
+    ctx: &RoutingContext,
+    now: DateTime<Utc>,
+) -> Resolution {
+    let mut r = resolve_with_hold(person, team, ctx, now);
+    if r.hold_until.take().is_some() {
+        // Urgent callers (escalation steps, runbook actions) never hold: digest -> email.
+        let mut channels: Vec<String> = Vec::with_capacity(r.channels.len());
+        for c in r.channels.drain(..) {
+            let c = if c == DIGEST { "email".to_string() } else { c };
+            if !channels.contains(&c) {
+                channels.push(c);
+            }
+        }
+        r.channels = channels;
+    }
+    r
+}
+
+/// Like [`resolve_channels`], but keeps the [`DIGEST`] pseudo-channel and sets `hold_until`
+/// (the window's next start) when the matching rule's `otherwise` holds the notification.
+/// Used by the router for an alert's notifications.
+pub fn resolve_with_hold(
     person: &Person,
     team: Option<&Team>,
     ctx: &RoutingContext,
@@ -337,6 +416,7 @@ pub fn resolve_channels(
                                 index,
                                 window: "none",
                             },
+                            hold_until: None,
                         };
                     }
                     Some(true) => {
@@ -346,17 +426,24 @@ pub fn resolve_channels(
                                 index,
                                 window: "in",
                             },
+                            hold_until: None,
                         };
                     }
                     // Outside the window.
                     Some(false) => match otherwise {
                         Some(channels) => {
+                            let hold_until = channels
+                                .iter()
+                                .any(|c| c == DIGEST)
+                                .then(|| when.as_ref().map(|w| w.next_start(now)))
+                                .flatten();
                             return Resolution {
                                 channels: channels.clone(),
                                 decision: Decision::Preference {
                                     index,
                                     window: "out",
                                 },
+                                hold_until,
                             };
                         }
                         // No `otherwise`: this rule passes; the next one gets a chance.
@@ -371,6 +458,7 @@ pub fn resolve_channels(
                         index,
                         window: "none",
                     },
+                    hold_until: None,
                 };
             }
         }
@@ -381,11 +469,13 @@ pub fn resolve_channels(
         return Resolution {
             channels: default.clone(),
             decision: Decision::TeamDefault { team: t.id.clone() },
+            hold_until: None,
         };
     }
     Resolution {
         channels: vec!["ui".to_string()],
         decision: Decision::UiDefault,
+        hold_until: None,
     }
 }
 
@@ -561,16 +651,112 @@ mod tests {
     }
 
     #[test]
-    fn warning_is_email_at_any_time() {
-        let r = resolve_anna(utc("2026-01-15T03:00:00Z"), "warning", None);
+    fn anna_warning_is_email_in_hours_and_held_outside() {
+        // 10:00 London (GMT): email now, nothing held.
+        let person = anna();
+        let r = resolve_with_hold(
+            &person,
+            None,
+            &ctx("warning", None),
+            utc("2026-01-15T10:00:00Z"),
+        );
         assert_eq!(r.channels, ["email"]);
         assert_eq!(
             r.decision,
             Decision::Preference {
                 index: 1,
-                window: "none",
+                window: "in"
             }
         );
+        assert_eq!(r.hold_until, None);
+
+        // 03:00: held until 08:00 the same morning.
+        let r = resolve_with_hold(
+            &person,
+            None,
+            &ctx("warning", None),
+            utc("2026-01-15T03:00:00Z"),
+        );
+        assert_eq!(r.channels, [DIGEST]);
+        assert_eq!(
+            r.decision,
+            Decision::Preference {
+                index: 1,
+                window: "out"
+            }
+        );
+        assert_eq!(r.hold_until, Some(utc("2026-01-15T08:00:00Z")));
+
+        // 21:00: held until 08:00 the NEXT morning.
+        let r = resolve_with_hold(
+            &person,
+            None,
+            &ctx("warning", None),
+            utc("2026-01-15T21:00:00Z"),
+        );
+        assert_eq!(r.hold_until, Some(utc("2026-01-16T08:00:00Z")));
+
+        // Urgent callers (escalation, actions) never hold: digest becomes email.
+        let r = resolve_anna(utc("2026-01-15T03:00:00Z"), "warning", None);
+        assert_eq!(r.channels, ["email"]);
+        assert_eq!(r.hold_until, None);
+    }
+
+    #[test]
+    fn next_start_follows_dst_and_wraps() {
+        let w = TimeWindow::parse("08:00-20:00", "Europe/London").unwrap();
+        // Summer (BST): 08:00 local is 07:00Z.
+        assert_eq!(
+            w.next_start(utc("2026-07-01T02:00:00Z")),
+            utc("2026-07-01T07:00:00Z")
+        );
+        // Exactly at the start: strictly after, so tomorrow.
+        assert_eq!(
+            w.next_start(utc("2026-07-01T07:00:00Z")),
+            utc("2026-07-02T07:00:00Z")
+        );
+        // Across the spring change (2026-03-29): Saturday night GMT -> Sunday 08:00 BST.
+        assert_eq!(
+            w.next_start(utc("2026-03-28T22:00:00Z")),
+            utc("2026-03-29T07:00:00Z")
+        );
+
+        // A start inside the spring-forward gap (01:00-02:00 London) opens an hour later.
+        let gap = TimeWindow::parse("01:30-06:00", "Europe/London").unwrap();
+        assert_eq!(
+            gap.next_start(utc("2026-03-29T00:00:00Z")),
+            utc("2026-03-29T01:30:00Z")
+        );
+
+        // A wrapping night window opens at its evening start.
+        let night = TimeWindow::parse("22:00-06:00", "UTC").unwrap();
+        assert_eq!(
+            night.next_start(utc("2026-01-15T12:00:00Z")),
+            utc("2026-01-15T22:00:00Z")
+        );
+    }
+
+    #[test]
+    fn digest_is_only_valid_in_otherwise() {
+        let ok = json!([{ "match": {}, "channels": ["email"],
+                          "when": {"between": "08:00-20:00", "tz": "UTC"},
+                          "otherwise": ["ui", "digest"] }]);
+        assert!(parse_preferences("a", &ok, KNOWN_CHANNELS).is_ok());
+        for raw in [
+            json!([{ "match": {}, "channels": ["digest"] }]),
+            json!([{ "default": ["digest"] }]),
+            json!([{ "match": {}, "channels": ["digest"],
+                     "when": {"between": "08:00-20:00", "tz": "UTC"}, "otherwise": ["email"] }]),
+        ] {
+            let msg = match parse_preferences("a", &raw, KNOWN_CHANNELS) {
+                Err(ConfigError::Invalid(m)) => m,
+                other => panic!("{raw} should be rejected, got {other:?}"),
+            };
+            assert!(
+                msg.contains("`digest` is only allowed in `otherwise`"),
+                "{msg}"
+            );
+        }
     }
 
     #[test]
