@@ -19,13 +19,16 @@ use uuid::Uuid;
 // Database helpers
 // ---------------------------------------------------------------------------------------------
 
-/// Insert an alert with the stub-table columns only. `status` is `open | acked | resolved`.
+/// Insert an open-able alert row with every NOT NULL column of the core alerts table. `status` is `open | acked | resolved`.
 pub async fn insert_alert(pool: &PgPool, status: &str, title: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO alerts (id, rule_id, team, fingerprint, status, severity, title, body, notify_seq) \
-         VALUES ($1, 'rates-rejected-trades', 'rates', $2, $3, 'warning', $4, \
-                 'Reason: LIMIT_BREACH', 1)",
+        "INSERT INTO alerts (id, rule_id, rule_revision, rule_name, team, fingerprint, \
+                             dedup_window_ms, status, severity, color, title, body, \
+                             first_seen, last_seen, source, schema, notify_seq) \
+         VALUES ($1, 'rates-rejected-trades', 1, 'Rates rejected trades', 'rates', $2, \
+                 600000, $3, 'warning', 'amber', $4, 'Reason: LIMIT_BREACH', \
+                 now(), now(), 'test', 'trade.rejected.v1', 1)",
     )
     .bind(id)
     .bind(format!("fp-{id}"))
@@ -49,6 +52,7 @@ pub async fn insert_notify(
         "notify_seq": notify_seq,
         "rule_id": "rates-rejected-trades",
         "rule_revision": 1,
+        "team": "rates",
         "severity": "warning",
         "reason": "new",
         "route": route_json,

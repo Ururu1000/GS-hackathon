@@ -513,7 +513,25 @@ mod tests {
         for t in ["settlements", "pricing", "rates", "payments"] {
             assert!(!d.expand(&format!("team:{t}")).unwrap().is_empty(), "{t}");
         }
-        assert_eq!(d.expand("oncall:settlements-primary").unwrap().len(), 1);
+        assert_eq!(d.expand("oncall:settlements").unwrap().len(), 1);
+
+        // Every route target in the seed rules (owned by part (a)) must expand against the
+        // seed directory, so a renamed team or schedule fails here instead of at runtime.
+        let rules: Vec<serde_json::Value> = load_dir(&root.join("rules")).unwrap();
+        assert!(!rules.is_empty(), "no seed rules found");
+        for rule in &rules {
+            for entry in rule["route"].as_array().into_iter().flatten() {
+                let to = entry["to"].as_str().unwrap();
+                let people = d
+                    .expand(to)
+                    .unwrap_or_else(|e| panic!("rule {}: {e}", rule["id"]));
+                assert!(
+                    !people.is_empty(),
+                    "rule {}: {to} expands to nobody",
+                    rule["id"]
+                );
+            }
+        }
         assert!(d.people.values().all(|p| {
             p.contact
                 .email
