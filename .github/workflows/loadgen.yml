@@ -91,10 +91,15 @@ jobs:
             out="results/loadgen-$rate"
             args="--rate $rate --duration $DURATION --batch $LG_BATCH --distinct-keys $LG_DISTINCT_KEYS --match-ratio $LG_MATCH_RATIO --concurrency $LG_CONCURRENCY --drain $LG_DRAIN --scenario m6-delivery-$rate --out $out"
             ./target/release/beacon-loadgen $args | tee "results/loadgen-$rate.log" || status=1
-            report=$(ls "$out"/*.md | head -1)
-            run_id=$(head -1 "$report" | grep -o '([0-9a-f]\{12\})' | tr -d '()')
+            # A failed loadgen run must not end the step: record it, go on to the next rate.
+            report=$(ls "$out"/*.md 2>/dev/null | head -1) || true
+            run_id=$( { head -1 "$report" | grep -o '([0-9a-f]\{12\})' | tr -d '()'; } 2>/dev/null) || true
+            if [ -z "$report" ] || [ -z "$run_id" ]; then
+              echo "## beacon-loadgen at $rate events/s: no report / run id (see results/loadgen-$rate.log)" >> "$GITHUB_STEP_SUMMARY"
+              status=1; continue
+            fi
             echo "rate $rate: run $run_id ($report)"
-            ./target/release/examples/delivery_latency --run-id "$run_id" --wait-secs 180 \
+            ./target/release/examples/delivery_latency --run-id "$run_id" --wait-secs 300 \
               --scenario "m6-delivery-$rate" --workload "beacon-loadgen $args" \
               --out "results/delivery-$rate.md" --json "results/delivery-$rate.json" || status=1
             {
