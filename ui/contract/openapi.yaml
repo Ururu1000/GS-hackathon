@@ -416,6 +416,51 @@ paths:
                   fields: { type: object }
                   warnings: { type: array, items: { type: string } }
         '422': { $ref: '#/components/responses/Error' }
+  /api/schemas/suggest:
+    post:
+      operationId: suggestSchemaMapping
+      summary: Propose a schema mapping for an unknown shape or a pasted event (off by default; nothing is stored)
+      description: >-
+        The model sees only the payload's paths, value types and short redacted
+        examples, and can only pick existing paths and approved transforms. An
+        admin reviews and edits the result, then publishes it with POST /api/schemas.
+      parameters: [ { $ref: '#/components/parameters/Csrf' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [schema]
+                  properties: { schema: { type: string, description: '`unknown:<sig>`; uses its latest redacted sample' } }
+                - type: object
+                  required: [event]
+                  properties: { event: { type: object }, source: { type: string } }
+      responses:
+        '200':
+          description: The proposed mapping and its preview against the sample
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider, model, spec, preview, notes]
+                properties:
+                  provider: { type: string, examples: [mock, claude], description: The UI labels `mock` as "Mock suggestion" }
+                  model: { type: [string, 'null'] }
+                  spec: { $ref: '#/components/schemas/SchemaSpec' }
+                  preview:
+                    type: object
+                    required: [matched, fields, warnings]
+                    properties:
+                      matched: { type: boolean }
+                      fields: { type: object }
+                      warnings: { type: array, items: { type: string } }
+                  notes: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /api/runbooks:
     get:
       operationId: listRunbooks
@@ -1074,6 +1119,7 @@ components:
             recipient_feed: { type: boolean, description: Supports recipient scope on both feed endpoints }
             mock_transports: { type: boolean, description: Accepts fixture broker and log events through the mock ingest endpoint }
             runbook_import: { type: boolean, description: Supports runbook preview and publication }
+            llm_suggest: { type: boolean, description: 'POST /api/schemas/suggest is enabled (BEACON_LLM=mock|claude; off by default)' }
     SnapshotEvent:
       type: object
       required: [team, items, next_cursor, server_time]
