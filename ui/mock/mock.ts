@@ -180,6 +180,13 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   const isTeamMember = (teamId: string) => teams.get(teamId)?.members.includes(ME_ID) ?? false
   const isTeamLead = (teamId: string) => teams.get(teamId)?.lead === ME_ID
   const simulator = createSimulator(canSeeTeam, isTeamMember)
+  // Demo gateway outages (same shape as the gateway's /api/simulator/outage).
+  const outages = new Map<string, { channel: string; mode: 'down'; until: number }>()
+  const outageList = () => {
+    const now = Date.now()
+    for (const [k, o] of outages) if (o.until <= now) outages.delete(k)
+    return { outages: [...outages.values()].map((o) => ({ ...o, until: new Date(o.until).toISOString() })) }
+  }
   const pendingDeviceAlerts = new Set<string>()
   const canEditPerson = (personId: string) => personId === ME_ID
   let idSeq = 0
@@ -694,6 +701,24 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     if (path === '/api/simulator/stream' && method === 'GET') {
       syncDeviceReceipts()
       return simulator.stream(req, res), true
+    }
+    if (path === '/api/simulator/outage') {
+      if (method === 'GET') return json(res, 200, outageList()), true
+      if (method === 'POST')
+        return write(req, res, (b: { channel?: unknown; seconds?: unknown }) => {
+          if (b.channel !== 'sms' && b.channel !== 'phone') return err(res, 400, 'bad_request', 'expected channel sms|phone')
+          if (typeof b.seconds !== 'number' || !Number.isInteger(b.seconds) || b.seconds < 1 || b.seconds > 3600)
+            return err(res, 400, 'bad_request', 'seconds must be in 1..=3600')
+          outages.set(b.channel, { channel: b.channel, mode: 'down', until: Date.now() + b.seconds * 1000 })
+          json(res, 200, outageList())
+        })
+      if (method === 'DELETE')
+        return write(req, res, () => {
+          const channel = url.searchParams.get('channel')
+          if (channel !== 'sms' && channel !== 'phone') return err(res, 400, 'bad_request', 'expected channel sms|phone')
+          outages.delete(channel)
+          json(res, 200, outageList())
+        })
     }
     if (path === '/api/simulator/reply' && method === 'POST') {
       return write(req, res, (b: { from?: string; text?: string; receipt_id?: string }) => {

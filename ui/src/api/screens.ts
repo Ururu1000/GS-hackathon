@@ -116,3 +116,22 @@ export interface SmsReplyResult {
 
 export const replyToSimulatorMessage = (from: string, text: string, receiptId?: string) =>
   post<SmsReplyResult>('/api/simulator/reply', { from, text, receipt_id: receiptId })
+
+export type OutageChannel = 'sms' | 'phone'
+
+/** A simulated provider outage on the demo gateway (`until` is RFC 3339). */
+export interface GatewayOutage {
+  channel: OutageChannel
+  mode: 'down' | 'lose_response'
+  until: string
+}
+
+export interface OutageList {
+  outages: GatewayOutage[]
+}
+
+export const listOutages = (signal?: AbortSignal) => request<OutageList>('/api/simulator/outage', { signal })
+export const startOutage = (channel: OutageChannel, seconds: number) =>
+  post<OutageList>('/api/simulator/outage', { channel, seconds })
+export const endOutage = (channel: OutageChannel) =>
+  request<OutageList>(`/api/simulator/outage?channel=${channel}`, { method: 'DELETE' })

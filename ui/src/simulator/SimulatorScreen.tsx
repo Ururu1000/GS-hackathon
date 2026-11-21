@@ -5,6 +5,7 @@ import { listSimulatorMessages, replyToSimulatorMessage, type SimulatorMessage, 
 import { internationalPhone } from '../lib/phone'
 import { maskAddress, redactText } from '../lib/redact'
 import { absTime } from '../lib/time'
+import { OutageControl } from './OutageControl'
 
 const replyStatus: Record<SmsReplyOutcome, string> = {
   approved: 'Reply accepted. Request approved.',
@@ -149,6 +150,7 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
       <h1 className="sr-only">Device simulator</h1>
       <div className="feature-body">
       {error && <div className="notice notice-error" role="alert">{error}</div>}
+      <OutageControl onError={setError} />
       <div className="feature-columns simulator-layout">
         <section className="feature-card">
           <div className="card-head simulator-inbox-head">
