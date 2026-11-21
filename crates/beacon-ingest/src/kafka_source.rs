@@ -209,8 +209,12 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
             m = consumer.recv() => m,
         };
         let mut batch: Vec<rdkafka::message::OwnedMessage> = Vec::with_capacity(SOURCE_BATCH);
+        let mut bytes = 0usize;
         match first {
-            Ok(m) => batch.push(m.detach()),
+            Ok(m) => {
+                bytes += m.payload_len();
+                batch.push(m.detach());
+            }
             Err(e) => {
                 warn!(source = %spec.id, error = %e, "kafka source receive error");
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -218,9 +222,12 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
             }
         }
         let deadline = tokio::time::Instant::now() + SOURCE_LINGER;
-        while batch.len() < SOURCE_BATCH {
+        while !batch_full(batch.len(), bytes) {
             match tokio::time::timeout_at(deadline, consumer.recv()).await {
-                Ok(Ok(m)) => batch.push(m.detach()),
+                Ok(Ok(m)) => {
+                    bytes += m.payload_len();
+                    batch.push(m.detach());
+                }
                 _ => break,
             }
         }
@@ -245,7 +252,15 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
 }
 
 const SOURCE_BATCH: usize = 500;
+/// Payload bytes held per batch, so a producer of large messages can't pin
+/// hundreds of MiB per source.
+const SOURCE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const SOURCE_LINGER: Duration = Duration::from_millis(10);
+
+/// A batch closes at the message count or the byte budget, whichever comes first.
+fn batch_full(count: usize, bytes: usize) -> bool {
+    count >= SOURCE_BATCH || bytes >= SOURCE_BATCH_BYTES
+}
 
 /// Publish one upstream message (or quarantine it), retrying transient broker
 /// errors. Returns false only when shutting down before it was written.
@@ -308,6 +323,16 @@ mod tests {
     }
 
     const OK: &str = "id: kafka:workflows\ntype: kafka\ntopics: [workflow-events]\n";
+
+    #[test]
+    fn batches_close_at_count_or_bytes() {
+        assert!(!batch_full(1, 1024));
+        assert!(batch_full(SOURCE_BATCH, 10));
+        // Three ~1 MiB messages are fine; eight reach the 8 MiB budget.
+        let mib = 1024 * 1024;
+        assert!(!batch_full(3, 3 * mib));
+        assert!(batch_full(8, 8 * mib));
+    }
 
     #[test]
     fn accepts_the_seed_sources() {
