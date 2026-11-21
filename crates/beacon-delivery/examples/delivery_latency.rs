@@ -216,7 +216,12 @@ async fn run(args: &Args) -> Result<bool, String> {
     let wait = Duration::from_secs(args.wait_secs);
     // Assigned by the first poll; the loop's only exit (break) follows the
     // assignments, so the report always sees the last poll's values.
-    let (mut alerts, mut jobs, mut unsent): (Vec<AlertRow>, Vec<Job>, usize);
+    let (mut alerts, mut jobs, mut unsent, mut notify_pending): (
+        Vec<AlertRow>,
+        Vec<Job>,
+        usize,
+        usize,
+    );
     let mut first_poll = true;
     loop {
         alerts = select_alerts(&pool, args.run_id.as_deref(), args.since, args.until).await?;
@@ -232,11 +237,14 @@ async fn run(args: &Args) -> Result<bool, String> {
         let alert_ids: Vec<Uuid> = alerts.iter().map(|(id, _, _)| *id).collect();
         jobs = select_jobs(&pool, &alert_ids).await?;
         unsent = jobs.iter().filter(|j| is_unsent(j)).count();
-        if unsent == 0 || drain_start.elapsed() >= wait {
+        // Jobs exist only once the router has processed the alert's notify row: until
+        // the run's rows are all processed, the job set itself is incomplete.
+        notify_pending = count_notify_pending(&pool, &alert_ids).await?;
+        if (unsent == 0 && notify_pending == 0) || drain_start.elapsed() >= wait {
             break;
         }
         eprintln!(
-            "[t+{:>3}s] alerts={} jobs={} unsent={unsent}",
+            "[t+{:>3}s] alerts={} jobs={} unsent={unsent} notify_pending={notify_pending}",
             drain_start.elapsed().as_secs(),
             alerts.len(),
             jobs.len()
@@ -244,10 +252,11 @@ async fn run(args: &Args) -> Result<bool, String> {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let drain_secs = drain_start.elapsed().as_secs_f64();
-    let drain_timed_out = unsent > 0;
+    let drain_timed_out = unsent > 0 || notify_pending > 0;
     if drain_timed_out {
         eprintln!(
-            "drain: gave up after {drain_secs:.1} s; {unsent} job(s) still unsent (see the report)"
+            "drain: gave up after {drain_secs:.1} s; {unsent} job(s) still unsent, \
+             {notify_pending} notification(s) still unrouted (see the report)"
         );
     } else {
         eprintln!("drain: {drain_secs:.1} s — nothing unsent");
@@ -269,7 +278,8 @@ async fn run(args: &Args) -> Result<bool, String> {
     };
 
     // ---- fold, render, write -------------------------------------------------------------
-    let data = fold(&alerts, &jobs, &receipts, &mail);
+    let mut data = fold(&alerts, &jobs, &receipts, &mail);
+    data.notify_pending = notify_pending;
     let facts = RunFacts {
         scenario: args.scenario.clone(),
         run_id: args.run_id.clone(),
@@ -282,6 +292,7 @@ async fn run(args: &Args) -> Result<bool, String> {
         drain_secs,
         drain_timed_out,
         unsent_at_stop: unsent,
+        notify_pending_at_stop: notify_pending,
     };
     let md = render_report(&facts, &data);
     println!("{md}");
@@ -393,6 +404,20 @@ type JobRow = (
 /// `delivery_jobs` rows (whatever the channel or escalation step — later waves only
 /// increase it), plain notification rows (`escalation_step = 0`), on the channels we
 /// measure.
+/// The run's `notify` outbox rows the router has not processed yet (`processed_at IS
+/// NULL`): each still has to become delivery jobs.
+async fn count_notify_pending(pool: &sqlx::PgPool, alert_ids: &[Uuid]) -> Result<usize, String> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox \
+         WHERE kind = 'notify' AND processed_at IS NULL AND alert_id = ANY($1)",
+    )
+    .bind(alert_ids)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("outbox query failed: {e}"))?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
 async fn select_jobs(pool: &sqlx::PgPool, alert_ids: &[Uuid]) -> Result<Vec<Job>, String> {
     let sql = "\
         WITH first_seq AS ( \
@@ -603,6 +628,10 @@ struct ReportData {
     /// Alerts with no measured job at all: ui-only rules, a throttle, or routing
     /// that had not happened yet. Informational — it is not a channel count.
     alerts_without_jobs: usize,
+    /// The run's `notify` outbox rows the router had not processed when measuring
+    /// stopped: their jobs do not exist yet, so the job counts are incomplete and the
+    /// run cannot pass (set by `main` after the fold).
+    notify_pending: usize,
     per_rule: BTreeMap<String, usize>,
     channels: HashMap<String, ChannelData>,
 }
@@ -645,7 +674,7 @@ impl ReportData {
     /// empty selection of jobs cannot be a clean reconciliation).
     fn pass(&self) -> bool {
         let (jobs, unsent, dead, missing) = self.totals();
-        jobs > 0 && unsent == 0 && dead == 0 && missing == 0
+        jobs > 0 && unsent == 0 && dead == 0 && missing == 0 && self.notify_pending == 0
     }
 }
 
@@ -716,6 +745,7 @@ fn fold(
     ReportData {
         alerts_total: alerts.len(),
         alerts_without_jobs: alerts.len() - with_jobs.len(),
+        notify_pending: 0,
         per_rule,
         channels,
     }
@@ -775,6 +805,7 @@ struct RunFacts {
     drain_secs: f64,
     drain_timed_out: bool,
     unsent_at_stop: usize,
+    notify_pending_at_stop: usize,
 }
 
 /// Compact RFC3339, UTC, no sub-second digits.
@@ -817,11 +848,14 @@ fn report_title(f: &RunFacts) -> String {
 fn drain_line(f: &RunFacts) -> String {
     if f.drain_timed_out {
         format!(
-            "gave up after {:.1} s — {} job(s) still unsent",
-            f.drain_secs, f.unsent_at_stop
+            "gave up after {:.1} s — {} job(s) still unsent, {} notification(s) still unrouted",
+            f.drain_secs, f.unsent_at_stop, f.notify_pending_at_stop
         )
     } else {
-        format!("{:.1} s — nothing unsent", f.drain_secs)
+        format!(
+            "{:.1} s — every notification routed, nothing unsent",
+            f.drain_secs
+        )
     }
 }
 
@@ -867,6 +901,13 @@ fn result_line(d: &ReportData) -> String {
     if d.pass() {
         return "PASS — every sms/phone/email job sent; nothing missing, unsent or dead"
             .to_string();
+    }
+    if d.notify_pending > 0 {
+        return format!(
+            "FAIL — {} notification(s) of this run still unrouted in the outbox, so the job \
+             counts and latencies are incomplete; {unsent} unsent, {dead} dead, {missing} missing",
+            d.notify_pending
+        );
     }
     format!("FAIL — {unsent} unsent, {dead} dead, {missing} missing (see the reconciliation table)")
 }
@@ -936,21 +977,21 @@ fn render_report(f: &RunFacts, d: &ReportData) -> String {
     );
     for name in ["sms", "phone"] {
         out.push_str(&latency_row(
-            "gateway acceptance: ingest → receipt (`received_at − first_seen`)",
+            "gateway acceptance: ingest (first event per alert) → receipt (`received_at − first_seen`)",
             name,
             &d.channel(name).gateway,
         ));
         out.push('\n');
     }
     out.push_str(&latency_row(
-        "email in Mailpit: ingest → message (`Created − first_seen`)",
+        "email in Mailpit: ingest (first event per alert) → message (`Created − first_seen`)",
         "email",
         &d.channel("email").mailpit,
     ));
     out.push('\n');
     for name in CHANNELS {
         out.push_str(&latency_row(
-            "internal: ingest → job planned (`created_at − first_seen`)",
+            "internal: ingest (first event per alert) → job planned (`created_at − first_seen`)",
             name,
             &d.channel(name).planned,
         ));
@@ -958,7 +999,7 @@ fn render_report(f: &RunFacts, d: &ReportData) -> String {
     }
     for name in CHANNELS {
         out.push_str(&latency_row(
-            "internal: ingest → provider ack (`sent_at − first_seen`)",
+            "internal: ingest (first event per alert) → provider ack (`sent_at − first_seen`)",
             name,
             &d.channel(name).ack,
         ));
@@ -1049,6 +1090,7 @@ fn report_json(f: &RunFacts, d: &ReportData) -> Value {
             "secs": f.drain_secs,
             "timed_out": f.drain_timed_out,
             "unsent_at_stop": f.unsent_at_stop,
+            "notify_pending_at_stop": f.notify_pending_at_stop,
         },
         "alerts": {
             "total": d.alerts_total,
@@ -1422,6 +1464,7 @@ mod tests {
             drain_secs: 12.4,
             drain_timed_out: false,
             unsent_at_stop: 0,
+            notify_pending_at_stop: 0,
         }
     }
 
@@ -1445,7 +1488,7 @@ mod tests {
              | git commit | `0c16b6e` |\n\
              | host CPUs | 8 |\n\
              | generated at (UTC) | 2026-11-21T12:00:00.000Z |\n\
-             | drain | 12.4 s — nothing unsent |\n\
+             | drain | 12.4 s — every notification routed, nothing unsent |\n\
              | selection | run id `f47ac10b58cc` in alerts.title/body/fields |\n\
              \n\
              Alerts matched: 3 (1 without sms/phone/email jobs)\n\
@@ -1472,20 +1515,36 @@ mod tests {
              \n\
              | metric | channel | count | p50 | p90 | p99 | max |\n\
              |---|---|---:|---:|---:|---:|---:|\n\
-             | gateway acceptance: ingest → receipt (`received_at − first_seen`) | sms | 1 | 900 | 900 | 900 | 900 |\n\
-             | gateway acceptance: ingest → receipt (`received_at − first_seen`) | phone | 1 | 600 | 600 | 600 | 600 |\n\
-             | email in Mailpit: ingest → message (`Created − first_seen`) | email | 1 | 500 | 500 | 500 | 500 |\n\
-             | internal: ingest → job planned (`created_at − first_seen`) | sms | 1 | 50 | 50 | 50 | 50 |\n\
-             | internal: ingest → job planned (`created_at − first_seen`) | phone | 1 | 50 | 50 | 50 | 50 |\n\
-             | internal: ingest → job planned (`created_at − first_seen`) | email | 1 | 80 | 80 | 80 | 80 |\n\
-             | internal: ingest → provider ack (`sent_at − first_seen`) | sms | 1 | 700 | 700 | 700 | 700 |\n\
-             | internal: ingest → provider ack (`sent_at − first_seen`) | phone | 1 | 400 | 400 | 400 | 400 |\n\
-             | internal: ingest → provider ack (`sent_at − first_seen`) | email | 1 | 300 | 300 | 300 | 300 |\n\
+             | gateway acceptance: ingest (first event per alert) → receipt (`received_at − first_seen`) | sms | 1 | 900 | 900 | 900 | 900 |\n\
+             | gateway acceptance: ingest (first event per alert) → receipt (`received_at − first_seen`) | phone | 1 | 600 | 600 | 600 | 600 |\n\
+             | email in Mailpit: ingest (first event per alert) → message (`Created − first_seen`) | email | 1 | 500 | 500 | 500 | 500 |\n\
+             | internal: ingest (first event per alert) → job planned (`created_at − first_seen`) | sms | 1 | 50 | 50 | 50 | 50 |\n\
+             | internal: ingest (first event per alert) → job planned (`created_at − first_seen`) | phone | 1 | 50 | 50 | 50 | 50 |\n\
+             | internal: ingest (first event per alert) → job planned (`created_at − first_seen`) | email | 1 | 80 | 80 | 80 | 80 |\n\
+             | internal: ingest (first event per alert) → provider ack (`sent_at − first_seen`) | sms | 1 | 700 | 700 | 700 | 700 |\n\
+             | internal: ingest (first event per alert) → provider ack (`sent_at − first_seen`) | phone | 1 | 400 | 400 | 400 | 400 |\n\
+             | internal: ingest (first event per alert) → provider ack (`sent_at − first_seen`) | email | 1 | 300 | 300 | 300 | 300 |\n\
              \n\
              Clock assumption: `first_seen` is written by the Beacon processes, `received_at`/`sent_at` by Postgres, `Created` by Mailpit, so the numbers are valid only when they share a host clock (same machine or NTP).\n\
              \n\
              RESULT: PASS — every sms/phone/email job sent; nothing missing, unsent or dead\n"
         );
+    }
+
+    #[test]
+    fn unrouted_notifications_fail_an_otherwise_clean_run() {
+        // Every existing job is sent and receipted, but the router has not processed
+        // two of the run's notify rows yet: their jobs do not exist, so no PASS.
+        let alert = Uuid::new_v4();
+        let alerts = vec![(alert, "rates-rejected-trades".into(), dt(0))];
+        let jobs = vec![job(alert, "email", "sent", 1, Some(dt(300)), dt(70))];
+        let mail = HashMap::from([(jobs[0].id, dt(310))]);
+        let mut d = fold(&alerts, &jobs, &HashMap::new(), &mail);
+        assert!(d.pass());
+        d.notify_pending = 2;
+        assert!(!d.pass());
+        let report = render_report(&fixture_facts(), &d);
+        assert!(report.contains("RESULT: FAIL — 2 notification(s) of this run still unrouted"));
     }
 
     #[test]
@@ -1505,8 +1564,11 @@ mod tests {
         let mut facts = fixture_facts();
         facts.drain_timed_out = true;
         facts.unsent_at_stop = 3;
+        facts.notify_pending_at_stop = 2;
         let report = render_report(&facts, &d);
-        assert!(report.contains("| drain | gave up after 12.4 s — 3 job(s) still unsent |"));
+        assert!(report.contains(
+            "| drain | gave up after 12.4 s — 3 job(s) still unsent, 2 notification(s) still unrouted |"
+        ));
         // and a window-only selection says so in the title and the facts
         let mut facts = fixture_facts();
         facts.run_id = None;
