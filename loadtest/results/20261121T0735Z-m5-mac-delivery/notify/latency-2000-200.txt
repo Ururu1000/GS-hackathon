@@ -1,0 +1,52 @@
+run de2bdf: posting 2050 events (50 warmup + 2000 measured) at 200 events/s, mix both
+       ingest http://localhost:8090, gateway http://localhost:8070, mailpit http://localhost:8025
+NOTE: t0 is this client's clock; gateway receipts are timestamped by Postgres and
+      email by Mailpit. The numbers are only valid when the client, Postgres and
+      Mailpit share a clock (same machine / NTP).
+[warmup] 50 alerts, 100 jobs drained in 0.2s; measuring
+[send] 200/2050 scheduled
+[send] 400/2050 scheduled
+[send] 600/2050 scheduled
+[send] 800/2050 scheduled
+[send] 1000/2050 scheduled
+[send] 1200/2050 scheduled
+[send] 1400/2050 scheduled
+[send] 1600/2050 scheduled
+[send] 1800/2050 scheduled
+[send] 2000/2050 scheduled
+run de2bdf: 2050/2050 posts answered 2xx (0 error(s) measured, 0 warmup)
+[wait t+  0s] alerts 1974/2000 · gateway 1969/1972 · mailpit 1966/1976 · pending 13 · dead 0
+[wait t+  1s] alerts 2000/2000 · gateway 2000/2000 · mailpit 2000/2000 · pending 0 · dead 0
+# ingest → delivery latency (run de2bdf)
+
+| workload | value |
+|---|---|
+| events (measured) | 2000 |
+| warmup events | 50 (excluded from stats) |
+| rate | 200 events/s (open loop) |
+| mix | both |
+| timeout | 120 s |
+| started at | 2026-11-21T07:39:01.261Z |
+| git commit | 35650c5 |
+| host CPUs | 10 |
+| ingest errors | 0 measured + 0 warmup |
+
+| metric (ms) | count | p50 | p90 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| ingest → gateway receipt (phone + sms jobs) | 2000 | 197 | 285 | 361 | 406 |
+| ingest → email receipt (Mailpit, per recipient) | 2000 | 210 | 293 | 388 | 427 |
+| ingest → alert (first_seen - t0) | 2000 | 0 | 0 | 0 | 0 |
+| alert → delivered (sent_at - first_seen, per job) | 4000 | 209 | 296 | 381 | 432 |
+
+| outcome | count |
+|---|---|
+| email latencies from sent_at (Mailpit fallback) | 0 |
+| missing alerts | 0 |
+| missing gateway receipts | 0 |
+| missing Mailpit messages | 0 |
+| pending / dead / cancelled jobs | 0 / 0 / 0 |
+| fallback / escalation jobs | 0 / 0 |
+
+RESULT: PASS — nothing missing, no ingest errors
+
+results (json) written to results/notify/latency-2000-200.json

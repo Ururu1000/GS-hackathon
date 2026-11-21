@@ -1,0 +1,81 @@
+run 5246c0: 50 events, sms outage 60 s, ingest http://localhost:8090, gateway http://localhost:8070
+run 5246c0: sms outage (mode down) started, ends at 07:40:14 UTC
+run 5246c0: posted 50/50 WORKFLOW_FAILED events (rule settlements-workflow-failed -> oncall:settlements-primary -> sms+phone for bob)
+[t+  0s] sms jobs: found=3/50 pending=3 in_flight=0 sent=0 dead=0 | breaker: closed (3 consecutive failures)
+[t+  1s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (5 consecutive failures)
+[t+  2s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (5 consecutive failures)
+[t+  3s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (5 consecutive failures)
+[t+  4s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (5 consecutive failures)
+[t+  5s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (5 consecutive failures)
+[t+  6s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (6 consecutive failures)
+[t+  7s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (6 consecutive failures)
+[t+  8s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (6 consecutive failures)
+[t+  9s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (6 consecutive failures)
+[t+ 10s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (6 consecutive failures)
+[t+ 11s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (7 consecutive failures)
+[t+ 12s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (7 consecutive failures)
+[t+ 13s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (7 consecutive failures)
+[t+ 14s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (7 consecutive failures)
+[t+ 15s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (7 consecutive failures)
+[t+ 16s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (8 consecutive failures)
+[t+ 17s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (8 consecutive failures)
+[t+ 18s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (8 consecutive failures)
+[t+ 19s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (8 consecutive failures)
+[t+ 20s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (8 consecutive failures)
+[t+ 21s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (9 consecutive failures)
+[t+ 22s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (9 consecutive failures)
+[t+ 23s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (9 consecutive failures)
+[t+ 24s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (9 consecutive failures)
+[t+ 25s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (9 consecutive failures)
+[t+ 26s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (10 consecutive failures)
+[t+ 27s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (10 consecutive failures)
+[t+ 28s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (10 consecutive failures)
+[t+ 29s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (10 consecutive failures)
+[t+ 30s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (10 consecutive failures)
+[t+ 31s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (11 consecutive failures)
+[t+ 32s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (11 consecutive failures)
+[t+ 33s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (11 consecutive failures)
+[t+ 34s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (11 consecutive failures)
+[t+ 35s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (11 consecutive failures)
+[t+ 36s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (12 consecutive failures)
+[t+ 37s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (12 consecutive failures)
+[t+ 38s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (12 consecutive failures)
+[t+ 39s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (12 consecutive failures)
+[t+ 40s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (12 consecutive failures)
+[t+ 41s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (13 consecutive failures)
+[t+ 42s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (13 consecutive failures)
+[t+ 43s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (13 consecutive failures)
+[t+ 44s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (13 consecutive failures)
+[t+ 45s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (13 consecutive failures)
+[t+ 46s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (14 consecutive failures)
+[t+ 47s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (14 consecutive failures)
+[t+ 48s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (14 consecutive failures)
+[t+ 49s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (14 consecutive failures)
+[t+ 50s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (14 consecutive failures)
+[t+ 51s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (15 consecutive failures)
+[t+ 52s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (15 consecutive failures)
+[t+ 53s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (15 consecutive failures)
+[t+ 54s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (15 consecutive failures)
+[t+ 55s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (15 consecutive failures)
+[t+ 56s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (15 consecutive failures)
+[t+ 57s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (16 consecutive failures)
+[t+ 58s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (16 consecutive failures)
+[t+ 59s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (16 consecutive failures)
+[t+ 60s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (16 consecutive failures)
+[t+ 61s] sms jobs: found=50/50 pending=50 in_flight=0 sent=0 dead=0 | breaker: open (16 consecutive failures)
+[t+ 62s] sms jobs: found=50/50 pending=0 in_flight=0 sent=50 dead=0 | breaker: closed (0 consecutive failures)
+
+================ SMS outage demo (run 5246c0) ================
+events posted                   50
+sms jobs expected               50
+sms jobs found                  50
+sent                            50
+dead                            0
+fallbacks created               0
+gateway receipt rows            50
+distinct gateway receipts       50
+duplicates (SUM)                0
+max attempts                    2
+outage ended -> last sms sent   2.1 s
+==============================================================
+RESULT: PASS (found=50 sent=50 dead=0 distinct receipts=50, duplicates=0)

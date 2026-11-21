@@ -1,0 +1,44 @@
+run 0e26fc: posting 550 events (50 warmup + 500 measured) at 50 events/s, mix both
+       ingest http://localhost:8090, gateway http://localhost:8070, mailpit http://localhost:8025
+NOTE: t0 is this client's clock; gateway receipts are timestamped by Postgres and
+      email by Mailpit. The numbers are only valid when the client, Postgres and
+      Mailpit share a clock (same machine / NTP).
+[warmup] 50 alerts, 100 jobs drained in 0.6s; measuring
+[send] 200/550 scheduled
+[send] 400/550 scheduled
+run 0e26fc: 550/550 posts answered 2xx (0 error(s) measured, 0 warmup)
+[wait t+  0s] alerts 487/500 · gateway 488/488 · mailpit 474/486 · pending 12 · dead 0
+[wait t+  1s] alerts 500/500 · gateway 500/500 · mailpit 500/500 · pending 0 · dead 0
+# ingest → delivery latency (run 0e26fc)
+
+| workload | value |
+|---|---|
+| events (measured) | 500 |
+| warmup events | 50 (excluded from stats) |
+| rate | 50 events/s (open loop) |
+| mix | both |
+| timeout | 120 s |
+| started at | 2026-11-21T07:35:31.031Z |
+| git commit | 963b4b4 |
+| host CPUs | 10 |
+| ingest errors | 0 measured + 0 warmup |
+
+| metric (ms) | count | p50 | p90 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| ingest → gateway receipt (phone + sms jobs) | 500 | 383 | 550 | 664 | 747 |
+| ingest → email receipt (Mailpit, per recipient) | 500 | 392 | 536 | 647 | 708 |
+| ingest → alert (first_seen - t0) | 500 | 0 | 0 | 0 | 0 |
+| alert → delivered (sent_at - first_seen, per job) | 1000 | 389 | 548 | 651 | 753 |
+
+| outcome | count |
+|---|---|
+| email latencies from sent_at (Mailpit fallback) | 0 |
+| missing alerts | 0 |
+| missing gateway receipts | 0 |
+| missing Mailpit messages | 0 |
+| pending / dead / cancelled jobs | 0 / 0 / 0 |
+| fallback / escalation jobs | 0 / 0 |
+
+RESULT: PASS — nothing missing, no ingest errors
+
+results (json) written to results/main/latency-500-50.json
