@@ -23,7 +23,14 @@ The submission rules ask every team that used AI tools to say how, and how it de
 - Implementation and tests went to OpenCode subagents, two or three at once, each with a written brief: files it may touch, gates it must pass (build, tests, Clippy, rustfmt), and "no git, no board".
 - The lead reviewed every subagent diff before committing. Larger changes got an independent review from a teammate's agent.
 
-*alexey and erop: add a short paragraph for parts (a) and (c) here.*
+### Spec and UI (part c) in more detail
+
+- **Spec first, reviewed by another model.** erop's Claude Code session wrote `docs/SPEC.md` (PR #1). A GPT model reviewed it in two read-only rounds (findings in `docs/reviews/`), and the fixes and board agreements went into v0.2 before any code.
+- **Contract before backend.** The UI was built against `ui/contract/openapi.yaml` and a local mock server (`ui/mock/`), so it didn't wait for the API. An annotated SSE fixture (`contract/fixtures/stream-basic.sse`) defines the client state the feed must end in; `npm test` replays it through the UI's reducer and the backend can replay it too.
+- **Two review passes per change.** Each UI change went through a correctness loop with a GPT model (findings fixed and re-checked until clean), then a separate Claude Opus pass for security and privacy (CSRF header on writes, no secrets or raw payloads rendered, redaction kept). The passes ran one after the other, never in parallel.
+- **People chose the look.** The agent offered options (for example several logo concepts), erop picked one, and the agent checked the result in the running demo at desktop and narrow widths before merging.
+
+*alexey: add a short paragraph for part (a) here.*
 
 ## Security and privacy
 
