@@ -617,6 +617,13 @@ async fn proposal_and_mapping_guards(pool: PgPool) {
     let (s, e) = send(&h.app, "POST", "/api/schemas/preview", &h.csrf, Some(json!({"spec": wide, "event": {"kind": 1}}))).await;
     assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("fields")));
 
+    // Rule bodies are measured as stored: jsonb prints 1e308 as 309 digits.
+    let (_, r) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+    let mut bloated = r["rule"].clone();
+    bloated["throttle"] = json!(vec![1e308; 500]);
+    let (s, e) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(json!({"rule_id": "rates-rejected-trades", "base_revision": r["revision"], "kind": "other", "summary": "s", "proposed_rule": bloated}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("proposed_rule")), "{e}");
+
     // Pending proposals are capped per rule; the list still carries both rule bodies.
     let (_, r) = get(&h.app, "/api/rules/rates-rejected-trades").await;
     let flood = json!({"rule_id": "rates-rejected-trades", "base_revision": r["revision"], "kind": "other", "summary": "s", "proposed_rule": r["rule"]});

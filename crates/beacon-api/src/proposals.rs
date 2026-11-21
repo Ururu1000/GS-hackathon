@@ -28,8 +28,13 @@ use crate::error::ApiError;
 const KINDS: &[&str] = &["noisy", "reroute", "template", "other"];
 const STATES: &[&str] = &["pending", "accepted", "rejected", "stale"];
 const MAX_BODY: usize = 128 * 1024;
-/// Newest proposals returned by a list call.
-const LIST_LIMIT: i64 = 200;
+/// Newest proposals returned by a list call. With [`MAX_STORED_RULES`] per
+/// row this bounds a list response to roughly 15 MB.
+const LIST_LIMIT: i64 = 100;
+/// Both rule bodies of a proposal, measured as Postgres stores and returns
+/// them: jsonb prints numbers in full (`1e308` comes back as 309 digits), so
+/// a rule that validates at 64 KiB can be far larger on the way out.
+const MAX_STORED_RULES: i64 = 128 * 1024;
 /// Pending proposals allowed per rule and per author, so the table (and the
 /// list, which carries two rule bodies per row) can't be flooded.
 const MAX_PENDING_PER_RULE: i64 = 10;
@@ -209,6 +214,14 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bod
         return Err(invalid("proposed_rule.team", "team cannot be changed on an existing rule"));
     }
     crate::rules::check_team(&state, &b.proposed_rule)?;
+    let stored: i64 = sqlx::query_scalar("SELECT (octet_length($1::jsonb::text) + octet_length($2::jsonb::text))::bigint")
+        .bind(&current.spec)
+        .bind(&b.proposed_rule)
+        .fetch_one(&state.pool)
+        .await?;
+    if stored > MAX_STORED_RULES {
+        return Err(invalid("proposed_rule", format!("the current and proposed rule together must be under {} KiB once stored", MAX_STORED_RULES / 1024)));
+    }
     // Best effort (two concurrent creates can both pass): a bound, not an invariant.
     let actor = state.session.actor();
     let (per_rule, per_author): (i64, i64) = sqlx::query_as(
