@@ -762,6 +762,7 @@ fn delivery_api_state(
         registry,
         alert_ops: alert_ops(),
         reply_secret: reply_secret().map(Arc::new),
+        email_link: None,
     })
 }
 

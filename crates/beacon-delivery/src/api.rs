@@ -6,6 +6,8 @@
 //! | `POST /api/alerts/{id}/steps/{step}/run` `{expected_version?}` | `202 {execution_id}` | `403 forbidden` (actor not on the alert's team); `404 not_found`; `409 approval_required` (+`error.approval_id`); `409 invalid_transition` (alert resolved, step disabled/condition unmet, already queued/running, not an action step, or no one else can approve this step) |
 //! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `403 forbidden` (team); `400 bad_request` (not a manual step); `404` |
 //! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden` (not eligible, or the requester — nobody approves their own request); `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
+//! | `GET /api/approvals/email?a&p&e&s` (M7: the signed link an approval prompt email carries; `a` approval id, `p` person id, `e` unix expiry, `s` HMAC hex) | `200` HTML: the request's facts (action, step, alert title/id, requester, expiry, current state) and, while still pending, a POST form with hidden `a,p,e,s` and `decision=approve/reject` buttons. NEVER changes state (mail scanners prefetch links); every page is `text/html; charset=utf-8`, self-contained (no JS, no external assets), every value HTML-escaped, `Cache-Control: no-store` + `Referrer-Policy: no-referrer` | `404` HTML (no `EmailLinkConfig`, or unknown approval); `401` HTML (missing/bad params or bad signature — one generic page, nothing burned); `410` HTML (the link's `e`, or the approval's expiry, is in the past) |
+//! | `POST /api/approvals/email` (`application/x-www-form-urlencoded` body `a,p,e,s,decision=approve\|reject`) — decides through the same `approvals::decide` path with actor `user:<p>` and `via = email` | `200` HTML (approved / rejected) | `404` HTML (no config / unknown approval); `401` HTML (bad params/signature); `410` HTML (expired); `403` HTML (the requester, or not eligible); `409` HTML (already decided: `<state>`, or the alert is resolved); `415` HTML (any other content type) |
 //! | `GET /api/runbooks` | `200 {items}` (RunbookSummary, with `revision`) | |
 //! | `GET /api/runbooks/{runbookId}` | `200 {id, revision, title, format, team, steps: [{id, kind, text, action: {name, label} \| null, approval}]}` (current library version, step templates unrendered) | `401`; `404 not_found` |
 //! | `GET /api/people/directory` | `200 {items}` of `PersonDirectoryEntry` (`{id, name, teams}`) | `401 unauthorized` |
@@ -16,9 +18,15 @@
 //! | `POST /api/replies` `{from, text}` (fake-gateway callback: `X-Beacon-Timestamp: <unix seconds>` within ±300 s of now, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, "<timestamp>." + raw_body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`, the alert of the newest sms/phone job `sent` to the number), `already_decided` (a repeated decision, or a repeated `ACK` whose newest sent page was already acked — it never advances to an older open alert), `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (missing/old/future timestamp, bad/missing signature) |
 //!
 //! Auth: beacon-api's session/CSRF middleware inserts `Extension(Actor("user:<id>"))` before
-//! these handlers; without it every route except `/api/replies` returns `401 unauthorized`.
+//! these handlers; without it every route except `/api/replies` and the two
+//! `/api/approvals/email` routes returns `401 unauthorized`.
 //! `/api/replies` is authenticated by its timestamped signature instead (the caller is the
 //! gateway; a replay inside the 300 s window is harmless because decisions are idempotent).
+//! The two email-approval routes ignore the session Actor ENTIRELY: the signed person `p`
+//! is the actor (the HMAC in the URL/body is the authorization, not a cookie, so a
+//! cross-site form post only ever decides what its author already holds — a validly
+//! signed link — and CSRF protection is pointless there; this is also why they are the
+//! only POST route that must NOT require JSON).
 //! `run` and `check` additionally require the actor to be on the alert's team — a member, the
 //! lead, or anyone in one of the team's on-call rotations (the EFFECTIVE directory, so a
 //! saved team change applies) — else `403 forbidden`
@@ -55,12 +63,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, body::Bytes};
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,6 +84,7 @@ use crate::approvals::{
 };
 use crate::audit;
 use crate::config::{Directory, Person, Team};
+use crate::email_link::{self, EmailLinkConfig};
 use crate::overrides::{self, Overrides};
 use crate::runbook::{RenderedStep, StepKind};
 
@@ -94,6 +105,10 @@ pub struct ApiState {
     pub alert_ops: Arc<dyn AlertOps>,
     /// HMAC key for `/api/replies` (env `REPLY_SECRET`); `None` rejects every reply.
     pub reply_secret: Option<Arc<Vec<u8>>>,
+    /// M7 (SPEC §6.3): signing config for the approval links email prompts carry.
+    /// `None` (the default) disables the `/api/approvals/email` routes (404) and the
+    /// worker renders the prompt emails' link-less "Decide in Beacon" form.
+    pub email_link: Option<EmailLinkConfig>,
 }
 
 /// The contract's error body.
@@ -267,6 +282,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/approvals/{id}/approve", post(approve_handler))
         .route("/api/approvals/{id}/reject", post(reject_handler))
+        .route(
+            "/api/approvals/email",
+            get(email_approval_page).post(email_approval_decide),
+        )
         .route("/api/runbooks", get(runbooks_handler))
         .route("/api/runbooks/{runbook_id}", get(runbook_detail_handler))
         .route("/api/people/directory", get(directory_handler))
@@ -634,6 +653,363 @@ fn decide_error(e: DecideError) -> ApiError {
         | DecideError::Expired
         | DecideError::InvalidTransition(_) => invalid_transition(e.to_string()),
         DecideError::Db(_) => ApiError::internal(e),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GET/POST /api/approvals/email (M7: the signed link an approval email carries, SPEC §6.3)
+// ---------------------------------------------------------------------------------------------
+
+/// The approval (and its alert) as the email pages show it.
+#[derive(sqlx::FromRow)]
+struct EmailApprovalView {
+    action: String,
+    step_id: String,
+    alert_id: Uuid,
+    state: String,
+    requested_by: String,
+    expires_at: DateTime<Utc>,
+    /// The alert's title; `NULL` only when the alerts row is gone.
+    title: Option<String>,
+}
+
+/// Escape every value interpolated into an email page: the pages carry alert titles,
+/// person ids and action names that nobody here controls, so text and double-quoted
+/// attribute positions are both covered.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// One small self-contained HTML page: `text/html; charset=utf-8`, no JS, no external
+/// assets. `no-store` because the query string carries the signature (it must not sit in
+/// a shared cache), `no-referrer` so a followed link off the page cannot leak it either.
+fn email_page(status: StatusCode, title: &str, body_html: &str) -> Response {
+    let html = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+         <title>{}</title>\n</head>\n<body>\n{}\n</body>\n</html>\n",
+        html_escape(title),
+        body_html
+    );
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+/// The generic 401 every bad or forged link gets: one page, no detail about which field
+/// failed — nothing is revealed, nothing burned (no `sms_attempts`, no state change).
+fn email_link_rejected() -> Response {
+    email_page(
+        StatusCode::UNAUTHORIZED,
+        "Invalid approval link",
+        "<p>This approval link is not valid.</p>",
+    )
+}
+
+fn email_link_expired() -> Response {
+    email_page(
+        StatusCode::GONE,
+        "Link expired",
+        "<p>This approval link has expired.</p>",
+    )
+}
+
+/// Percent-decode one urlencoded component: `%XX` becomes that byte (an invalid escape
+/// stays literal) and `+` a space (the form-encoding rule). Never fails; the result is
+/// lossy UTF-8. The encoder's side is [`email_link::percent_encode`].
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let nibble = |b: u8| match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                };
+                match (nibble(bytes[i + 1]), nibble(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi * 16 + lo);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse `k=v&k=v` — a query string or an `application/x-www-form-urlencoded` body —
+/// percent-decoding both sides. A pair without `=` decodes to an empty value; a repeated
+/// key keeps its first value.
+fn parse_urlencoded(raw: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        out.entry(percent_decode(key))
+            .or_insert_with(|| percent_decode(value));
+    }
+    out
+}
+
+/// The signed link's `a`, `p`, `e`, `s` parsed and verified (constant time). `None` for
+/// any missing or malformed field or a bad signature — both callers then answer the same
+/// generic 401 and burn nothing. Returns `(approval id, person id, exp unix, sig)`.
+fn verified_link_params(
+    cfg: &EmailLinkConfig,
+    params: &HashMap<String, String>,
+) -> Option<(Uuid, String, i64, String)> {
+    let approval_id: Uuid = params.get("a")?.parse().ok()?;
+    let person = params.get("p")?;
+    let exp_unix: i64 = params.get("e")?.parse().ok()?;
+    let sig = params.get("s")?;
+    if !email_link::verify(&cfg.secret, approval_id, person, exp_unix, sig) {
+        return None;
+    }
+    Some((approval_id, person.clone(), exp_unix, sig.clone()))
+}
+
+/// `GET /api/approvals/email?a&p&e&s`: the page a mail client opens. NEVER changes state
+/// (mail scanners prefetch links); it only reads. The signature is verified in constant
+/// time, and a valid one still decides nothing — the form's POST does.
+async fn email_approval_page(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Response {
+    let Some(cfg) = state.email_link.as_ref() else {
+        return email_page(
+            StatusCode::NOT_FOUND,
+            "Email approvals are not enabled",
+            "<p>Email approvals are not enabled on this Beacon installation.</p>",
+        );
+    };
+    let query = raw.as_deref().map(parse_urlencoded).unwrap_or_default();
+    let Some((approval_id, person, exp_unix, sig)) = verified_link_params(cfg, &query) else {
+        return email_link_rejected();
+    };
+    if exp_unix <= Utc::now().timestamp() {
+        return email_link_expired();
+    }
+    let row: Result<Option<EmailApprovalView>, sqlx::Error> =
+        sqlx::query_as::<_, EmailApprovalView>(
+            "SELECT ap.action, ap.step_id, ap.alert_id, ap.state, ap.requested_by, \
+                    ap.expires_at, al.title \
+             FROM approvals ap LEFT JOIN alerts al ON al.id = ap.alert_id \
+             WHERE ap.id = $1",
+        )
+        .bind(approval_id)
+        .fetch_optional(&state.pool)
+        .await;
+    let view = match row {
+        Ok(view) => view,
+        Err(e) => {
+            tracing::error!(error = %e, "email approval page load failed");
+            return email_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+                "<p>Something went wrong. Try the Beacon UI.</p>",
+            );
+        }
+    };
+    let Some(view) = view else {
+        return email_page(
+            StatusCode::NOT_FOUND,
+            "Approval not found",
+            "<p>This approval no longer exists.</p>",
+        );
+    };
+    // A pending row whose expiry has already lapsed (the sweeper has not marked it yet)
+    // answers like the decide path would: expired, with no form to press.
+    if view.state == "pending" && view.expires_at <= Utc::now() {
+        return email_link_expired();
+    }
+    let expires_at = view.expires_at.to_rfc3339();
+    let mut body_html = format!(
+        "<h1>Approval request</h1>\n\
+         <p>Action: <strong>{action}</strong> (step {step_id})</p>\n\
+         <p>Alert: {title} ({alert_id})</p>\n\
+         <p>Requested by: {requested_by}</p>\n\
+         <p>Expiry: {expires_at}</p>\n\
+         <p>Current state: {state}</p>\n",
+        action = html_escape(&view.action),
+        step_id = html_escape(&view.step_id),
+        title = html_escape(view.title.as_deref().unwrap_or("(alert removed)")),
+        alert_id = html_escape(&view.alert_id.to_string()),
+        requested_by = html_escape(&view.requested_by),
+        expires_at = html_escape(&expires_at),
+        state = html_escape(&view.state),
+    );
+    if view.state == "pending" {
+        // The form re-carries the link's own parameters as hidden fields; only the
+        // pressed `decision` button is new.
+        body_html.push_str(&format!(
+            "<form method=\"post\" action=\"/api/approvals/email\">\n\
+             <input type=\"hidden\" name=\"a\" value=\"{a}\">\n\
+             <input type=\"hidden\" name=\"p\" value=\"{p}\">\n\
+             <input type=\"hidden\" name=\"e\" value=\"{e}\">\n\
+             <input type=\"hidden\" name=\"s\" value=\"{s}\">\n\
+             <button type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>\n\
+             <button type=\"submit\" name=\"decision\" value=\"reject\">Reject</button>\n\
+             </form>\n",
+            a = html_escape(&approval_id.to_string()),
+            p = html_escape(&person),
+            e = html_escape(&exp_unix.to_string()),
+            s = html_escape(&sig),
+        ));
+    }
+    email_page(StatusCode::OK, "Approval request", &body_html)
+}
+
+/// `POST /api/approvals/email` with an `application/x-www-form-urlencoded` body
+/// `a,p,e,s,decision=approve|reject`: verified exactly like the GET, then decided
+/// through the same `approvals::decide` path as the UI button, with the SIGNED person as
+/// the actor (`user:<p>`, `via = email`) — the session `Actor`, if the mounting app
+/// inserted one, is ignored entirely. Outcomes are HTML pages, never JSON.
+async fn email_approval_decide(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(cfg) = state.email_link.as_ref() else {
+        return email_page(
+            StatusCode::NOT_FOUND,
+            "Email approvals are not enabled",
+            "<p>Email approvals are not enabled on this Beacon installation.</p>",
+        );
+    };
+    // The HMAC in the body is the authorization, not a cookie: a cross-site form can
+    // only re-post a link its author already holds, so the JSON content-type guard is
+    // deliberately NOT applied here (this is the one POST that takes a form). Anything
+    // but the form encoding is still refused.
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if media_type != "application/x-www-form-urlencoded" {
+        return email_page(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Unsupported media type",
+            "<p>This route accepts application/x-www-form-urlencoded bodies only.</p>",
+        );
+    }
+    // Body size: axum's default body limit guards this extraction.
+    let form = parse_urlencoded(&String::from_utf8_lossy(&body));
+    let Some((approval_id, person, exp_unix, _sig)) = verified_link_params(cfg, &form) else {
+        return email_link_rejected();
+    };
+    if exp_unix <= Utc::now().timestamp() {
+        return email_link_expired();
+    }
+    let decision = match form.get("decision").map(String::as_str) {
+        Some("approve") => Decision::Approve,
+        Some("reject") => Decision::Reject,
+        _ => {
+            return email_page(
+                StatusCode::BAD_REQUEST,
+                "Unknown decision",
+                "<p>The decision must be approve or reject.</p>",
+            );
+        }
+    };
+    let actor = format!("user:{person}");
+    match approvals::decide(
+        &state.pool,
+        state.alert_ops.as_ref(),
+        approval_id,
+        &actor,
+        decision,
+        Via::Email,
+        None,
+    )
+    .await
+    {
+        Ok(DecideOutcome::Approved { execution_id }) => email_page(
+            StatusCode::OK,
+            "Approved",
+            &format!(
+                "<p>The request was approved.</p>\n<p>Execution: {}</p>\n",
+                html_escape(&execution_id.to_string())
+            ),
+        ),
+        Ok(DecideOutcome::Rejected) => email_page(
+            StatusCode::OK,
+            "Rejected",
+            "<p>The request was rejected.</p>\n",
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, approval_id = %approval_id, "email link decide failed");
+            match e {
+                DecideError::Forbidden(message) => email_page(
+                    StatusCode::FORBIDDEN,
+                    "Forbidden",
+                    &format!("<p>{}</p>\n", html_escape(&message)),
+                ),
+                DecideError::NotFound => email_page(
+                    StatusCode::NOT_FOUND,
+                    "Approval not found",
+                    "<p>This approval no longer exists.</p>",
+                ),
+                DecideError::AlreadyDecided(state_str) => email_page(
+                    StatusCode::CONFLICT,
+                    "Already decided",
+                    &format!(
+                        "<p>This approval was already decided: {}.</p>\n",
+                        html_escape(&state_str)
+                    ),
+                ),
+                DecideError::Expired => email_link_expired(),
+                DecideError::InvalidTransition(message) => email_page(
+                    StatusCode::CONFLICT,
+                    "Cannot decide",
+                    &format!("<p>{}</p>\n", html_escape(&message)),
+                ),
+                DecideError::Db(_) => email_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error",
+                    "<p>Something went wrong. Try the Beacon UI.</p>",
+                ),
+            }
+        }
     }
 }
 

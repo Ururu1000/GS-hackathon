@@ -93,6 +93,7 @@ fn api_state(pool: &PgPool, reply_secret: Option<Vec<u8>>) -> ApiState {
         registry: ActionRegistry::default(),
         alert_ops: std::sync::Arc::new(SqlAlertOps),
         reply_secret: reply_secret.map(std::sync::Arc::new),
+        email_link: None,
     }
 }
 
