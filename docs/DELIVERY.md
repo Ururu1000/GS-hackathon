@@ -78,12 +78,14 @@ cargo run -p beacon -- --migrate \
 
 ## Demos and measured results
 
-Rows marked *CI* (and the latency rows) ran on a GitHub Actions `ubuntu-latest` runner (2 vCPU, release build, `.github/workflows/loadtest.yml`). The other rows were measured on one laptop with `docker compose` and a debug build.
+Rows marked *CI* (and the latency rows) ran on a GitHub Actions `ubuntu-latest` runner (2 vCPU, release build, `.github/workflows/loadtest.yml`). Rows marked *Apple M5 Mac* were run by alexey on a 10-core Mac (release build, stack via `docker compose`). The other rows were measured on one laptop with `docker compose` and a debug build.
 
 | Scenario | Result |
 |---|---|
 | **60 s SMS gateway outage** (SPEC §9 c), `./scripts/demo_sms_outage.sh --events 50 --outage-secs 60` | 50/50 SMS sent, 0 failed, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 2 attempts per job; the last SMS went out **3.8 s** after the gateway came back. Phone calls for the same events were unaffected (all sent within 0.5 s). |
 | *CI, on main* (`b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383)): the same 60 s outage, 50 events | **PASS**: 50/50 SMS sent, 0 dead, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 3 attempts per job; the last SMS went out **1.7 s** after the gateway came back |
+| *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): the same 60 s outage, 50 events | **PASS**: 50/50 SMS sent, 0 dead, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 3 attempts per job; the last SMS went out **2.3 s** after recovery |
+| *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): the same outage with a single SMS (`--events 1`) | sent, 0 dead, 0 duplicates; all 8 attempts used; sent **28.8 s** after recovery (the final-attempt floor at work) |
 | Same outage with a single SMS (`--events 1`), the worst case for retries | sent, 0 failed: it used all 8 attempts, and the final-attempt floor kept the last one after the outage (sent 33 s after recovery) |
 | 1,000 emails over 8 workers into Mailpit (`DELIVERY_LOAD_TEST=1 cargo test -p beacon-delivery --test delivery_m0`) | each exactly once; **~47–163 msgs/s**, limited by Mailpit |
 | Escalation (4 s override) | unacked alert: carol (next on call) paged by phone + SMS; acked alert: timer cancelled, nobody else paged |
@@ -91,6 +93,8 @@ Rows marked *CI* (and the latency rows) ran on a GitHub Actions `ubuntu-latest` 
 | Settlement-timeout runbook (SPEC M5) | health check ok → `retry_workflow` fails twice → `escalate` unlocks → approval SMS to carol → her `Y <code>` approves → `counterparty-support` (gina) emailed with the runbook steps; full audit timeline; no approval code left at rest |
 | **Ingest → delivery latency** (SPEC §9, M6), `./scripts/demo_latency.sh --events 500 --rate 50` on CI ([run 44867217055](https://github.com/Ururu1000/GS-hackathon/actions/runs/44867217055), commit `9140087`, ubuntu-latest, 2 vCPU, release build) | 500/500 events delivered, 0 missing, 0 dead. Ingest → fake-gateway receipt (sms + phone): **p50 862 ms, p90 1361 ms, p99 1751 ms, max 1970 ms**. Ingest → Mailpit email: **p50 904 ms, p90 1317 ms, p99 1542 ms, max 1578 ms**. Full table below. |
 | *CI, on main* (`b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383)): the same latency workload again | 500/500 delivered, 0 missing. Gateway: **p50 952 / p90 1225 / p99 1606 / max 1804 ms**. Email: **p50 936 / p90 1204 / p99 1391 / max 1556 ms** |
+| *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): `--events 500 --rate 50` | 500/500 delivered, 0 missing. Gateway: **p50 464 / p90 618 / p99 743 / max 765 ms**. Email: **p50 380 / p90 491 / p99 549 / max 618 ms** |
+| *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): `--events 2000 --rate 200` | 2000/2000 delivered, 0 missing, 0 dead. Gateway: **p50 653 / p90 833 / p99 959 / max 1085 ms**. Email: **p50 650 / p90 819 / p99 944 / max 1030 ms** |
 
 Run the settlement-timeout flow by hand against the stack above. The mock workflow engine is set to fail with `POST :8070/api/simulator/mock {"target":"workflows","mode":"fail"}` plus the gateway token. Post `samples/events/workflow-failed.json` to `:8090/ingest/webhook`, then run the steps with `POST :8071/api/alerts/<id>/steps/<s1|s2|s3>/run`, and answer the approval SMS through `POST :8070/api/simulator/reply`.
 
