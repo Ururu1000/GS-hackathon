@@ -17,12 +17,12 @@ npm run build      # typecheck + static build → ui/dist/
 Against a real backend, the dev server proxies `/api` and `/ingest`:
 
 ```sh
-BEACON_API_URL=http://localhost:8080 BEACON_GATEWAY_URL=http://localhost:8070 npm run dev
+BEACON_API_URL=http://localhost:8080 npm run dev
 ```
 
 Standalone mock (for backend folks, or to serve a build): `npm run mock` serves the mock API on `:8787` (`PORT=` to change) and, if `ui/dist/` exists, the built UI too. `npm run build && npm run mock` gives a full demo on one port.
 
-The gateway URL sends the device inbox and SSE requests to the development gateway. Set `VITE_MAILPIT_URL` if the Mailpit inbox uses a port other than 8025. The mock implements the new source, schema, runbook import, and SMS reply endpoints. Live deployments need the corresponding backend routes. The recipient filter and runbook import appear when the session advertises support.
+Device simulator calls (inbox, stream, replies, outage) also go through the API, which adds the gateway token server-side. Set `VITE_MAILPIT_URL` if the Mailpit inbox uses a port other than 8025. The mock implements the new source, schema, runbook import, and SMS reply endpoints. Live deployments need the corresponding backend routes. The recipient filter and runbook import appear when the session advertises support.
 
 ### Serving the build
 

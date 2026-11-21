@@ -335,6 +335,19 @@ it('applies detector precedence before resolving matching detectors with the sam
     .toMatchObject({ schema: 'prometheus.alert', fields: { stage: 'firing' } })
 })
 
+it('starts, lists and ends a demo gateway outage', async () => {
+  expect(await request('/api/simulator/outage')).toEqual({ outages: [] })
+  await request('/api/simulator/outage', 400, 'POST', { channel: 'email', seconds: 60 })
+  await request('/api/simulator/outage', 400, 'POST', { channel: 'sms', seconds: 0 })
+  await request('/api/simulator/outage', 400, 'POST', { channel: 'sms', seconds: 3601 })
+  const started = await request('/api/simulator/outage', 200, 'POST', { channel: 'sms', seconds: 60 })
+  expect(started.outages).toEqual([{ channel: 'sms', mode: 'down', until: expect.any(String) }])
+  expect(Date.parse(started.outages[0].until)).toBeGreaterThan(Date.now())
+  expect((await request('/api/simulator/outage')).outages).toHaveLength(1)
+  await request('/api/simulator/outage?channel=fax', 400, 'DELETE')
+  expect(await request('/api/simulator/outage?channel=sms', 200, 'DELETE')).toEqual({ outages: [] })
+})
+
 it('serves a runbook’s current revision and keeps the alert’s frozen copy', async () => {
   const detail = await request('/api/runbooks/settlement-timeout')
   expect(detail).toMatchObject({ id: 'settlement-timeout', revision: 2, team: 'settlements' })
