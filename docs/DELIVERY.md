@@ -2,7 +2,7 @@
 
 Delivery turns an alert into the right messages for the right people and follows up until someone acts. It covers routing, channel preferences, email/SMS/phone delivery, retries, escalation, throttling, runbooks, actions and approvals. Code: [`crates/beacon-delivery`](../crates/beacon-delivery). Config: `config/people`, `config/teams`, `config/delivery.yaml`, `config/runbooks`, `config/actions`.
 
-> Status: everything below is on the delivery branches. PR #9 has preferences, the fake gateway, the breaker and fallback. PR #11 has escalation, throttles, runbooks, approvals and the security fixes. `main` has the M0 part (PRs #5 and #7).
+> Status: `main` has the M0 part (PRs #5 and #7). PR #9 (preferences, the fake gateway, the breaker and fallback) is approved. PR #11 (escalation, throttles, runbooks, approvals and the security-audit fixes) is in final review.
 
 ## How a notification flows
 
@@ -26,7 +26,8 @@ actions     runs queued runbook actions; approvals gate the risky ones
 
 - **Exactly one job per notification and channel:** the unique key is `(alert, recipient, channel, notify_seq, escalation_step)`. A replayed outbox row or a router crash never doubles a page.
 - **Retries:** capped, jittered exponential backoff; a provider's `Retry-After` is honoured, clamped at 10 min. Errors are classed as transient, permanent or ambiguous.
-- **Circuit breaker** per channel: 5 transient failures open it for 5 s. While it's open, no jobs are claimed and deferred jobs keep their attempts. After the cooldown, one leased probe decides; its lease (`probe_until`) lets another worker take over if the probe's worker crashes.
+- **Circuit breaker** per channel: 5 transient failures open it for 5 s. While it's open, no jobs are claimed. After the cooldown, one leased probe decides; its lease (`probe_until`) lets another worker take over if the probe's worker crashes.
+- **Attempts during an outage:** only a job that never reached the provider gets its attempt back. A real failed send always uses its attempt and waits at least the cooldown. The failure before a job's last attempt waits at least `max(cooldown, backoff cap)` (60 s by default). A 60 s outage therefore drains with nothing lost, and a much longer one ends in `dead` plus the one-hop fallback.
 - **One-hop fallback** (`config/delivery.yaml`: phone → sms → email): a job that finally fails creates exactly one job on the frozen fallback address, in the same transaction.
 - **No pages for acked or resolved alerts:** each attempt re-reads the alert first.
 - **Honest limits:** sends are at least once (a crash after SMTP accepted the message can resend; the Message-ID stays stable). Postgres is a single point of failure in the demo.
@@ -81,7 +82,8 @@ All measured on one laptop with `docker compose`, debug build.
 
 | Scenario | Result |
 |---|---|
-| **60 s SMS gateway outage** (SPEC §9 c), `./scripts/demo_sms_outage.sh --events 50 --outage-secs 60` | 50/50 SMS sent, 0 failed, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 2 attempts per job; the last SMS went out **1.7 s** after the gateway came back. Phone calls for the same events were unaffected (all sent within 0.5 s). |
+| **60 s SMS gateway outage** (SPEC §9 c), `./scripts/demo_sms_outage.sh --events 50 --outage-secs 60` | 50/50 SMS sent, 0 failed, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 2 attempts per job; the last SMS went out **3.8 s** after the gateway came back. Phone calls for the same events were unaffected (all sent within 0.5 s). |
+| Same outage with a single SMS (`--events 1`), the worst case for retries | sent, 0 failed: it used all 8 attempts, and the final-attempt floor kept the last one after the outage (sent 33 s after recovery) |
 | 1,000 emails over 8 workers into Mailpit (`DELIVERY_LOAD_TEST=1 cargo test -p beacon-delivery --test delivery_m0`) | each exactly once; **~47–163 msgs/s**, limited by Mailpit |
 | Escalation (4 s override) | unacked alert: carol (next on call) paged by phone + SMS; acked alert: timer cancelled, nobody else paged |
 | Throttle `{max: 2, per: 1m}`, 5 trades | 2 emails per person, 3 held back, then one digest each: "3 more alert(s) … were held back by throttling" |
@@ -101,7 +103,8 @@ Run the settlement-timeout flow by hand against the stack above. The mock workfl
 
 - No approval code is ever logged or returned by an API. Codes exist only in the SMS itself until the approval is decided.
 - Phone numbers and email addresses are masked in logs and error text.
-- Delivery's API trusts the `Actor` set by beacon-api's session/CSRF layer: POSTs must be JSON, and only members, the lead or an on-call of the alert's team may run steps.
+- Delivery's API trusts the `Actor` set by beacon-api's session/CSRF layer: every POST must send `Content-Type: application/json` (415 otherwise, even with an empty body), and only members, the lead or an on-call of the alert's team may run steps.
+- Approval requests are race-safe (one request and one set of prompt SMS per step), and an `ACK` reply only acks an alert that was actually delivered to that phone.
 - `/api/replies` only accepts HMAC-signed, timestamped calls from the gateway.
 - The gateway needs a token for everything once `GATEWAY_TOKEN` is set, and won't listen beyond loopback without one.
 
