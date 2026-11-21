@@ -4,6 +4,8 @@
 # Brings up Postgres + Mailpit + Redpanda (deploy/docker-compose.yml), builds release
 # `beacon`, runs scripts/demo_latency.sh, then the 60 s SMS outage demo (SPEC §9 c), and
 # uploads results.json / results.md / outage.md / beacon.log.
+# The `fullstack` job runs the judges' path, `docker compose up --build` (UI + API + every
+# role + demo seed), and smoke-tests it through the UI's origin (:8080).
 name: loadtest
 
 on:
@@ -98,3 +100,72 @@ jobs:
             outage.md
             beacon.log
           if-no-files-found: warn
+
+  fullstack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose up --build (UI + API + all roles + demo seed)
+        run: docker compose up -d --build --wait beacon
+      - name: Demo seed finished
+        run: |
+          code=$(docker compose wait demo-seed)
+          docker compose logs demo-seed
+          test "$code" = 0
+      - name: Smoke test through the UI origin (:8080)
+        run: |
+          set -euo pipefail
+          api=http://127.0.0.1:8080
+          ok() { echo "ok  $*"; echo "- ok: $*" >> "$GITHUB_STEP_SUMMARY"; }
+          fail() { echo "FAIL: $*"; echo "- **FAIL**: $*" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "## Full-stack demo smoke (docker compose up --build)" >> "$GITHUB_STEP_SUMMARY"
+
+          curl -fsS -o ui.html "$api/"; grep -qi '<html' ui.html && ok "UI served at /" || fail "UI not served at /"
+          session=$(curl -fsS "$api/api/session")
+          csrf=$(jq -r '.csrf_token // .csrf' <<<"$session")
+          test -n "$csrf" && test "$csrf" != null && ok "session + CSRF token" || fail "session + CSRF token"
+
+          # The seed's alerts: workflow failure + rejected trade (Kafka) + HTTP samples.
+          for i in $(seq 1 60); do
+            alerts=$(curl -fsS "$api/api/alerts")
+            n=$(jq '.items | length' <<<"$alerts")
+            [ "$n" -ge 3 ] && break
+            sleep 2
+          done
+          [ "$n" -ge 3 ] && ok "$n alerts in the feed" || fail "$n alerts in the feed"
+
+          for path in people teams runbooks; do
+            curl -fsS -o /dev/null "$api/api/$path" && ok "GET /api/$path (delivery mount)" || fail "GET /api/$path (delivery mount)"
+          done
+
+          # Delivery reached the fake gateway (simulator via the API, token injected
+          # server-side) and Mailpit.
+          for i in $(seq 1 60); do
+            sims=$(curl -fsS "$api/api/simulator/messages" | jq '.items | length')
+            mails=$(curl -fsS http://127.0.0.1:8025/api/v1/messages | jq '.total')
+            [ "$sims" -ge 1 ] && [ "$mails" -ge 1 ] && break
+            sleep 2
+          done
+          [ "$sims" -ge 1 ] && ok "$sims SMS/phone message(s) in the device simulator" || fail "$sims SMS/phone message(s) in the device simulator"
+          [ "$mails" -ge 1 ] && ok "$mails email(s) in Mailpit" || fail "$mails email(s) in Mailpit"
+
+          # Alert detail (deliveries + delivery timeline + runbook), then ack it like the UI does.
+          first=$(jq -c '[.items[] | select(.status == "open")][0]' <<<"$alerts")
+          id=$(jq -r .id <<<"$first"); version=$(jq -r .version <<<"$first")
+          detail=$(curl -fsS "$api/api/alerts/$id")
+          jq -e '(.deliveries | type) == "array" and (.timeline | length) > 0 and has("runbook")' <<<"$detail" >/dev/null \
+            && ok "alert detail: $(jq '.deliveries | length' <<<"$detail") deliveries, $(jq '.timeline | length' <<<"$detail") timeline entries, runbook $(jq -r 'if .runbook then "attached" else "none" end' <<<"$detail")" || fail "alert detail $id: $(head -c 300 <<<"$detail")"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/api/alerts/$id/ack" \
+            -H 'content-type: application/json' -H "x-csrf-token: $csrf" \
+            --data "{\"expected_version\": $version}")
+          [ "$code" = 200 ] && ok "ack via the API (CSRF) -> 200" || fail "ack via the API -> $code"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/api/alerts/$id/resolve" \
+            -H 'content-type: application/json' --data '{}')
+          [ "$code" = 403 ] && ok "write without CSRF -> 403" || fail "write without CSRF -> $code (want 403)"
+      - name: Compose logs
+        if: failure()
+        run: docker compose logs --no-color --tail 300
