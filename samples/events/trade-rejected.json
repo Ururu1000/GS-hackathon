@@ -1,0 +1,4 @@
+{
+  "meta": { "schema": "trade.rejected.v1", "producer": "trade-gateway", "ts": 1761210842000 },
+  "payload": { "tradeId": "T-99877", "desk": "rates", "notional": 25000000, "currency": "EUR", "reason": "LIMIT_BREACH" }
+}

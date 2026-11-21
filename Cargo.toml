@@ -24,3 +24,14 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Added by ingest/engine (a).
+axum = "0.8.9"
+rdkafka = { version = "0.39", features = ["cmake-build", "tokio"] }
+minijinja = "2"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+humantime-serde = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+hdrhistogram = "7.5"

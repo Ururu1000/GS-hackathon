@@ -1,0 +1,25 @@
+# Team Rates: trade.rejected where desk = rates and notional > 10,000,000 -> email + UI.
+id: rates-rejected-trades
+name: Large rejected rates trades
+team: rates
+when:
+  all:
+    - { path: raw.meta.schema, op: eq, value: "trade.rejected.v1" }
+    - { path: raw.payload.desk, op: eq, value: rates }
+    - { path: raw.payload.notional, op: gt, value: 10000000 }
+severity: warning
+route:
+  - to: team:rates
+    channels: [email, ui]
+present:
+  title: "Rejected {{ raw.payload.currency }} {{ raw.payload.notional | money }} trade {{ raw.payload.tradeId }}"
+  body: "Reason: {{ raw.payload.reason }}"
+  fields:
+    - { path: raw.payload.desk, label: Desk }
+    - { path: raw.payload.reason, label: Reason }
+    - { path: raw.meta.producer, label: Producer }
+  color: amber
+dedup:
+  key: [raw.payload.tradeId]
+  window: 10m
+runbook: trade-rejected

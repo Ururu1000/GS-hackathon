@@ -1,0 +1,129 @@
+//! Aggregator against a real Postgres (needs DATABASE_URL; sqlx::test creates
+//! a fresh database per test and applies ../../migrations).
+
+use beacon_core::MatchKind;
+use beacon_core::MatchRecord;
+use beacon_core::model::NotifyPayload;
+use beacon_core::rule::RouteSpec;
+use beacon_engine::aggregator::apply_batch;
+use beacon_engine::feed::load_feed_alerts;
+use chrono::{Duration, Utc};
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> MatchRecord {
+    MatchRecord {
+        match_id: format!("{event}:rates-rejected-trades"),
+        kind,
+        rule_id: "rates-rejected-trades".into(),
+        rule_revision: 1,
+        rule_name: "Large rejected rates trades".into(),
+        team: "rates".into(),
+        fingerprint: fp.into(),
+        key: vec![serde_json::json!("T-1")],
+        dedup_window_ms: 600_000,
+        severity: "warning".into(),
+        color: "amber".into(),
+        title: "Rejected EUR 25,000,000 trade T-1".into(),
+        body: "Reason: LIMIT_BREACH".into(),
+        fields: vec![beacon_core::model::AlertField {
+            path: "raw.payload.desk".into(),
+            label: "Desk".into(),
+            value: serde_json::json!("rates"),
+        }],
+        route: vec![RouteSpec { to: "team:rates".into(), channels: Some(vec!["email".into(), "ui".into()]) }],
+        event_id: event.into(),
+        source: "kafka:trades".into(),
+        schema: "envelope.meta-payload".into(),
+        ingested_at: at,
+        diagnostics: vec![],
+    }
+}
+
+async fn alert_rows(pool: &PgPool) -> Vec<(Uuid, i64, String, bool, i64)> {
+    sqlx::query("SELECT id, count, status, dedup_active, version FROM alerts ORDER BY first_seen, id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn dedup_across_batches(pool: PgPool) {
+    let now = Utc::now();
+    let first: Vec<_> = (0..300).map(|i| rec(&format!("a{i}"), "fp1", MatchKind::Fire, now)).collect();
+    apply_batch(&pool, &first).await.unwrap();
+    let second: Vec<_> = (0..200).map(|i| rec(&format!("b{i}"), "fp1", MatchKind::Fire, now + Duration::seconds(1))).collect();
+    apply_batch(&pool, &second).await.unwrap();
+
+    let rows = alert_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, 500, "500 dupes -> 1 alert with exact count");
+    assert_eq!(rows[0].4, 2, "one version bump per batch");
+
+    let notify: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT payload FROM outbox WHERE kind = 'notify'").fetch_all(&pool).await.unwrap();
+    assert_eq!(notify.len(), 1, "count bumps never page again");
+    let n: NotifyPayload = serde_json::from_value(notify[0].clone()).unwrap();
+    assert_eq!(n.alert_id, rows[0].0);
+    assert_eq!(n.notify_seq, 1);
+    assert_eq!(n.route[0].channels.as_deref(), Some(&["email".to_string(), "ui".to_string()][..]));
+
+    let notify_seq: i32 = sqlx::query_scalar("SELECT notify_seq FROM alerts").fetch_one(&pool).await.unwrap();
+    assert_eq!(notify_seq, 1);
+    let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE kind = 'alert_update'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(updates, 2, "one alert_update per alert per batch");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn window_expiry_and_recovery(pool: PgPool) {
+    let t0 = Utc::now();
+    apply_batch(&pool, &[rec("a", "fp", MatchKind::Fire, t0)]).await.unwrap();
+    // 11 minutes later: outside the 10-minute window -> new generation.
+    apply_batch(&pool, &[rec("b", "fp", MatchKind::Fire, t0 + Duration::minutes(11))]).await.unwrap();
+    let rows = alert_rows(&pool).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].2.as_str(), rows[0].3), ("open", false), "retired alert stays open");
+    assert_eq!((rows[1].2.as_str(), rows[1].3), ("open", true));
+
+    apply_batch(&pool, &[rec("r", "fp", MatchKind::Recover, t0 + Duration::minutes(12))]).await.unwrap();
+    let rows = alert_rows(&pool).await;
+    assert_eq!((rows[1].2.as_str(), rows[1].3), ("resolved", false));
+
+    let feed = load_feed_alerts(&pool, &[rows[1].0]).await.unwrap();
+    assert_eq!(feed[0].resolved_reason.as_deref(), Some("recovered"));
+    assert_eq!(feed[0].fields[0].label, "Desk");
+    assert_eq!(feed[0].rule.name, "Large rejected rates trades");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn acked_alerts_keep_counting(pool: PgPool) {
+    let t0 = Utc::now();
+    apply_batch(&pool, &[rec("a", "fp", MatchKind::Fire, t0)]).await.unwrap();
+    sqlx::query("UPDATE alerts SET status = 'acked', acked_by = 'bob', acked_at = now()").execute(&pool).await.unwrap();
+    apply_batch(&pool, &[rec("b", "fp", MatchKind::Fire, t0 + Duration::seconds(5))]).await.unwrap();
+    let rows = alert_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].1, rows[0].2.as_str()), (2, "acked"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn nul_bytes_in_match_do_not_poison_batch(pool: PgPool) {
+    let t0 = Utc::now();
+    let mut poisoned = rec("nul-1", "fp-nul", MatchKind::Fire, t0);
+    poisoned.title = "Bad\0Title".into();
+    poisoned.body = "Body\0with\0nuls".into();
+    poisoned.fields[0].value = serde_json::json!({"k\0": "v\0"});
+    apply_batch(&pool, &[poisoned]).await.unwrap();
+
+    let rows = alert_rows(&pool).await;
+    assert_eq!(rows.len(), 1);
+    let feed = load_feed_alerts(&pool, &[rows[0].0]).await.unwrap();
+    assert_eq!(feed[0].title, "BadTitle");
+    assert_eq!(feed[0].body, "Bodywithnuls");
+}

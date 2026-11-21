@@ -1,0 +1,1 @@
+{ "event_kind": "disk_full", "host": "batch-07", "used_pct": 97.5, "mount": "/var/data" }

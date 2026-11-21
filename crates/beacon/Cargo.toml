@@ -8,6 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 beacon-delivery = { path = "../beacon-delivery" }
+beacon-core = { path = "../beacon-core" }
+beacon-ingest = { path = "../beacon-ingest" }
+beacon-engine = { path = "../beacon-engine" }
+axum.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 anyhow.workspace = true

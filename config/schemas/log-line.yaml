@@ -1,0 +1,14 @@
+# Structured application log lines (JSON lines from a tailed file or a log shipper).
+schema: log.line
+priority: 30
+detect:
+  all:
+    - { path: level, op: exists }
+    - { path: logger, op: exists }
+    - { path: msg, op: exists }
+fields:
+  type:        { value: LOG }
+  severity:    { path: level, enum: severity }
+  service:     { path: logger }
+  instrument:  { path: instrument }
+  occurred_at: { path: ts, as: rfc3339 }
