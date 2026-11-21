@@ -154,20 +154,23 @@ Re-run it: Actions → `loadgen` → Run workflow (inputs: rates, duration), or 
 
 ## What is mocked
 
-- **SMS and phone calls:** the `gateway` role stands in for a provider such as Twilio. It persists every message (`gateway_receipts`), deduplicates by job id, simulates outages (`down`, `lose_response`) and feeds the UI's device simulator. A real provider is one `Channel` implementation.
-- **Email** is real SMTP; in the demo it goes to Mailpit.
+- **SMS and phone calls:** the `gateway` role stands in for a provider such as Twilio. It persists every message (`gateway_receipts`), deduplicates by job id, simulates outages (`down`, `lose_response`) and feeds the UI's device simulator. A real provider is one `Channel` implementation, or an adapter service with no Rust change: see [PROVIDERS.md](PROVIDERS.md).
+- **Email** is real SMTP; in the demo it goes to Mailpit. A real relay (SES, SendGrid, ...) is configuration only.
 - **Action targets** (workflow engine, service restart, tickets, health checks) are mock endpoints on the gateway, each switchable between `ok` and `fail`.
-- **People, teams and preferences** are YAML loaded at startup; versioned Postgres config with hot reload is M2.
-- **Not built yet:** signed email approval links (M7), a recipient-wide throttle (M7), and writable people/teams APIs.
+- **People, teams and preferences** come from `config/people` and `config/teams` (synthetic: `example.test` addresses, `+44 7700 900xxx` numbers). Edits through `PUT /api/people/{id}/preferences` and `PUT /api/teams/{id}` (the Preferences screen) are stored in Postgres (`directory_overrides`) and apply on the router's next pass, with no restart.
+- **Not built:** signed email approval links (approvals are by SMS code or in the UI) and a recipient-wide throttle (throttles are per rule and recipient).
 
 ## Security notes
 
 - No approval code is ever logged or returned by an API. Codes exist only in the SMS itself until the approval is decided.
+- Approval codes are 4 digits, stored only as a SHA-256 hash, unique per approver, single-use, valid for 15 minutes, with 5 attempts. Only the team lead or the current on-call may approve, never the person who asked, and the hash is scrubbed once the request is decided.
 - Phone numbers and email addresses are masked in logs and error text.
 - Delivery's API trusts the `Actor` set by beacon-api's session/CSRF layer: every POST must send `Content-Type: application/json` (415 otherwise, even with an empty body), and only members, the lead or an on-call of the alert's team may run steps.
 - Approval requests are race-safe (one request and one set of prompt SMS per step), and an `ACK` reply only acks an alert that was actually delivered to that phone.
 - `/api/replies` only accepts HMAC-signed, timestamped calls from the gateway.
 - The gateway needs a token for everything once `GATEWAY_TOKEN` is set, and won't listen beyond loopback without one.
+- Email refuses plaintext SMTP to a non-local host unless `SMTP_ALLOW_PLAINTEXT=1`; `SMTP_TLS=starttls|tls` for a real relay.
+- How we used AI tools to build this, and how we kept data and secrets out of them: [AI_USAGE.md](AI_USAGE.md).
 
 ## Tests
 
