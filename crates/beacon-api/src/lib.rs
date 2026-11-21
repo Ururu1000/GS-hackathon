@@ -136,13 +136,9 @@ pub fn router_full(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         ));
         api = api.merge(routes);
         if let Some(sim) = d.simulator {
-            let bearer = sim
-                .token
-                .as_deref()
-                .map(|t| axum::http::HeaderValue::try_from(format!("Bearer {t}")))
-                .transpose()
-                .ok()
-                .flatten();
+            // Callers validate the token up front ([`bearer_header`]); one that
+            // still can't be a header value is a startup bug, not a silent 401.
+            let bearer = sim.token.as_deref().map(|t| bearer_header(t).expect("GATEWAY_TOKEN is not a valid header value"));
             let routes = beacon_delivery::gateway::simulator_router(sim.state)
                 .layer(axum::middleware::from_fn(move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                     let bearer = bearer.clone();
@@ -169,6 +165,12 @@ pub fn router_full(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         None => api,
     };
     app.layer(axum::middleware::from_fn(security_headers))
+}
+
+/// `Authorization: Bearer <token>` for the simulator mount; `Err` if the
+/// token can't be sent as an HTTP header (e.g. contains a newline).
+pub fn bearer_header(token: &str) -> Result<axum::http::HeaderValue, axum::http::header::InvalidHeaderValue> {
+    axum::http::HeaderValue::try_from(format!("Bearer {token}"))
 }
 
 /// Non-GET requests to `routes` need the session's `X-CSRF-Token`.

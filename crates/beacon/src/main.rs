@@ -241,6 +241,10 @@ async fn main() -> Result<()> {
     let gateway_token = std::env::var("GATEWAY_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
+    if let Some(t) = &gateway_token {
+        beacon_api::bearer_header(t)
+            .context("GATEWAY_TOKEN must be a valid HTTP header value (no control characters)")?;
+    }
     let gateway_state = if has(Role::Gateway) {
         // Replies go to whichever process serves /api/replies: the API role mounts delivery's
         // routes, so in an all-in-one process that is our own API port.
