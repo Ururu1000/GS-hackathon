@@ -10,7 +10,7 @@
 //! ```
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -118,11 +118,9 @@ fn invalid(path: &str, message: impl Into<String>) -> ApiError {
     e
 }
 
-pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Response, ApiError> {
     state.session.check_csrf(&headers)?;
-    if body.len() > MAX_BODY {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_BODY} bytes")));
-    }
+    let body = crate::rules::read_body(body, MAX_BODY).await?;
     let b: CreateBody = serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("not a valid proposal: {e}")))?;
     if !KINDS.contains(&b.kind.as_str()) {
         return Err(invalid("kind", format!("one of {KINDS:?}")));
@@ -224,9 +222,9 @@ pub async fn decide(State(state): State<ApiState>, headers: HeaderMap, Path((id,
         let rule_id: String = row.try_get("rule_id")?;
         let base: i64 = row.try_get("base_revision")?;
         crate::rules::check_team(&state, &proposed)?;
-        match config_store::update_in(&mut tx, &rule_id, &proposed, base, &actor).await? {
+        match config_store::update_in(&mut tx, &rule_id, &proposed, base, &actor, Some(&crate::rules::visible_teams(&state))).await? {
             Ok(_) => "accepted",
-            Err(WriteError::Conflict(_)) | Err(WriteError::NotFound) => {
+            Err(WriteError::Conflict(_) | WriteError::NotFound | WriteError::Forbidden) => {
                 let stale = set_state(&state, &mut tx, id, "stale", &actor).await?;
                 tx.commit().await?;
                 return Err(ApiError::conflict("revision_conflict", "the rule changed after this proposal was made", stale));

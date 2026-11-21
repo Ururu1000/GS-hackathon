@@ -263,27 +263,30 @@ pub async fn update_scoped(
     actor: &str,
     visible_teams: Option<&[String]>,
 ) -> Result<Result<StoredRule, WriteError>> {
-    let rule = match validate(spec) {
-        Ok(r) => r,
-        Err(p) => return Ok(Err(WriteError::Invalid(p))),
-    };
-    if rule.id != id {
-        return Ok(Err(WriteError::Invalid(vec![Invalid { path: "id".into(), message: format!("must match the URL ({id})") }])));
-    }
     let mut tx = pool.begin().await?;
-    let res = update_in(&mut tx, id, spec, expected_revision, actor).await?;
+    let res = update_in(&mut tx, id, spec, expected_revision, actor, visible_teams).await?;
     if res.is_ok() {
         tx.commit().await?;
     }
     Ok(res)
 }
 
-/// Compare-and-set update inside the caller's transaction (already validated
-/// by the caller via [`validate`]), so a rule write can commit atomically with
-/// other state, e.g. a proposal being accepted.
-pub async fn update_in(tx: &mut PgConnection, id: &str, spec: &Value, expected_revision: i64, actor: &str) -> Result<Result<StoredRule, WriteError>> {
-    if let Err(p) = validate(spec) {
-        return Ok(Err(WriteError::Invalid(p)));
+/// [`update_scoped`] inside the caller's transaction, so a rule write can
+/// commit atomically with other state, e.g. a proposal being accepted.
+pub async fn update_in(
+    tx: &mut PgConnection,
+    id: &str,
+    spec: &Value,
+    expected_revision: i64,
+    actor: &str,
+    visible_teams: Option<&[String]>,
+) -> Result<Result<StoredRule, WriteError>> {
+    let rule = match validate(spec) {
+        Ok(r) => r,
+        Err(p) => return Ok(Err(WriteError::Invalid(p))),
+    };
+    if rule.id != id {
+        return Ok(Err(WriteError::Invalid(vec![Invalid { path: "id".into(), message: format!("must match the URL ({id})") }])));
     }
     lock_rules(&mut *tx).await?;
     let Some(existing) = current(&mut *tx, id, true).await?.filter(|e| !e.deleted) else {

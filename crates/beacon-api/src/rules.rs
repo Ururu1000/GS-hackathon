@@ -205,7 +205,7 @@ const MAX_WRITE_BODY: usize = 128 * 1024;
 /// Bound concurrent blocking rule-test evaluations per replica.
 static TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
-async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
+pub(crate) async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
     axum::body::to_bytes(body, limit)
         .await
         .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {limit} bytes")))
@@ -242,7 +242,7 @@ async fn map_write(state: &ApiState, e: WriteError) -> ApiError {
     }
 }
 
-fn visible_teams(state: &ApiState) -> Vec<String> {
+pub(crate) fn visible_teams(state: &ApiState) -> Vec<String> {
     state.session.teams.iter().map(|t| t.id.clone()).collect()
 }
 
@@ -411,10 +411,10 @@ struct SchemaWrite {
 /// Publish a schema mapping (create, or compare-and-set with expected_revision).
 /// Mappings are global (they recognise shapes, not team data), so publishing
 /// is limited to admins.
-pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Response, ApiError> {
     state.session.check_csrf(&headers)?;
-    check_body(&body)?;
     require_admin(&state, "publishing schema mappings")?;
+    let body = read_body(body, MAX_WRITE_BODY).await?;
     let b: SchemaWrite = parse_body(&body, "{\"spec\": {...}, \"expected_revision\"?: <int>}")?;
     match config_store::save_schema(&state.pool, &b.spec, b.expected_revision, &state.session.actor()).await? {
         Ok((s, created)) => {
@@ -423,7 +423,7 @@ pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body
             Ok((status, Json(v)).into_response())
         }
         Err(WriteError::Invalid(d)) => Err(invalid(d)),
-        Err(WriteError::NotFound) => Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no mapping with that schema name to update")),
+        Err(WriteError::NotFound | WriteError::Forbidden) => Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no mapping with that schema name to update")),
         Err(WriteError::Conflict(_)) => {
             let name = b.spec.get("schema").and_then(Value::as_str).unwrap_or("");
             let current = config_store::get_schema(&state.pool, name)
@@ -444,11 +444,9 @@ struct SchemaPreview {
 }
 
 /// Evaluate a mapping against one event, without changing config.
-pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
-    if body.len() > MAX_TEST_BODY {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_TEST_BODY} bytes")));
-    }
+    let body = read_body(body, MAX_TEST_BODY).await?;
     let b: SchemaPreview = parse_body(&body, "{\"spec\": {...}, \"event\": {...}, \"source\": \"...\"}")?;
     let spec = config_store::validate_schema(&b.spec).map_err(invalid)?;
     let out = tokio::task::spawn_blocking(move || {
