@@ -45,6 +45,8 @@ fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> Mat
             fields: serde_json::Map::new(),
             raw: serde_json::json!({"payload": {"tradeId": "T-1"}}),
         }),
+        quiet_for_ms: None,
+        group_key: None,
     }
 }
 
@@ -207,4 +209,57 @@ async fn fenced_checkpoints(pool: PgPool) {
     assert!(again.is_ok(), "already applied is not a fence error");
     let count: i64 = sqlx::query_scalar("SELECT count FROM alerts").fetch_one(&pool).await.unwrap();
     assert_eq!(count, 15, "the retried batch is not applied twice");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn quiet_for_resolves_idle_alerts(pool: PgPool) {
+    use beacon_engine::aggregator::sweep_quiet;
+    let mut quiet = rec("q", "fp-quiet", MatchKind::Fire, Utc::now() - Duration::minutes(20));
+    quiet.quiet_for_ms = Some(10 * 60 * 1000);
+    let mut busy = rec("b", "fp-busy", MatchKind::Fire, Utc::now());
+    busy.quiet_for_ms = Some(10 * 60 * 1000);
+    let plain = rec("p", "fp-plain", MatchKind::Fire, Utc::now() - Duration::minutes(20));
+    apply_batch(&pool, &[quiet, busy, plain]).await.unwrap();
+    assert_eq!(sweep_quiet(&pool).await.unwrap(), 1);
+    let rows: Vec<(String, String, Option<String>, bool)> =
+        sqlx::query_as("SELECT fingerprint, status, resolved_reason, dedup_active FROM alerts ORDER BY fingerprint")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows[0], ("fp-busy".into(), "open".into(), None, true));
+    assert_eq!(rows[1], ("fp-plain".into(), "open".into(), None, true), "no quiet_for, never auto-resolved");
+    assert_eq!(rows[2], ("fp-quiet".into(), "resolved".into(), Some("quiet_for".into()), false));
+    assert_eq!(sweep_quiet(&pool).await.unwrap(), 0, "idempotent");
+    let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE kind = 'alert_update'").fetch_one(&pool).await.unwrap();
+    assert_eq!(updates, 3 + 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn grouped_recovery_closes_every_window(pool: PgPool) {
+    let rule: beacon_core::rule::RuleSpec = serde_json::from_value(serde_json::json!({
+        "id": "lat", "team": "pricing",
+        "when": {"all": [{"path": "raw.kind", "op": "eq", "value": "latency"}, {"path": "raw.state", "op": "eq", "value": "high"}]},
+        "route": [{"to": "team:pricing"}], "present": {"title": "Latency {{ raw.instrument }}"},
+        "group": {"by": ["raw.instrument"], "window": "5m"},
+        "auto_resolve": {"recover_when": {"all": [{"path": "raw.kind", "op": "eq", "value": "latency"}, {"path": "raw.state", "op": "eq", "value": "ok"}]}}
+    }))
+    .unwrap();
+    let cfg = beacon_core::ConfigSnapshot::build(1, vec![], vec![rule]).unwrap();
+    let ev = |id: &str, state: &str, at: chrono::DateTime<Utc>| {
+        let mut e = beacon_core::Event::new(id.into(), "http:x".into(), serde_json::json!({"kind": "latency", "state": state, "instrument": "EURUSD"}));
+        e.ingested_at = at;
+        cfg.process(e).1.remove(0)
+    };
+    let t0 = Utc::now() - Duration::minutes(12);
+    // Two digests in different 5-minute windows, then a recovery in a third.
+    apply_batch(&pool, &[ev("a", "high", t0)]).await.unwrap();
+    apply_batch(&pool, &[ev("b", "high", t0 + Duration::minutes(6))]).await.unwrap();
+    let open: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE status = 'open'").fetch_one(&pool).await.unwrap();
+    assert_eq!(open, 2);
+    let rec = ev("r", "ok", t0 + Duration::minutes(11));
+    assert_eq!(rec.kind, MatchKind::Recover);
+    apply_batch(&pool, &[rec]).await.unwrap();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT status, resolved_reason FROM alerts").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(s, r)| s == "resolved" && r.as_deref() == Some("recovered")), "{rows:?}");
 }

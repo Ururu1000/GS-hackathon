@@ -23,6 +23,7 @@ Last updated: 2026-11-21.
 | One-command `docker compose up --build` | Done, verified end to end | PR #13 |
 | Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
 | Exact counts under replay and crashes (M1) | Done: scenario e exact | PR #15 |
+| Grouping digests + quiet-for auto-resolve (M3) | Done | PR #16 |
 | Kafka-mode load test | Later | |
 
 PR merge order: #5 → #8 → #7 → #9 → #11 → #12 → #13. Each PR is stacked on the previous one.
@@ -92,6 +93,16 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
 - **The UI** is served at http://localhost:8080.
 - **Delivery sent 3 emails to Mailpit** (http://localhost:8025): Anna for `HighErrorRate`, Erin and Bob for the rejected rates trade.
 
+## Grouping and quiet timers (M3)
+
+- **`group: {by, window}`** keys an incident by the group tuple plus the UTC time bucket. Each tuple gets one alert per window, its count grows live, and the card shows the window, e.g. "Window 09:15–09:20 UTC".
+- **Pricing's seed rule** now does exactly what the brief asks: one alert per instrument every 5 minutes.
+- **Recovery closes the whole series:** on a grouped rule, a recovery signal resolves every open digest of that tuple, whatever its window.
+- **The validator requires grouped rules to auto-resolve** (`quiet_for` or `recover_when`), so old windows can't pile up.
+- **`auto_resolve.quiet_for`:** a sweeper resolves open or acked alerts with no new match for that long (`resolved_reason = quiet_for`). Pricing digests resolve after 10 quiet minutes.
+  - Sweepers claim rows with `SKIP LOCKED`.
+  - Postgres re-checks `last_seen` after a row lock, so a fresh match always wins.
+
 ## Exact counts (M1)
 
 Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
@@ -135,6 +146,7 @@ Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
   - Duplicate event ids are dropped within a bounded window per matcher. That is 200k ids, about 80 s at 20k ev/s.
   - A client that retries without an `Idempotency-Key` can still double-count.
   - After a crash, processing pauses up to about 10 s while the dead matcher's transaction times out.
+- **Grouping and quiet timers use processing time** (`ingested_at`), not the producer's own timestamp. If the aggregator lags more than `quiet_for`, a digest can be resolved and then reopen as a new alert.
 - **A deleted and recreated `alerts.matches` topic** is not detected. Stored checkpoints would skip the new topic's first offsets.
 - **Rare event reorderings can merge incidents.** An older fire arriving after a newer one, across batches, merges two incidents into one. The open/resolved state stays correct; only history is affected.
 - **Schema mappings are read-only through the API for now.** They come from `config/schemas`, and edits arrive with the schemas write endpoints.

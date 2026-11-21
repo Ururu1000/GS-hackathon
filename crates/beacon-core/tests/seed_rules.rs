@@ -110,6 +110,22 @@ fn pricing_warn_and_above_by_instrument() {
     other["instrument"] = json!("GBPUSD");
     let (_, m2) = run(&cfg, "http:logs", other);
     assert_ne!(m2[0].fingerprint, m[0].fingerprint, "one alert per instrument");
+
+    // Grouping: same instrument in the same UTC 5-minute bucket = same digest;
+    // the next bucket starts a new one. The card shows the window.
+    use chrono::TimeZone;
+    let at = |min: u32, sec: u32| {
+        let mut e = Event::new(format!("p{min}{sec}"), "http:logs".into(), sample("pricing-log-warn.json"));
+        e.ingested_at = chrono::Utc.with_ymd_and_hms(2026, 11, 21, 9, min, sec).unwrap();
+        cfg.process(e).1.remove(0)
+    };
+    let (a, b, c) = (at(15, 1), at(19, 59), at(20, 0));
+    assert_eq!(a.fingerprint, b.fingerprint);
+    assert_ne!(b.fingerprint, c.fingerprint);
+    assert_eq!(a.dedup_window_ms, 300_000);
+    let w = a.fields.iter().find(|f| f.label == "Window").expect("window field");
+    assert_eq!(w.value, json!("09:15–09:20 UTC"));
+    assert_eq!(a.quiet_for_ms, Some(600_000));
 }
 
 #[test]

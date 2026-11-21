@@ -229,6 +229,14 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Aggregator => {
+                tasks.spawn({
+                    let (pool, rx) = (pool.clone(), shutdown_rx.clone());
+                    async move {
+                        if let Err(e) = beacon_engine::aggregator::run_quiet_sweeper(pool, rx).await {
+                            tracing::error!(error = %e, "quiet sweeper stopped");
+                        }
+                    }
+                });
                 for _ in 0..workers("AGGREGATOR_WORKERS", "2")? {
                     let (kafka, pool, rx) = (kafka.clone(), pool.clone(), shutdown_rx.clone());
                     tasks.spawn(supervise("aggregator", rx.clone(), move || {

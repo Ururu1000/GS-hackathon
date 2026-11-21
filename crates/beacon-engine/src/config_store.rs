@@ -105,6 +105,7 @@ pub fn validate(spec: &Value) -> Result<RuleSpec, Vec<Invalid>> {
                 }
                 RuleError::BadId => "id".into(),
                 RuleError::TooMany { .. } => "present.fields".into(),
+                RuleError::Group { .. } => "group".into(),
             };
             if !problems.iter().any(|p| p.path == path) {
                 problems.push(Invalid { path, message: e.to_string() });
@@ -371,6 +372,14 @@ mod tests {
         let mut bad = rule();
         bad["route"] = json!([]);
         assert_eq!(validate(&bad).unwrap_err()[0].path, "route");
+        let mut bad = rule();
+        bad["group"] = json!({"by": ["raw.x"], "window": "forever"});
+        assert_eq!(validate(&bad).unwrap_err()[0].path, "group");
+        let mut ok = rule();
+        ok["group"] = json!({"by": ["raw.x"], "window": 300});
+        assert_eq!(validate(&ok).unwrap_err()[0].path, "group", "grouped rules must auto-resolve");
+        ok["auto_resolve"] = json!({"quiet_for": "10m"});
+        assert!(validate(&ok).is_ok());
         let mut bad = rule();
         bad["present"]["__proto__"] = json!({"x": 1});
         assert_eq!(validate(&bad).unwrap_err()[0].path, "present.__proto__");
