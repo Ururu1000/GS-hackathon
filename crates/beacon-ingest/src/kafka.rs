@@ -72,6 +72,24 @@ pub fn consumer(bootstrap: &str, group: &str, topics: &[&str], from_beginning: b
     Ok(consumer)
 }
 
+/// Create topics with `partitions` if they don't exist (idempotent).
+pub async fn ensure_named_topics(bootstrap: &str, names: &[String], partitions: i32) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let admin: AdminClient<DefaultClientContext> = base_config(bootstrap).create().context("creating Kafka admin client")?;
+    let topics: Vec<NewTopic> = names.iter().map(|t| NewTopic::new(t, partitions, TopicReplication::Fixed(1))).collect();
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    for r in admin.create_topics(&topics, &opts).await.context("creating topics")? {
+        match r {
+            Ok(t) => info!(topic = %t, partitions, "created topic"),
+            Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => {}
+            Err((t, e)) => anyhow::bail!("creating topic {t}: {e}"),
+        }
+    }
+    Ok(())
+}
+
 /// Create the internal topics if they don't exist (idempotent).
 pub async fn ensure_topics(bootstrap: &str) -> Result<()> {
     let admin: AdminClient<DefaultClientContext> =

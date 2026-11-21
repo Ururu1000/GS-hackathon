@@ -45,9 +45,13 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        for f in /app/samples/events/*.json; do
-          case "$$f" in *resolved*) continue;; esac
-          curl -fsS -X POST -H 'content-type: application/json' --data @"$$f" http://beacon:8090/ingest/demo >/dev/null \
-            && echo "seeded $$(basename $$f)"
+        # Two source types, as in the brief: the workflow failure and the
+        # rejected trade come from a message broker (Kafka sources), the rest
+        # arrive over the HTTP webhook.
+        beacon-loadgen --kafka redpanda:9092 --topic workflow-events --send-file /app/samples/events/workflow-failed.json
+        beacon-loadgen --kafka redpanda:9092 --topic trade-events --send-file /app/samples/events/trade-rejected.json
+        for f in high-error-rate pricing-log-warn unknown-shape; do
+          curl -fsS -X POST -H 'content-type: application/json' --data @/app/samples/events/$$f.json http://beacon:8090/ingest/demo >/dev/null \
+            && echo "seeded $$f.json over HTTP"
         done
     restart: "no"

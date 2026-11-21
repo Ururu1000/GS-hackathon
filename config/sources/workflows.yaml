@@ -1,0 +1,7 @@
+# Workflow engine failures arrive on a message broker (Appendix A,
+# "Workflow failure (from a message broker)"). Beacon consumes the topic and
+# commits upstream offsets only after each event is durably in events.raw.
+id: kafka:workflows
+type: kafka
+topics: [workflow-events]
+start: earliest

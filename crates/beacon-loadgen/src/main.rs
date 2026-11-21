@@ -62,16 +62,44 @@ struct Args {
     /// Scenario label for the report.
     #[arg(long, default_value = "a-baseline")]
     scenario: String,
+    /// Where events go: `http` (POST /ingest/lg/batch) or `kafka` (an external
+    /// topic read by a Kafka source, see config/sources).
+    #[arg(long, default_value = "http")]
+    via: String,
+    /// Topic for `--via kafka`.
+    #[arg(long, default_value = "workflow-events")]
+    topic: String,
+    /// Event shapes to send: all, or a comma list of workflow,trade,pricing,prometheus.
+    #[arg(long, default_value = "all")]
+    event_types: String,
+    /// Produce this one JSON file to `--topic` and exit (demo seeding).
+    #[arg(long)]
+    send_file: Option<String>,
     /// Write the markdown report here (directory).
     #[arg(long, default_value = "loadtest/results")]
     out: String,
 }
 
 /// Generate one event; `matching` false produces a near-miss that no rule matches.
-fn make_event(rng: &mut impl Rng, run: &str, keys: u64, matching: bool) -> Value {
+fn event_types(spec: &str) -> Result<Vec<usize>> {
+    if spec == "all" {
+        return Ok(vec![0, 1, 2, 3]);
+    }
+    spec.split(',')
+        .map(|t| match t.trim() {
+            "workflow" => Ok(0),
+            "trade" => Ok(1),
+            "pricing" => Ok(2),
+            "prometheus" => Ok(3),
+            other => anyhow::bail!("unknown event type `{other}` (workflow, trade, pricing, prometheus)"),
+        })
+        .collect()
+}
+
+fn make_event(rng: &mut impl Rng, run: &str, keys: u64, matching: bool, types: &[usize]) -> Value {
     // Keys are namespaced per run so alerts from earlier runs are never reused.
     let k = format!("{run}-{:06}", rng.random_range(0..keys));
-    match rng.random_range(0..4) {
+    match types[rng.random_range(0..types.len())] {
         0 => json!({
             "type": "WORKFLOW_FAILED",
             "workflowId": format!("WF-LG-{k}"),
@@ -116,6 +144,26 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let args = Args::parse();
     let run_id = uuid::Uuid::now_v7().simple().to_string()[..12].to_string();
+    let types = event_types(&args.event_types)?;
+    let via_kafka = match args.via.as_str() {
+        "http" => false,
+        "kafka" => true,
+        other => anyhow::bail!("--via must be http or kafka, not `{other}`"),
+    };
+    let producer = if via_kafka || args.send_file.is_some() { Some(kafka::producer(&args.kafka)?) } else { None };
+
+    if let Some(path) = &args.send_file {
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?)?;
+        let payload = serde_json::to_vec(&raw)?;
+        producer
+            .as_ref()
+            .unwrap()
+            .send(rdkafka::producer::FutureRecord::<str, [u8]>::to(&args.topic).payload(&payload), Duration::from_secs(10))
+            .await
+            .map_err(|(e, _)| anyhow::anyhow!("producing to {}: {e}", args.topic))?;
+        println!("produced {path} to {}", args.topic);
+        return Ok(());
+    }
 
     // Intended send time per event id, for latency correlation.
     let sent_at: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -134,6 +182,7 @@ async fn main() -> Result<()> {
     let observer = {
         let (sent_at, latency, first_alert, updates_seen, alerts_seen) =
             (sent_at.clone(), latency.clone(), first_alert.clone(), updates_seen.clone(), alerts_seen.clone());
+        let run_tag = run_id.clone();
         tokio::spawn(async move {
             loop {
                 let Ok(m) = consumer.recv().await else { continue };
@@ -142,10 +191,18 @@ async fn main() -> Result<()> {
                 updates_seen.fetch_add(1, Ordering::Relaxed);
                 // Only alerts carrying an event from this run are sampled, so
                 // unrelated traffic on the shared feed is ignored.
-                let Some(eid) = a.last_event_id.as_deref() else { continue };
-                let Some(t0) = sent_at.lock().unwrap().get(eid).copied() else { continue };
-                let us = now.duration_since(t0).as_micros() as u64;
-                let _ = latency.lock().unwrap().record(us.max(1));
+                // Over Kafka the source assigns event ids, so only first-alert
+                // latency (server clock) is measured, for this run's alerts.
+                if via_kafka {
+                    if !a.title.contains(run_tag.as_str()) {
+                        continue;
+                    }
+                } else {
+                    let Some(eid) = a.last_event_id.as_deref() else { continue };
+                    let Some(t0) = sent_at.lock().unwrap().get(eid).copied() else { continue };
+                    let us = now.duration_since(t0).as_micros() as u64;
+                    let _ = latency.lock().unwrap().record(us.max(1));
+                }
                 if alerts_seen.lock().unwrap().insert(a.id) {
                     // Opening latency on the server clock: ingest receipt (first_seen)
                     // to the first update observed for this alert. Unaffected by the
@@ -215,7 +272,7 @@ async fn main() -> Result<()> {
             .map(|_| {
                 let matching = rng.random_bool(args.match_ratio.clamp(0.0, 1.0));
                 matching_in_batch += matching as u64;
-                make_event(&mut rng, &run_id, args.distinct_keys, matching)
+                make_event(&mut rng, &run_id, args.distinct_keys, matching, &types)
             })
             .collect();
         let key = format!("{run_id}-{b}");
@@ -233,6 +290,25 @@ async fn main() -> Result<()> {
         }
         let (client, url, counters) = (client.clone(), args.url.clone(), counters.clone());
         let n = events.len() as u64;
+        if let (true, Some(producer)) = (via_kafka, producer.clone()) {
+            let topic = args.topic.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                counters.sent.fetch_add(n, Ordering::Relaxed);
+                let payloads: Vec<Vec<u8>> = events.iter().map(|e| serde_json::to_vec(e).unwrap()).collect();
+                let sends = payloads.iter().map(|p| {
+                    producer.send(rdkafka::producer::FutureRecord::<str, [u8]>::to(&topic).payload(p), Duration::from_secs(10))
+                });
+                let results = futures::future::join_all(sends).await;
+                if results.iter().all(Result::is_ok) {
+                    counters.matching_accepted.fetch_add(matching_in_batch, Ordering::Relaxed);
+                    counters.accepted.fetch_add(n, Ordering::Relaxed);
+                } else {
+                    counters.failed.fetch_add(n, Ordering::Relaxed);
+                }
+            }));
+            continue;
+        }
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             counters.sent.fetch_add(n, Ordering::Relaxed);
