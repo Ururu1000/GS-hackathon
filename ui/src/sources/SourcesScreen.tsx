@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { parseDocument, stringify } from 'yaml'
-import { errorText, ingest } from '../api/client'
+import { errorText, HttpError, ingest } from '../api/client'
 import {
-  listDiscoveredSchemas, listSchemaMappings, listSources, previewSchemaMapping, saveSchemaMapping,
-  type DiscoveredSchema, type SchemaMapping, type SchemaPreview, type SourceView,
+  listDiscoveredSchemas, listSchemaMappings, listSources, previewSchemaMapping, saveSchemaMapping, suggestSchemaMapping,
+  type DiscoveredSchema, type SchemaMapping, type SchemaPreview, type SchemaSuggestion, type SourceView,
 } from '../api/screens'
-import { FORBIDDEN_KEYS, hasForbiddenKey, isSensitivePath, redactValue } from '../lib/redact'
+import { FORBIDDEN_KEYS, hasForbiddenKey, isSensitivePath, redactText, redactValue } from '../lib/redact'
 import { absTime } from '../lib/time'
 import { flattenPaths, slugify } from '../rules/draft'
 
@@ -25,7 +25,19 @@ function mappingTemplate(sample: DiscoveredSchema | null) {
   })
 }
 
-export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: DiscoveredSchema) => void }) {
+/** Who proposed a suggested mapping, as the UI labels it. */
+export function suggestionLabel(s: Pick<SchemaSuggestion, 'provider' | 'model'>): string {
+  if (s.provider === 'mock') return 'Mock suggestion'
+  if (s.provider === 'claude') return `Suggested by Claude${s.model ? ` (${s.model})` : ''}`
+  return `Suggested by ${s.provider}`
+}
+
+function suggestionError(e: unknown): string {
+  if (e instanceof HttpError && e.body?.error.code === 'llm_disabled') return 'Mapping suggestions are turned off on this server.'
+  return errorText(e)
+}
+
+export function SourcesScreen({ onCreateRule, llmSuggest = false }: { onCreateRule: (sample: DiscoveredSchema) => void; llmSuggest?: boolean }) {
   const [data, setData] = useState<{ sources: SourceView[]; discovered: DiscoveredSchema[]; mappings: SchemaMapping[] } | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [payload, setPayload] = useState('')
@@ -35,6 +47,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
   const [busy, setBusy] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [feedback, setFeedback] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null)
+  const [suggestion, setSuggestion] = useState<Pick<SchemaSuggestion, 'provider' | 'model' | 'notes'> | null>(null)
   const sample = data?.discovered.find((entry) => keyFor(entry) === selected) ?? data?.discovered[0] ?? null
   const previewFrom = previewInput ?? (sample ? 'discovered' : 'paste')
 
@@ -79,6 +92,32 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
     setMapping({ saved, text: saved ? stringify(saved.spec) : mappingTemplate(sample) })
     setPreview(null)
     setFeedback(null)
+    setSuggestion(null)
+  }
+
+  /** Ask the server for a mapping proposal and open it in the editor, unsaved. */
+  const suggest = async (from: 'discovered' | 'paste') => {
+    setBusy(true)
+    setFeedback(null)
+    try {
+      let input: Parameters<typeof suggestSchemaMapping>[0]
+      if (from === 'discovered') {
+        if (!sample) return
+        input = sample.schema.startsWith('unknown:') ? { schema: sample.schema } : { event: sample.sample, source: sample.source }
+      } else {
+        if (payload.length > MAX_INPUT_CHARS) throw new Error('Event JSON must be 64 KiB or smaller.')
+        input = { event: JSON.parse(payload) as unknown, source: 'http:playground' }
+      }
+      const result = await suggestSchemaMapping(input)
+      setMapping({ text: stringify(result.spec) })
+      setPreviewInput(from)
+      setPreview(result.preview)
+      setSuggestion({ provider: result.provider, model: result.model, notes: result.notes })
+    } catch (e) {
+      setFeedback({ kind: 'error', text: suggestionError(e) })
+    } finally {
+      setBusy(false)
+    }
   }
 
   const applyMapping = async (save: boolean) => {
@@ -166,6 +205,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                       <div className="inline wrap">
                         <button className="btn btn-primary" onClick={() => onCreateRule(sample)}>Create rule from this event</button>
                         <button className="btn" onClick={() => editMapping()} disabled={busy}>Map this schema</button>
+                        {llmSuggest && <button className="btn" onClick={() => void suggest('discovered')} disabled={busy}>Suggest a mapping</button>}
                       </div>
                     </>
                   )}
@@ -185,6 +225,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
               </label>
               <div className="inline">
                 <span className="spacer" />
+                {llmSuggest && <button className="btn" disabled={busy || !payload.trim()} onClick={() => void suggest('paste')}>Suggest a mapping</button>}
                 <button className="btn" disabled={busy || !payload.trim()} onClick={() => void submitEvent()}>Ingest sample</button>
               </div>
             </section>
@@ -200,6 +241,12 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
             </div>
             {mapping && (
               <div className="stack">
+                {suggestion && (
+                  <div className="notice" role="status">
+                    <p><span className="pill pill-auto">{suggestionLabel(suggestion)}</span> Nothing is saved yet. Check the paths, preview it, then save.</p>
+                    {suggestion.notes && <p className="small">{redactText(suggestion.notes, 500)}</p>}
+                  </div>
+                )}
                 <label className="form-field">
                   <span className="label">Mapping YAML</span>
                   <textarea className="input mono feature-textarea" rows={11} maxLength={64 * 1024} value={mapping.text} onChange={(e) => { setMapping({ ...mapping, text: e.target.value }); setPreview(null) }} disabled={busy} spellCheck={false} />
@@ -217,7 +264,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                     </select>
                   </label>
                   <span className="spacer" />
-                  <button className="btn btn-ghost" disabled={busy} onClick={() => { setMapping(null); setPreview(null) }}>Close editor</button>
+                  <button className="btn btn-ghost" disabled={busy} onClick={() => { setMapping(null); setPreview(null); setSuggestion(null) }}>Close editor</button>
                   <button className="btn" disabled={busy || (previewFrom === 'discovered' ? !sample : !payload.trim())} onClick={() => void applyMapping(false)}>Preview mapping</button>
                   <button className="btn btn-primary" disabled={busy} onClick={() => void applyMapping(true)}>Save mapping</button>
                 </div>

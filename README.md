@@ -168,4 +168,5 @@ One binary, `beacon`, runs any mix of roles (`--role ingest,matcher,...`); the c
 - **SMS replies:** they reach the API signed with `REPLY_SECRET` (HMAC with a timestamp). `GATEWAY_TOKEN` stays on the server, and the API adds it to the UI's simulator calls.
 - **Demo caveat:** the device simulator is a fake phone for the demo. Any session can read the SMS it holds, approval codes included, and reply as any number. A real SMS provider replaces it.
 - **Limits:** bodies, rule sizes, regexes, templates, SSE streams and pending proposals are all capped, and every request is validated.
+- **LLM (off by default):** `BEACON_LLM=mock` (a labelled name-based heuristic) or `claude` (needs `ANTHROPIC_API_KEY`) enables `POST /api/schemas/suggest`, a draft mapping for an unknown event shape. The model never sees the event, only its paths, value types and short redacted examples, and it has no tools. Its answer can only pick paths that exist in the sample and the approved transforms. The server builds and validates the mapping and previews it against the sample, and an admin publishes it through the normal path. Use synthetic data with a live model.
 

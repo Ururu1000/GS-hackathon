@@ -211,7 +211,7 @@ pub(crate) async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiErro
         .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {limit} bytes")))
 }
 
-fn require_admin(state: &ApiState, what: &str) -> Result<(), ApiError> {
+pub(crate) fn require_admin(state: &ApiState, what: &str) -> Result<(), ApiError> {
     if state.session.admin {
         Ok(())
     } else {

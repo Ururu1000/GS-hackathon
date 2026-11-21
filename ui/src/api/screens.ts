@@ -94,6 +94,18 @@ export const listDiscoveredSchemas = (signal?: AbortSignal) =>
   request<DiscoveredSchema[]>('/api/schemas/discovered', { signal })
 export const listSchemaMappings = (signal?: AbortSignal) =>
   request<SchemaMapping[]>('/api/schemas', { signal })
+/** `POST /api/schemas/suggest`: a reviewed-before-publish mapping proposal (nothing is stored). */
+export interface SchemaSuggestion {
+  provider: 'mock' | 'claude' | (string & {})
+  model: string | null
+  spec: SchemaSpec
+  preview: SchemaPreview
+  notes: string
+}
+
+export const suggestSchemaMapping = (input: { schema: string } | { event: unknown; source?: string }) =>
+  post<SchemaSuggestion>('/api/schemas/suggest', input)
+
 export const previewSchemaMapping = (spec: unknown, event: unknown, source: string, signal?: AbortSignal) =>
   post<SchemaPreview>('/api/schemas/preview', { spec, event, source }, signal)
 /** `editing` is the stored mapping being changed; omit it to create a new one. */
