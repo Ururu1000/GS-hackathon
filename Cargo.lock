@@ -281,6 +281,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "http-body-util",
  "humantime-serde",
  "lettre",
  "minijinja",
@@ -294,6 +295,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "uuid",
 ]

@@ -7,6 +7,9 @@
 //! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `403 forbidden` (team); `400 bad_request` (not a manual step); `404` |
 //! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden` (not eligible, or the requester — nobody approves their own request); `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
 //! | `GET /api/runbooks` | `200 {items}` | |
+//! | `GET /api/people/directory` | `200 {items}` of `PersonDirectoryEntry` (`{id, name, teams}`) | `401 unauthorized` |
+//! | `GET /api/people` | `200 {items}` of `PersonView` | `401 unauthorized` |
+//! | `GET /api/teams` | `200 {items}` of `TeamView` | `401 unauthorized` |
 //! | `POST /api/replies` `{from, text}` (fake-gateway callback: `X-Beacon-Timestamp: <unix seconds>` within ±300 s of now, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, "<timestamp>." + raw_body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`, the alert of the newest sms/phone job `sent` to the number), `already_decided` (a repeated decision, or a repeated `ACK` whose newest sent page was already acked — it never advances to an older open alert), `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (missing/old/future timestamp, bad/missing signature) |
 //!
 //! Auth: beacon-api's session/CSRF middleware inserts `Extension(Actor("user:<id>"))` before
@@ -16,6 +19,14 @@
 //! `run` and `check` additionally require the actor to be on the alert's team — a member, the
 //! lead, or anyone in one of the team's on-call rotations (Directory) — else `403 forbidden`
 //! (audit #11; `GET /api/runbooks` stays open to any authenticated user).
+//! The three people/teams `GET`s are read-only views over the in-memory Directory (no
+//! database, items sorted by `id`, `revision` always the constant `1` — nothing is
+//! persisted; there is no edit API yet), and `/api/people` redacts everyone except the
+//! actor to `contact: {}` and `preferences: []`, so no other user's email, phone or
+//! preferences may leak. `Admin(bool)` is inserted by the mounting app (beacon-api's
+//! `Session.admin`; absent means not admin, and `serve_standalone` never inserts it) and
+//! widens `can_edit` to every person and team — otherwise a person's `can_edit` is being
+//! that person and a team's is being its lead.
 //! Every POST must say `Content-Type: application/json` (`415 unsupported_media_type`
 //! otherwise — media type only, and even when the body is empty: an empty body WITH the
 //! JSON content type is still accepted wherever the contract allows no body) — a
@@ -27,6 +38,7 @@
 //! `{expected_version?}` on the run route is accepted (shape-checked: an integer or null) but
 //! not enforced — the route table above lists no version-conflict error for it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
@@ -37,7 +49,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, body::Bytes};
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use uuid::Uuid;
@@ -48,12 +60,17 @@ use crate::approvals::{
     self, DecideError, DecideOutcome, Decision, ReplyOutcome, RequestError, Via,
 };
 use crate::audit;
-use crate::config::Directory;
+use crate::config::{Directory, Person, Team};
 use crate::runbook::{RenderedStep, StepKind};
 
 /// The authenticated user, `user:<id>`, inserted by the mounting app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Actor(pub String);
+
+/// Whether the session is an admin, inserted by the mounting app (beacon-api's
+/// `Session.admin`); absent means not admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admin(pub bool);
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -210,6 +227,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/approvals/{id}/approve", post(approve_handler))
         .route("/api/approvals/{id}/reject", post(reject_handler))
         .route("/api/runbooks", get(runbooks_handler))
+        .route("/api/people/directory", get(directory_handler))
+        .route("/api/people", get(people_handler))
+        .route("/api/teams", get(teams_handler))
         .route("/api/replies", post(replies_handler))
         .with_state(state)
 }
@@ -570,6 +590,184 @@ async fn runbooks_handler(
 ) -> Result<Response, ApiError> {
     let _actor = actor.map(|a| a.0).ok_or_else(unauthorized)?;
     let items = crate::runbook::list_items(&state.dir.runbooks);
+    Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
+}
+
+// ---------------------------------------------------------------------------------------------
+// GET /api/people/directory, /api/people, /api/teams (read-only Directory views)
+// ---------------------------------------------------------------------------------------------
+
+/// Every view's `revision`: the constant `1` — nothing is persisted and there is no edit
+/// API yet, so no view can have moved past it.
+const DIRECTORY_REVISION: i64 = 1;
+
+/// The id title-cased (first char uppercased): `bob` -> `Bob`,
+/// `counterparty-support` -> `Counterparty-support`.
+fn title_cased(id: &str) -> String {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The sorted ids of the teams where `person` is a member or the lead.
+fn teams_of(dir: &Directory, person: &str) -> Vec<String> {
+    let mut ids: Vec<String> = dir
+        .teams
+        .values()
+        .filter(|t| t.members.iter().any(|m| m == person) || t.lead.as_deref() == Some(person))
+        .map(|t| t.id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `PersonDirectoryEntry` (contract): `{id, name, teams}` — a minimal recipient-picker
+/// entry, no `contact`, no `preferences` keys at all.
+#[derive(Serialize)]
+struct PersonDirectoryEntry {
+    id: String,
+    /// The configured name, else the title-cased id.
+    name: String,
+    teams: Vec<String>,
+}
+
+/// `PersonView.contact`: only the keys that are `Some` (never `null`); both absent
+/// serializes to `{}` — also the redacted shape for other users.
+#[derive(Serialize)]
+struct ContactView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+}
+
+/// `PersonView` (contract).
+#[derive(Serialize)]
+struct PersonView {
+    id: String,
+    /// The configured name, else the title-cased id.
+    name: String,
+    contact: ContactView,
+    teams: Vec<String>,
+    /// The person's raw `preferences` value if it is a JSON array, else `[]` — `[]`
+    /// unless `can_edit` (redacted like `contact`).
+    preferences: Vec<Value>,
+    revision: i64,
+    can_edit: bool,
+}
+
+/// `TeamView` (contract).
+#[derive(Serialize)]
+struct TeamView {
+    id: String,
+    /// Always the title-cased id (team YAML has no name).
+    name: String,
+    members: Vec<String>,
+    lead: Option<String>,
+    /// The schedule -> rotation map as configured; `{}` when empty.
+    oncall: HashMap<String, Vec<String>>,
+    /// The configured list, or `[]` when unset.
+    default_channels: Vec<String>,
+    revision: i64,
+    can_edit: bool,
+}
+
+/// `GET /api/people/directory`: every person as `{id, name, teams}`, sorted by id.
+async fn directory_handler(
+    State(state): State<ApiState>,
+    actor: Option<axum::Extension<Actor>>,
+) -> Result<Response, ApiError> {
+    let _actor = actor.map(|a| a.0).ok_or_else(unauthorized)?;
+    let mut people: Vec<&Person> = state.dir.people.values().collect();
+    people.sort_by(|a, b| a.id.cmp(&b.id));
+    let items: Vec<PersonDirectoryEntry> = people
+        .into_iter()
+        .map(|p| PersonDirectoryEntry {
+            id: p.id.clone(),
+            name: p.name.clone().unwrap_or_else(|| title_cased(&p.id)),
+            teams: teams_of(&state.dir, &p.id),
+        })
+        .collect();
+    Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
+}
+
+/// `GET /api/people`: every person as `PersonView`, sorted by id. The actor (and an
+/// admin) sees their own contact details and raw preferences; everyone else is redacted
+/// to `contact: {}` and `preferences: []` — no other user's email/phone may leak.
+async fn people_handler(
+    State(state): State<ApiState>,
+    actor: Option<axum::Extension<Actor>>,
+    admin: Option<axum::Extension<Admin>>,
+) -> Result<Response, ApiError> {
+    let actor = actor
+        .map(|axum::Extension(Actor(a))| a)
+        .ok_or_else(unauthorized)?;
+    let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
+    let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
+    let mut people: Vec<&Person> = state.dir.people.values().collect();
+    people.sort_by(|a, b| a.id.cmp(&b.id));
+    let items: Vec<PersonView> = people
+        .into_iter()
+        .map(|p| {
+            let can_edit = p.id == me || is_admin;
+            PersonView {
+                id: p.id.clone(),
+                name: p.name.clone().unwrap_or_else(|| title_cased(&p.id)),
+                contact: if can_edit {
+                    ContactView {
+                        email: p.contact.email.clone(),
+                        phone: p.contact.phone.clone(),
+                    }
+                } else {
+                    ContactView {
+                        email: None,
+                        phone: None,
+                    }
+                },
+                teams: teams_of(&state.dir, &p.id),
+                preferences: match (&p.preferences, can_edit) {
+                    (Some(Value::Array(raw)), true) => raw.clone(),
+                    _ => Vec::new(),
+                },
+                revision: DIRECTORY_REVISION,
+                can_edit,
+            }
+        })
+        .collect();
+    Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
+}
+
+/// `GET /api/teams`: every team as `TeamView`, sorted by id, as configured — `lead` is
+/// `null` when unset, `oncall` the schedule -> rotation map (`{}` when empty) and
+/// `default_channels` the configured list (`[]` when unset). `can_edit` is the team's
+/// lead or an admin.
+async fn teams_handler(
+    State(state): State<ApiState>,
+    actor: Option<axum::Extension<Actor>>,
+    admin: Option<axum::Extension<Admin>>,
+) -> Result<Response, ApiError> {
+    let actor = actor
+        .map(|axum::Extension(Actor(a))| a)
+        .ok_or_else(unauthorized)?;
+    let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
+    let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
+    let mut teams: Vec<&Team> = state.dir.teams.values().collect();
+    teams.sort_by(|a, b| a.id.cmp(&b.id));
+    let items: Vec<TeamView> = teams
+        .into_iter()
+        .map(|t| TeamView {
+            id: t.id.clone(),
+            name: title_cased(&t.id),
+            members: t.members.clone(),
+            lead: t.lead.clone(),
+            oncall: t.oncall.clone(),
+            default_channels: t.default_channels.clone().unwrap_or_default(),
+            revision: DIRECTORY_REVISION,
+            can_edit: t.lead.as_deref() == Some(me) || is_admin,
+        })
+        .collect();
     Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
 }
 

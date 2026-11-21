@@ -31,3 +31,7 @@ hmac.workspace = true
 humantime-serde.workspace = true
 
 [dev-dependencies]
+# In-process router testing (`tower::ServiceExt::oneshot` + reading bodies); versions as
+# already pinned in the workspace Cargo.lock (transitive deps of axum).
+tower = "0.5.3"
+http-body-util = "0.1.5"
