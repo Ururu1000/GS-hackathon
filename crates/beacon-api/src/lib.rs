@@ -18,6 +18,7 @@
 pub mod alerts;
 pub mod error;
 pub mod feed;
+pub mod mapping_suggest;
 pub mod proposals;
 pub mod rules;
 pub mod session;
@@ -103,6 +104,7 @@ pub fn router_full(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         .route("/api/events/recent", get(rules::recent_events))
         .route("/api/schemas", get(rules::schemas).post(rules::save_schema))
         .route("/api/schemas/preview", post(rules::preview_schema))
+        .route("/api/schemas/suggest", post(mapping_suggest::suggest))
         .route("/api/proposals", get(proposals::list).post(proposals::create))
         .route("/api/proposals/count", get(proposals::count))
         .route("/api/proposals/{id}/{decision}", post(proposals::decide))

@@ -215,3 +215,58 @@ export function mappedContext(event: unknown, source: string, mappings: Iterable
     return { raw: event, source, schema: first.schema, fields: first.fields() }
   return { raw: event, source, schema: unknownSignature(event), fields: {} }
 }
+
+// ---- Suggested mappings (BEACON_LLM=mock equivalent) ----------------------
+
+/** Canonical fields a suggestion may fill, with the leaf names a name-based heuristic accepts. */
+const SUGGEST_NAMES: [field: string, names: string[], extra?: Partial<SchemaField>][] = [
+  ['type', ['type', 'event_type', 'eventtype', 'kind', 'alertname', 'name', 'event']],
+  ['severity', ['severity', 'level', 'priority', 'sev'], { enum: 'severity' }],
+  ['service', ['service', 'app', 'application', 'component', 'job']],
+  ['environment', ['environment', 'env', 'stage']],
+  ['occurred_at', ['timestamp', 'time', 'occurred_at', 'ts', 'created_at', 'eventtime']],
+  ['message', ['message', 'msg', 'summary', 'description', 'text']],
+]
+
+function leafPaths(value: unknown, prefix = '', depth = 0, out: [string, unknown][] = []): [string, unknown][] {
+  if (!isRecord(value) || depth > 6 || out.length >= 200) return out
+  for (const [key, child] of Object.entries(value)) {
+    if (FORBIDDEN_KEYS.has(key) || !/^[A-Za-z_][\w-]*$/.test(key)) continue
+    const path = prefix ? `${prefix}.${key}` : key
+    if (isSensitivePath(path)) continue
+    if (isRecord(child)) leafPaths(child, path, depth + 1, out)
+    else out.push([path, child])
+  }
+  return out
+}
+
+/**
+ * A labelled, name-based mapping suggestion: no network, no model. Like the
+ * API's mock provider it only picks paths that exist in the sample.
+ */
+export function suggestMapping(event: unknown, source: string): { spec: SchemaSpec; notes: string } | null {
+  const leaves = leafPaths(event)
+  if (!leaves.length) return null
+  const fields: Record<string, SchemaField> = {}
+  const used: string[] = []
+  for (const [field, names, extra] of SUGGEST_NAMES) {
+    const hit = leaves.find(([path, value]) =>
+      !used.includes(path) && names.includes(path.split('.').pop()!.toLowerCase()) && (typeof value === 'string' || typeof value === 'number'))
+    if (!hit) continue
+    used.push(hit[0])
+    const [path, value] = hit
+    fields[field] = { path, ...extra, ...(field === 'occurred_at' ? { as: typeof value === 'number' ? (value > 1e11 ? 'epoch_ms' : 'epoch_s') : 'rfc3339' } : {}) }
+  }
+  const detectPaths = (used.length ? used : [leaves[0]![0]]).slice(0, 2)
+  const name = detectPaths[0]!.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'event'
+  if (!fields.type) fields.type = { value: 'Custom event' }
+  return {
+    spec: {
+      schema: `suggested.${name}`.slice(0, 80),
+      priority: 50,
+      detect: { all: detectPaths.map((path) => ({ path, op: 'exists' as const })), source },
+      fields,
+    },
+    notes: `Matched ${used.length} field${used.length === 1 ? '' : 's'} by name. Check each path before saving.`,
+  }
+}

@@ -49,7 +49,7 @@ import type {
 import type { DiscoveredSchema, SchemaMapping, SourceView } from '../src/api/screens.ts'
 import { createSimulator, type DeviceRecord } from './simulator.ts'
 import { importRunbook, prepareRunbook } from './import-runbook.ts'
-import { mappedContext, parseMapping, previewMapping } from './schemas.ts'
+import { mappedContext, parseMapping, previewMapping, suggestMapping } from './schemas.ts'
 import { internationalPhone } from '../src/lib/phone.ts'
 import { redactText, redactValue } from '../src/lib/redact.ts'
 import { inWindow, parseWindow, resolveChannels } from '../src/prefs/resolve.ts'
@@ -702,7 +702,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         user: { id: ME_ID, name: demoUserName },
         teams: [...teams.values()].filter((t) => allowed.has(t.id)).map((t) => ({ id: t.id, name: t.name })),
         csrf_token: csrf,
-        capabilities: { recipient_feed: true, mock_transports: true, runbook_import: true },
+        capabilities: { recipient_feed: true, mock_transports: true, runbook_import: true, llm_suggest: true },
       }
       return json(res, 200, session), true
     }
@@ -942,6 +942,25 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       return json(res, 200, items), true
     }
     if (path === '/api/schemas' && method === 'GET') return json(res, 200, [...schemas.values()]), true
+    if (path === '/api/schemas/suggest' && method === 'POST') {
+      return write(req, res, (b: { schema?: unknown; event?: unknown; source?: unknown }) => {
+        let event: unknown
+        let source = 'http:playground'
+        if (typeof b.schema === 'string' && b.event === undefined) {
+          const found = [...discovered.values()].find(({ entry }) => entry.schema === b.schema)
+          if (!found) return err(res, 404, 'not_found', 'no sample for that schema')
+          event = redactValue(found.entry.sample)
+          source = found.entry.source
+        } else if (b.schema === undefined && b.event && typeof b.event === 'object' && !Array.isArray(b.event)) {
+          event = redactValue(b.event)
+          if (typeof b.source === 'string' && SOURCE_RE.test(b.source)) source = b.source
+        } else return err(res, 400, 'bad_request', 'send either schema or event')
+        const suggestion = suggestMapping(event, source)
+        if (!suggestion) return err(res, 422, 'invalid', 'the event has no fields to map')
+        const result = previewMapping(suggestion.spec, event, source)
+        json(res, 200, { provider: 'mock', model: null, spec: suggestion.spec, preview: { ...result, fields: redactValue(result.fields) }, notes: suggestion.notes })
+      })
+    }
     if (path === '/api/schemas/preview' && method === 'POST') {
       return write(req, res, (b: { spec: unknown; event: unknown; source?: string }) => {
         if (b.source !== undefined && (typeof b.source !== 'string' || b.source.length > 64 || !SOURCE_RE.test(b.source)))

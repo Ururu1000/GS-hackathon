@@ -272,7 +272,7 @@ export interface Session {
   teams: { id: string; name: string }[]
   /** Echo in the `X-CSRF-Token` header on every write. */
   csrf_token: string
-  capabilities?: { recipient_feed?: boolean; mock_transports?: boolean; runbook_import?: boolean }
+  capabilities?: { recipient_feed?: boolean; mock_transports?: boolean; runbook_import?: boolean; llm_suggest?: boolean }
 }
 
 // ---- SSE: GET /api/stream?team= -------------------------------------------

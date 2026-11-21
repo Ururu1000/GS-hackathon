@@ -731,3 +731,26 @@ async fn simulator_is_mounted_with_the_gateway_token_injected(pool: PgPool) {
     let (s, v) = post(&h.app, "/api/simulator/outage", Some(&h.csrf), json!({"channel": "sms", "mode": "down", "seconds": 5})).await;
     assert!(s.is_success(), "{s} {v}");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn mapping_suggestion_mock_is_validated_and_previewed(pool: PgPool) {
+    beacon_api::mapping_suggest::configure(beacon_api::mapping_suggest::Provider::Mock);
+    let h = harness(pool);
+    assert_eq!(get(&h.app, "/api/session").await.1["capabilities"]["llm_suggest"], json!(true));
+    let event = json!({"event": "REFUND_FAILED", "level": "ERROR", "app": "payments-api", "ts": "2026-11-21T06:00:00Z", "detail": {"msg": "card declined"}});
+    // A write: CSRF first.
+    let (s, _) = post(&h.app, "/api/schemas/suggest", None, json!({"event": event})).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, v) = post(&h.app, "/api/schemas/suggest", Some(&h.csrf), json!({"event": event})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!((v["provider"].as_str(), v["model"].is_null()), (Some("mock"), true));
+    assert_eq!(v["preview"]["matched"], json!(true), "{v}");
+    assert_eq!(v["preview"]["fields"]["severity"], json!("error"));
+    assert_eq!(v["preview"]["fields"]["service"], json!("payments-api"));
+    // The suggestion is publishable as-is through the normal path.
+    let (s, p) = post(&h.app, "/api/schemas", Some(&h.csrf), json!({"spec": v["spec"]})).await;
+    assert!(s.is_success(), "{s} {p}");
+    // Nonsense is a 400, not a call.
+    let (s, _) = post(&h.app, "/api/schemas/suggest", Some(&h.csrf), json!({"event": [1, 2]})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+}
