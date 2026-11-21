@@ -54,6 +54,9 @@ pub struct RouterConfig {
     pub clock: Arc<dyn clock::Clock>,
     /// Demo/test knob: replaces every rule's `escalate_after` (env `ESCALATE_AFTER_OVERRIDE_MS`).
     pub escalate_after_override: Option<Duration>,
+    /// Run the throttle digest pass before each batch. With several router tasks
+    /// (`ROUTER_TASKS`) only one needs it; the others would only repeat empty queries.
+    pub digest: bool,
 }
 
 impl Default for RouterConfig {
@@ -63,6 +66,7 @@ impl Default for RouterConfig {
             batch_size: 100,
             clock: Arc::new(clock::SystemClock),
             escalate_after_override: None,
+            digest: true,
         }
     }
 }

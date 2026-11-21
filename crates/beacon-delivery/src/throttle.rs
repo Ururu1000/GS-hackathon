@@ -235,6 +235,60 @@ pub async fn take(
     }
 }
 
+/// Create (full, on first use) and row-lock every bucket in `keys`, in ONE sorted order
+/// (`ORDER BY rule_id, recipient_id` under the database collation), before the router
+/// takes tokens from them one notification at a time (M7). With several router tasks, two
+/// batches can need the same buckets in opposite orders; locking them all up front in one
+/// order means they queue instead of deadlocking (Postgres would abort one batch after
+/// `deadlock_timeout`, 1 s by default). The later [`take`] calls re-lock rows this
+/// transaction already holds, which never waits. Duplicate keys are fine.
+pub async fn lock_buckets(
+    tx: &mut Transaction<'_, Postgres>,
+    keys: &[(&str, &str, ThrottleSpec)],
+) -> Result<(), sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let mut rules: Vec<&str> = Vec::with_capacity(keys.len());
+    let mut recipients: Vec<&str> = Vec::with_capacity(keys.len());
+    let mut capacities: Vec<i32> = Vec::with_capacity(keys.len());
+    let mut refills: Vec<f64> = Vec::with_capacity(keys.len());
+    for (rule, recipient, spec) in keys {
+        rules.push(rule);
+        recipients.push(recipient);
+        capacities.push(i32::try_from(spec.max).unwrap_or(i32::MAX));
+        refills.push(spec.refill_per_sec());
+    }
+    // New rows are inserted in key order too: two transactions inserting the same new keys
+    // wait on each other's uncommitted unique-index entries, in that same order.
+    sqlx::query(
+        "INSERT INTO throttle_buckets \
+            (rule_id, recipient_id, tokens, capacity, refill_per_sec, refilled_at, updated_at) \
+         SELECT DISTINCT ON (r, p) r, p, c::double precision, c, f, now(), now() \
+         FROM unnest($1::text[], $2::text[], $3::int[], $4::float8[]) AS k(r, p, c, f) \
+         ORDER BY r, p \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&rules)
+    .bind(&recipients)
+    .bind(&capacities)
+    .bind(&refills)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT 1 FROM throttle_buckets b \
+         JOIN (SELECT DISTINCT r, p FROM unnest($1::text[], $2::text[]) AS k(r, p)) k \
+           ON b.rule_id = k.r AND b.recipient_id = k.p \
+         ORDER BY b.rule_id, b.recipient_id \
+         FOR UPDATE OF b",
+    )
+    .bind(&rules)
+    .bind(&recipients)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Park the planned jobs of one recipient notification.
 pub async fn suppress(
     tx: &mut Transaction<'_, Postgres>,
