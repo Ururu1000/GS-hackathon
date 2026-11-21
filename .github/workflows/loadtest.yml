@@ -33,6 +33,9 @@ jobs:
       DATABASE_URL: postgres://beacon:beacon@localhost:5432/beacon
       EVENTS: ${{ inputs.events || '500' }}
       RATE: ${{ inputs.rate || '50' }}
+    defaults:
+      run:
+        shell: bash  # -eo pipefail: a failing benchmark fails the job even through `tee`
     steps:
       - uses: actions/checkout@v4
       - name: System dependencies (librdkafka build)
@@ -45,6 +48,8 @@ jobs:
         run: docker compose -f deploy/docker-compose.yml up -d --wait
       - name: Build release beacon + benchmark
         run: cargo build --locked --release -p beacon && cargo build --locked --release -p beacon-delivery --example latency_bench
+      - name: Benchmark unit tests
+        run: cargo test --locked --release -p beacon-delivery --example latency_bench
       - name: Start beacon (ingest .. delivery + fake gateway)
         run: |
           nohup ./target/release/beacon --migrate \
@@ -58,11 +63,13 @@ jobs:
           echo "beacon did not become ready"; tail -50 beacon.log; exit 1
       - name: Run the latency benchmark
         run: |
-          ./scripts/demo_latency.sh --events "$EVENTS" --rate "$RATE" --out results.json | tee results.md
+          status=0
+          ./scripts/demo_latency.sh --events "$EVENTS" --rate "$RATE" --out results.json | tee results.md || status=$?
           {
             echo "## Ingest -> delivery latency (events=$EVENTS, rate=$RATE/s, ubuntu-latest)"
             cat results.md
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4

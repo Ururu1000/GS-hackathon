@@ -722,7 +722,8 @@ struct JobHit {
     status: String,
     sent_at: Option<DateTime<Utc>>,
     fallback_of: Option<Uuid>,
-    escalation_step: Option<i32>,
+    /// 0 = the initial notification; >0 = a later escalation step (NOT NULL DEFAULT 0).
+    escalation_step: i32,
 }
 
 struct Snapshot {
@@ -795,13 +796,13 @@ fn evaluate(
             if job.fallback_of.is_some() {
                 st.fallback_jobs += 1;
             }
-            if job.escalation_step.is_some() {
+            if job.escalation_step > 0 {
                 st.escalation_jobs += 1;
             }
         }
         let initial: Vec<&JobHit> = jobs
             .iter()
-            .filter(|j| j.fallback_of.is_none() && j.escalation_step.is_none())
+            .filter(|j| j.fallback_of.is_none() && j.escalation_step == 0)
             .collect();
         // The alert exists, so ingest → alert is measurable even if the router has
         // not expanded it (yet); that state is counted as a missing alert below.
@@ -890,7 +891,7 @@ async fn snapshot(
         String,
         Option<DateTime<Utc>>,
         Option<Uuid>,
-        Option<i32>,
+        i32,
     );
     let job_rows: Vec<JobRow> = sqlx::query_as(
         "SELECT id, alert_id, channel, status, sent_at, fallback_of, escalation_step \
@@ -1435,7 +1436,7 @@ mod tests {
             status: "sent".into(),
             sent_at: Some(dt(1_400)),
             fallback_of: None,
-            escalation_step: None,
+            escalation_step: 0,
         };
         let phone_job = JobHit {
             id: Uuid::new_v4(),
@@ -1443,7 +1444,7 @@ mod tests {
             status: "sent".into(),
             sent_at: Some(dt(1_200)),
             fallback_of: None,
-            escalation_step: None,
+            escalation_step: 0,
         };
         s.receipts.insert(sms_job.id, dt(1_500));
         s.receipts.insert(phone_job.id, dt(1_300));
@@ -1477,7 +1478,7 @@ mod tests {
             status: "sent".into(),
             sent_at: Some(dt(1_900)),
             fallback_of: None,
-            escalation_step: None,
+            escalation_step: 0,
         };
         let dead_phone = JobHit {
             id: Uuid::new_v4(),
@@ -1485,7 +1486,7 @@ mod tests {
             status: "dead".into(),
             sent_at: None,
             fallback_of: None,
-            escalation_step: None,
+            escalation_step: 0,
         };
         let in_flight_sms = JobHit {
             id: Uuid::new_v4(),
@@ -1493,7 +1494,7 @@ mod tests {
             status: "in_flight".into(),
             sent_at: None,
             fallback_of: None,
-            escalation_step: None,
+            escalation_step: 0,
         };
         let fallback_job = JobHit {
             id: Uuid::new_v4(),
@@ -1501,12 +1502,27 @@ mod tests {
             status: "pending".into(),
             sent_at: None,
             fallback_of: Some(dead_phone.id),
-            escalation_step: None,
+            escalation_step: 0,
+        };
+        // A later escalation step is a separate notification: counted, not measured.
+        let escalated_sms = JobHit {
+            id: Uuid::new_v4(),
+            channel: "sms".into(),
+            status: "pending".into(),
+            sent_at: None,
+            fallback_of: None,
+            escalation_step: 1,
         };
         let sent_email_id = sent_email.id;
         s.jobs.insert(
             alert_id,
-            vec![sent_email, dead_phone, in_flight_sms, fallback_job],
+            vec![
+                sent_email,
+                dead_phone,
+                in_flight_sms,
+                fallback_job,
+                escalated_sms,
+            ],
         );
 
         let t0 = vec![Some(dt(0))];
@@ -1521,6 +1537,7 @@ mod tests {
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.dead, 1);
         assert_eq!(stats.fallback_jobs, 1); // the retry's fallback is not in the stats
+        assert_eq!(stats.escalation_jobs, 1); // step 1 is not in the stats either
 
         // Same snapshot with Mailpit down: the sent email is no longer "missing".
         let stats = evaluate(0, 1, &t0, &s, &HashMap::new(), false);
