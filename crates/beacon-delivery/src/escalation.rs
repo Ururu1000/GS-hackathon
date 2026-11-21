@@ -757,6 +757,13 @@ pub async fn run_scheduler(
     let effective = Arc::new(crate::overrides::EffectiveDirectory::new(dir));
     while !*shutdown.borrow() && shutdown.has_changed().is_ok() {
         let dir = effective.get(&pool).await;
+        // Off-hours digests whose window reopened ride along (crate::offhours): one cheap
+        // indexed query when nothing is due, and no extra role in the default command.
+        match crate::offhours::release_once(&pool, Utc::now(), 100).await {
+            Ok(r) if r.digests > 0 => debug!(?r, "off-hours digests"),
+            Ok(_) => {}
+            Err(err) => error!(%err, "off-hours digest pass failed"),
+        }
         let wait = match escalate_once(&pool, &dir, &cfg).await {
             Ok(stats) => {
                 if stats != EscalationStats::default() {

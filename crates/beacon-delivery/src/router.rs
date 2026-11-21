@@ -465,12 +465,6 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
                 Ok(_) => {}
                 Err(err) => error!(%err, "throttle digest pass failed"),
             }
-            // Off-hours digests whose window reopened (injected clock, like routing).
-            match offhours::release_once(&pool, cfg.clock.now(), 100).await {
-                Ok(r) if r.digests > 0 => debug!(?r, "off-hours digests"),
-                Ok(_) => {}
-                Err(err) => error!(%err, "off-hours digest pass failed"),
-            }
         }
         let dir = effective.get(&pool).await;
         let wait = match route_once(&pool, &dir, &cfg).await {

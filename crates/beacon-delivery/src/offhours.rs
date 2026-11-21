@@ -1,6 +1,6 @@
 //! Off-hours digest: hold non-critical notifications outside a person's working hours and send
 //! them as ONE email when the hours start again (table `offhours_held`, migration
-//! `20261121073000_delivery_offhours_held.sql`).
+//! `20261121073000_delivery_offhours_digest.sql`).
 //!
 //! - **Opt-in per person.** A preference rule with a `when` window lists the pseudo-channel
 //!   `digest` in `otherwise` (`crate::prefs::DIGEST`). Outside the window the router calls
@@ -8,7 +8,7 @@
 //! - **Never for critical.** The router sends `digest` as email for a critical alert.
 //!   Escalation steps and runbook actions resolve `digest` to email too
 //!   (`prefs::resolve_channels`), so nothing urgent waits for the morning.
-//! - **Release.** [`release_once`] picks people with due rows. Per person, in one transaction,
+//! - **Release.** [`release_once`], run by the scheduler role each pass, picks people with due rows. Per person, in one transaction,
 //!   it locks their due rows (`FOR UPDATE SKIP LOCKED`, so router replicas never double-send),
 //!   files ONE email job under the latest held row's `(alert_id, notify_seq)` with
 //!   `escalation_step = 300` ([`STEP`], so it never collides with that notification's own

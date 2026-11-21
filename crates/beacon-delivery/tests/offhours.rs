@@ -277,3 +277,36 @@ async fn evening_hold_waits_for_the_next_morning(pool: PgPool) {
     .expect("route");
     assert_eq!(held_pending(&pool).await, 1);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_release_keeps_rows_held_and_a_rerun_sends_once(pool: PgPool) {
+    let dir = directory();
+    let cfg = router_cfg(Arc::new(FixedClock::new(utc("2026-01-15T03:00:00Z"))));
+    let a = insert_alert(&pool, "open", "HighLatency on payments-api").await;
+    notify(&pool, a, "warning").await;
+    route_once(&pool, &dir, &cfg).await.expect("route");
+
+    // A release that dies mid-transaction (another session holds the rows, as a crashed
+    // or concurrent scheduler would): the rows stay held, nothing is filed.
+    let mut blocker = pool.begin().await.expect("tx");
+    sqlx::query("SELECT id FROM offhours_held FOR UPDATE")
+        .execute(&mut *blocker)
+        .await
+        .expect("lock");
+    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:00Z"), 100)
+        .await
+        .expect("release");
+    assert_eq!(r.digests, 0, "locked rows are skipped, not double-sent");
+    blocker.rollback().await.expect("rollback");
+    assert_eq!(held_pending(&pool).await, 1);
+
+    // After the "restart", two passes in a row file exactly one job.
+    for _ in 0..2 {
+        offhours::release_once(&pool, utc("2026-01-15T08:00:05Z"), 100)
+            .await
+            .expect("release");
+    }
+    let jobs = jobs_for(&pool, "anna").await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(held_pending(&pool).await, 0);
+}

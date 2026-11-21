@@ -776,3 +776,55 @@ async fn out_of_range_revisions_and_empty_defaults_are_rejected(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Off-hours digest preference (crate::offhours)
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_saved_digest_preference_validates_and_holds_on_the_next_pass(pool: PgPool) {
+    let state = api_state(&pool, fixture_dir());
+
+    // `digest` outside `otherwise` is rejected by the shared validator.
+    let app = app_as(&state, Some("user:bob"), false);
+    let (status, body) = put(
+        app,
+        "/api/people/bob/preferences",
+        &json!({ "preferences": [{ "default": ["digest"] }], "expected_revision": 1 }),
+        JSON,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // In `otherwise` it saves.
+    let app = app_as(&state, Some("user:bob"), false);
+    let (status, body) = put(
+        app,
+        "/api/people/bob/preferences",
+        &json!({
+            "preferences": [{ "match": {}, "channels": ["email"],
+                              "when": { "between": "08:00-20:00", "tz": "UTC" },
+                              "otherwise": ["digest"] }],
+            "expected_revision": 1
+        }),
+        JSON,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The router's next pass (EffectiveDirectory, no restart) holds bob's 03:00 warning
+    // and resolves his 10:00 one to email.
+    let effective = EffectiveDirectory::new(Arc::new(fixture_dir()));
+    let dir = effective.get(&pool).await;
+    let bob = dir.people.get("bob").expect("bob");
+    let night = "2026-01-15T03:00:00Z".parse().unwrap();
+    let r = prefs::resolve_with_hold(bob, None, &routing_ctx(), night);
+    assert_eq!(r.channels, [prefs::DIGEST]);
+    assert_eq!(r.hold_until, Some("2026-01-15T08:00:00Z".parse().unwrap()));
+    let day = "2026-01-15T10:00:00Z".parse().unwrap();
+    let r = prefs::resolve_with_hold(bob, None, &routing_ctx(), day);
+    assert_eq!(
+        (r.channels, r.hold_until),
+        (vec!["email".to_string()], None)
+    );
+}
