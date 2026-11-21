@@ -464,6 +464,24 @@ async fn the_digest_uses_the_current_address_and_drops_when_it_is_gone(pool: PgP
         0,
         "the row is closed, not retried forever"
     );
+    // The timeline says it was not sent, never "queued" (review R2-2).
+    let timeline = beacon_delivery::audit::timeline_entries(&pool, b)
+        .await
+        .expect("timeline");
+    let messages: Vec<&str> = timeline
+        .iter()
+        .filter_map(|e| e["message"].as_str())
+        .collect();
+    assert!(
+        messages.iter().all(|m| !m.starts_with("queued in")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("not sent: anna has no email address")),
+        "{messages:?}"
+    );
     assert_eq!(
         jobs_for(&pool, "anna").await.len(),
         1,

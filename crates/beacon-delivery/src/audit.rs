@@ -148,16 +148,18 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
         DateTime<Utc>,
         Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
+        bool,
     );
     let held: Vec<HeldRow> = sqlx::query_as(
         "SELECT h.recipient_id, h.created_at, h.release_at, h.released_at, \
-                (SELECT j.sent_at FROM delivery_jobs j WHERE j.id = h.digest_job) \
+                (SELECT j.sent_at FROM delivery_jobs j WHERE j.id = h.digest_job), \
+                h.digest_job IS NOT NULL \
          FROM offhours_held h WHERE h.alert_id = $1 ORDER BY h.id",
     )
     .bind(alert_id)
     .fetch_all(pool)
     .await?;
-    for (recipient, at, release_at, released_at, sent_at) in held {
+    for (recipient, at, release_at, released_at, sent_at, has_job) in held {
         entries.push(Entry {
             at,
             actor: "system".to_string(),
@@ -174,11 +176,20 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
                 kind: "digest".to_string(),
                 message: format!("sent to {recipient} in their off-hours digest"),
             }),
-            (Some(released), None) => entries.push(Entry {
+            (Some(released), None) if has_job => entries.push(Entry {
                 at: released,
                 actor: "system".to_string(),
                 kind: "digest".to_string(),
                 message: format!("queued in {recipient}'s off-hours digest"),
+            }),
+            // Released without a job: the person or their email left the directory overnight.
+            (Some(released), None) => entries.push(Entry {
+                at: released,
+                actor: "system".to_string(),
+                kind: "digest".to_string(),
+                message: format!(
+                    "not sent: {recipient} has no email address in the directory any more"
+                ),
             }),
             (None, None) => {}
         }

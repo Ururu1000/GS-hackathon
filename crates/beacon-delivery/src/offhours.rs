@@ -168,6 +168,9 @@ async fn release_person(
 
     // The CURRENT address, not the one frozen at hold time: the digest waits hours, and the
     // person may have changed or removed their email, or left the directory, meanwhile.
+    // Known limit: during a rolling deploy a scheduler on an older directory can drop holds
+    // for a person only the newer router knows. Keeping such rows pending would need a
+    // backoff so a really removed person doesn't stall the batch; out of scope for the demo.
     let Some(address) = dir
         .person(recipient_id)
         .and_then(|p| address_for(p, "email"))
