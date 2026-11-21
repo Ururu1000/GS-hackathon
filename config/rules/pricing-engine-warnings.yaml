@@ -1,7 +1,8 @@
 # Team Pricing: log lines from pricing-engine at WARN or above -> UI only;
-# one alert per instrument every 5 minutes.
-# M0 approximates the digest with a 5-minute dedup window keyed by instrument;
-# true time-bucket grouping (group:) lands in M3.
+# group them into one alert per instrument every 5 minutes.
+# `group` keys the incident by instrument + UTC 5-minute bucket, so each
+# instrument gets one digest alert per window whose count grows live.
+# Digests resolve themselves after 10 quiet minutes.
 id: pricing-engine-warnings
 name: Pricing engine warnings
 team: pricing
@@ -18,9 +19,8 @@ present:
   fields:
     - { path: fields.instrument, label: Instrument }
     - { path: raw.msg, label: Message }
-dedup:
-  key: [fields.instrument]
-  window: 5m
 group:
   by: [fields.instrument]
   window: 5m
+auto_resolve:
+  quiet_for: 10m

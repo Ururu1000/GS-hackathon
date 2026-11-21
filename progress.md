@@ -23,6 +23,7 @@ Last updated: 2026-11-21.
 | One-command `docker compose up --build` | Done, verified end to end | PR #13 |
 | Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
 | Exact counts under replay and crashes (M1) | Done: scenario e exact | PR #15 |
+| Grouping digests + quiet-for auto-resolve (M3) | Done | PR #16 |
 | Kafka-mode load test | Later | |
 
 PR merge order: #5 → #8 → #7 → #9 → #11 → #12 → #13. Each PR is stacked on the previous one.
@@ -91,6 +92,14 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
 - **`/api/alerts`** showed the 4 expected alerts. The unknown shape correctly created none.
 - **The UI** is served at http://localhost:8080.
 - **Delivery sent 3 emails to Mailpit** (http://localhost:8025): Anna for `HighErrorRate`, Erin and Bob for the rejected rates trade.
+
+## Grouping and quiet timers (M3)
+
+- **`group: {by, window}`** keys an incident by the group tuple plus the UTC time bucket. Each tuple gets one alert per window, its count grows live, and the card shows the window, e.g. "Window 09:15–09:20 UTC".
+- **Pricing's seed rule** now does exactly what the brief asks: one alert per instrument every 5 minutes.
+- **`auto_resolve.quiet_for`:** a sweeper resolves open or acked alerts with no new match for that long (`resolved_reason = quiet_for`). Pricing digests resolve after 10 quiet minutes.
+  - Sweepers claim rows with `SKIP LOCKED`.
+  - Postgres re-checks `last_seen` after a row lock, so a fresh match always wins.
 
 ## Exact counts (M1)
 

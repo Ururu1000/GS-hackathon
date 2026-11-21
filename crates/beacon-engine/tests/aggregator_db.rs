@@ -45,6 +45,7 @@ fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> Mat
             fields: serde_json::Map::new(),
             raw: serde_json::json!({"payload": {"tradeId": "T-1"}}),
         }),
+        quiet_for_ms: None,
     }
 }
 
@@ -207,4 +208,27 @@ async fn fenced_checkpoints(pool: PgPool) {
     assert!(again.is_ok(), "already applied is not a fence error");
     let count: i64 = sqlx::query_scalar("SELECT count FROM alerts").fetch_one(&pool).await.unwrap();
     assert_eq!(count, 15, "the retried batch is not applied twice");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn quiet_for_resolves_idle_alerts(pool: PgPool) {
+    use beacon_engine::aggregator::sweep_quiet;
+    let mut quiet = rec("q", "fp-quiet", MatchKind::Fire, Utc::now() - Duration::minutes(20));
+    quiet.quiet_for_ms = Some(10 * 60 * 1000);
+    let mut busy = rec("b", "fp-busy", MatchKind::Fire, Utc::now());
+    busy.quiet_for_ms = Some(10 * 60 * 1000);
+    let plain = rec("p", "fp-plain", MatchKind::Fire, Utc::now() - Duration::minutes(20));
+    apply_batch(&pool, &[quiet, busy, plain]).await.unwrap();
+    assert_eq!(sweep_quiet(&pool).await.unwrap(), 1);
+    let rows: Vec<(String, String, Option<String>, bool)> =
+        sqlx::query_as("SELECT fingerprint, status, resolved_reason, dedup_active FROM alerts ORDER BY fingerprint")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows[0], ("fp-busy".into(), "open".into(), None, true));
+    assert_eq!(rows[1], ("fp-plain".into(), "open".into(), None, true), "no quiet_for, never auto-resolved");
+    assert_eq!(rows[2], ("fp-quiet".into(), "resolved".into(), Some("quiet_for".into()), false));
+    assert_eq!(sweep_quiet(&pool).await.unwrap(), 0, "idempotent");
+    let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE kind = 'alert_update'").fetch_one(&pool).await.unwrap();
+    assert_eq!(updates, 3 + 1);
 }

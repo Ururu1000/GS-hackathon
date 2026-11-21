@@ -59,6 +59,9 @@ pub struct MatchRecord {
     /// The event itself, only for fires of rules with a runbook (templates).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<NotifyEvent>,
+    /// `auto_resolve.quiet_for`: resolve the alert after this long without a match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_for_ms: Option<u64>,
 }
 
 /// Values copied from the event into a match (dedup key values, card fields)
@@ -267,17 +270,32 @@ impl ConfigSnapshot {
 
     fn record(&self, rule: &CompiledRule, event: &Event, kind: MatchKind) -> MatchRecord {
         let mut diagnostics = Vec::new();
-        let mut key = Vec::with_capacity(rule.dedup_key.len());
+        // Grouped rules (`group:`) key incidents by the group tuple plus the UTC
+        // time bucket, so each tuple gets one alert per window (a digest whose
+        // count grows live). Otherwise the dedup key tuple is the identity.
+        let (key_paths, window_ms, bucket) = match &rule.group {
+            Some(g) => {
+                let w = g.window.as_millis().max(1) as i64;
+                let start = event.ingested_at.timestamp_millis().div_euclid(w) * w;
+                (&g.by, w as u64, Some((start, start + w)))
+            }
+            None => (&rule.dedup_key, rule.spec.dedup.window.as_millis() as u64, None),
+        };
+        let mut key = Vec::with_capacity(key_paths.len() + 1);
         let mut missing = false;
-        for p in &rule.dedup_key {
+        for p in key_paths {
             match p.resolve(event) {
                 Some(v) => key.push(v.into_owned()),
                 None => {
                     missing = true;
-                    diagnostics.push(format!("dedup key `{p}` missing; alert not merged"));
+                    let what = if bucket.is_some() { "group key" } else { "dedup key" };
+                    diagnostics.push(format!("{what} `{p}` missing; alert not merged"));
                     key.push(Value::Null);
                 }
             }
+        }
+        if let Some((start, _)) = bucket {
+            key.push(Value::from(start));
         }
         let fingerprint = fingerprint(rule.id(), &key, missing.then_some(event.id.as_str()));
         let key: Vec<Value> = key.into_iter().map(bounded).collect();
@@ -300,7 +318,11 @@ impl ConfigSnapshot {
                         value: bounded(v.into_owned()),
                     })
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let mut fields = fields;
+            if let Some((start, end)) = bucket {
+                fields.push(AlertField { path: "group.window".into(), label: "Window".into(), value: Value::String(window_label(start, end)) });
+            }
             (title, body, fields)
         } else {
             (String::new(), String::new(), Vec::new())
@@ -317,7 +339,8 @@ impl ConfigSnapshot {
             team: rule.spec.team.clone(),
             fingerprint,
             key,
-            dedup_window_ms: rule.spec.dedup.window.as_millis() as u64,
+            dedup_window_ms: window_ms,
+            quiet_for_ms: rule.spec.auto_resolve.as_ref().and_then(|a| a.quiet_for).map(|d| d.as_millis() as u64),
             severity: severity.as_str().to_string(),
             color: rule
                 .spec
@@ -364,6 +387,17 @@ fn field_str(event: &Event, name: &str) -> Option<String> {
         s.truncate(cut);
     }
     Some(s)
+}
+
+/// "09:15–09:20 UTC" (date added when the window isn't within one day).
+fn window_label(start_ms: i64, end_ms: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    let (s, e) = (Utc.timestamp_millis_opt(start_ms).single(), Utc.timestamp_millis_opt(end_ms).single());
+    match (s, e) {
+        (Some(s), Some(e)) if e - s < chrono::Duration::days(1) => format!("{}–{} UTC", s.format("%H:%M"), e.format("%H:%M")),
+        (Some(s), Some(e)) => format!("{}–{} UTC", s.format("%Y-%m-%d %H:%M"), e.format("%Y-%m-%d %H:%M")),
+        _ => String::new(),
+    }
 }
 
 /// Incident identity: rule id + dedup key values. When a key field is missing

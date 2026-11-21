@@ -72,6 +72,7 @@ pub struct AlertState {
     pub resolved_by: Option<String>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub resolved_reason: Option<String>,
+    pub quiet_for_ms: Option<i64>,
     #[serde(skip)]
     pub is_new: bool,
     #[serde(skip)]
@@ -316,6 +317,7 @@ fn new_alert(m: &MatchRecord, generation: i32) -> AlertState {
         resolved_by: None,
         resolved_at: None,
         resolved_reason: None,
+        quiet_for_ms: m.quiet_for_ms.map(|q| q as i64),
         is_new: true,
         touched: true,
         status_changed: false,
@@ -329,7 +331,7 @@ async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> 
         "SELECT id, rule_id, rule_revision, rule_name, team, fingerprint, generation, dedup_active,
                 dedup_window_ms, status, severity, color, title, body, fields, count, first_seen,
                 last_seen, version, status_version, notify_seq, source, schema, last_event_id,
-                resolved_by, resolved_at, resolved_reason
+                resolved_by, resolved_at, resolved_reason, quiet_for_ms
          FROM alerts
          WHERE (rule_id, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[]))
            AND dedup_active AND status IN ('open', 'acked')
@@ -370,6 +372,7 @@ async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> 
                 resolved_by: r.try_get("resolved_by")?,
                 resolved_at: r.try_get("resolved_at")?,
                 resolved_reason: r.try_get("resolved_reason")?,
+                quiet_for_ms: r.try_get("quiet_for_ms")?,
                 is_new: false,
                 touched: false,
                 status_changed: false,
@@ -552,11 +555,11 @@ pub async fn apply_batch_fenced(pool: &PgPool, batch: &[MatchRecord], fences: &[
             "INSERT INTO alerts (id, rule_id, rule_revision, rule_name, team, fingerprint, generation,
                 dedup_active, dedup_window_ms, status, severity, color, title, body, fields, count,
                 first_seen, last_seen, version, status_version, notify_seq, source, schema,
-                last_event_id, resolved_by, resolved_at, resolved_reason)
+                last_event_id, resolved_by, resolved_at, resolved_reason, quiet_for_ms)
              SELECT id, rule_id, rule_revision, rule_name, team, fingerprint, generation,
                 dedup_active, dedup_window_ms, status, severity, color, title, body, fields, count,
                 first_seen, last_seen, version, status_version, notify_seq, source, schema,
-                last_event_id, resolved_by, resolved_at, resolved_reason
+                last_event_id, resolved_by, resolved_at, resolved_reason, quiet_for_ms
              FROM jsonb_populate_recordset(NULL::alerts, $1)",
         )
         .bind(sanitized_json(&plan.inserts)?)
@@ -604,6 +607,54 @@ pub async fn apply_batch_fenced(pool: &PgPool, batch: &[MatchRecord], fences: &[
     }
     tx.commit().await?;
     Ok(Ok(plan))
+}
+
+/// Resolve open/acked alerts whose `quiet_for` elapsed since `last_seen`
+/// (`resolved_reason = 'quiet_for'`). Any number of sweepers can run: rows
+/// are claimed with SKIP LOCKED, and Postgres re-checks `last_seen` after
+/// waiting on a row the aggregator is updating, so a fresh match wins.
+pub async fn sweep_quiet(pool: &PgPool) -> Result<usize> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE alerts SET status = 'resolved', resolved_reason = 'quiet_for', resolved_by = 'system',
+                resolved_at = now(), dedup_active = false,
+                version = version + 1, status_version = version + 1
+         WHERE id IN (
+             SELECT id FROM alerts
+             WHERE quiet_for_ms IS NOT NULL AND status IN ('open', 'acked')
+               AND last_seen < now() - quiet_for_ms * interval '1 millisecond'
+             ORDER BY last_seen LIMIT 500
+             FOR UPDATE SKIP LOCKED)
+           AND last_seen < now() - quiet_for_ms * interval '1 millisecond'
+         RETURNING id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if !ids.is_empty() {
+        sqlx::query("INSERT INTO outbox (kind, alert_id) SELECT $1, unnest($2::uuid[])")
+            .bind(outbox_kind::ALERT_UPDATE)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_notify($1, '')").bind(OUTBOX_CHANNEL).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(ids.len())
+}
+
+pub async fn run_quiet_sweeper(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    info!("quiet-timer sweeper started");
+    loop {
+        match sweep_quiet(&pool).await {
+            Ok(n) if n > 0 => info!(resolved = n, "resolved quiet alerts"),
+            Ok(_) => {}
+            Err(e) => warn!(error = format!("{e:#}"), "quiet sweep failed"),
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+    }
 }
 
 pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -746,6 +797,7 @@ mod tests {
             diagnostics: vec![],
             context: Default::default(),
             event: None,
+            quiet_for_ms: None,
         }
     }
 
