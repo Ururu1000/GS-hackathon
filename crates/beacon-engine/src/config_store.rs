@@ -465,14 +465,20 @@ pub async fn list_schemas(pool: &PgPool) -> Result<Vec<StoredSchema>> {
 /// Valid stored mappings, for snapshots and the rule test panel. An invalid
 /// stored mapping is skipped (and logged), never fatal.
 pub async fn schema_specs(pool: &PgPool) -> Result<Vec<SchemaMappingSpec>> {
+    Ok(valid_schema_specs(list_schemas(pool).await?))
+}
+
+/// The CPU half of [`schema_specs`] (compiles every mapping), for callers
+/// that run it on a blocking thread.
+pub fn valid_schema_specs(stored: Vec<StoredSchema>) -> Vec<SchemaMappingSpec> {
     let mut out = Vec::new();
-    for s in list_schemas(pool).await? {
+    for s in stored {
         match validate_schema(&s.spec) {
             Ok(m) => out.push(m),
             Err(problems) => error!(?problems, "stored schema mapping is invalid; skipped"),
         }
     }
-    Ok(out)
+    out
 }
 
 /// Create (no `expected_revision`) or compare-and-set update a mapping.

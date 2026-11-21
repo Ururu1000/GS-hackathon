@@ -302,9 +302,10 @@ pub async fn test(State(state): State<ApiState>, headers: HeaderMap, body: Body)
     // Compiling and evaluating is CPU work: keep it off the async workers, and
     // hold the concurrency permit inside the blocking task even if the request cancels.
     // The live mappings (Postgres), so a just-published mapping is used.
-    let schemas = config_store::schema_specs(&state.pool).await?;
+    let stored = config_store::list_schemas(&state.pool).await?;
     let out = tokio::task::spawn_blocking(move || {
         let _slot = slot;
+        let schemas = config_store::valid_schema_specs(stored);
         run_test(&schemas, b.rule, b.event, b.source)
     })
         .await

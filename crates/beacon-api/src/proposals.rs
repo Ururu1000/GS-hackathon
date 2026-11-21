@@ -16,7 +16,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use beacon_engine::config_store::{self, WriteError};
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sqlx::Row;
 use uuid::Uuid;
@@ -27,6 +28,12 @@ use crate::error::ApiError;
 const KINDS: &[&str] = &["noisy", "reroute", "template", "other"];
 const STATES: &[&str] = &["pending", "accepted", "rejected", "stale"];
 const MAX_BODY: usize = 128 * 1024;
+/// Newest proposals returned by a list call.
+const LIST_LIMIT: i64 = 200;
+/// Pending proposals allowed per rule and per author, so the table (and the
+/// list, which carries two rule bodies per row) can't be flooded.
+const MAX_PENDING_PER_RULE: i64 = 10;
+const MAX_PENDING_PER_AUTHOR: i64 = 50;
 
 fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -39,30 +46,62 @@ fn param(raw: Option<&str>, name: &str) -> Option<String> {
 const COLUMNS: &str = "id, rule_id, rule_name, team, kind, summary, note, base_revision, base_rule, proposed_rule,
     author, auto, alert_id, created_at, state, decided_by, decided_at";
 
-fn view(state: &ApiState, r: &sqlx::postgres::PgRow) -> Result<Value, ApiError> {
+/// A proposal as the API returns it. The two rule bodies pass through as raw
+/// JSON text, so a list never decodes them into `Value` trees.
+#[derive(Serialize)]
+struct ProposalView {
+    id: String,
+    rule_id: String,
+    rule_name: String,
+    kind: String,
+    summary: String,
+    note: String,
+    base_revision: i64,
+    base_rule: Box<RawValue>,
+    proposed_rule: Box<RawValue>,
+    author: String,
+    auto: bool,
+    alert_id: Option<String>,
+    created_at: String,
+    state: String,
+    decided_by: Option<String>,
+    decided_at: Option<String>,
+    can_review: bool,
+}
+
+fn raw_view(state: &ApiState, r: &sqlx::postgres::PgRow) -> Result<ProposalView, ApiError> {
     let team: String = r.try_get("team")?;
     let author: String = r.try_get("author")?;
     // Mirrors decide(): the team's members review, but not their own proposal.
     let can_review = state.session.can_see(&team) && (state.session.admin || author != state.session.actor());
-    Ok(json!({
-        "id": r.try_get::<Uuid, _>("id")?.to_string(),
-        "rule_id": r.try_get::<String, _>("rule_id")?,
-        "rule_name": r.try_get::<String, _>("rule_name")?,
-        "kind": r.try_get::<String, _>("kind")?,
-        "summary": r.try_get::<String, _>("summary")?,
-        "note": r.try_get::<String, _>("note")?,
-        "base_revision": r.try_get::<i64, _>("base_revision")?,
-        "base_rule": r.try_get::<Value, _>("base_rule")?,
-        "proposed_rule": r.try_get::<Value, _>("proposed_rule")?,
-        "author": author,
-        "auto": r.try_get::<bool, _>("auto")?,
-        "alert_id": r.try_get::<Option<Uuid>, _>("alert_id")?.map(|u| u.to_string()),
-        "created_at": ts(r.try_get("created_at")?),
-        "state": r.try_get::<String, _>("state")?,
-        "decided_by": r.try_get::<Option<String>, _>("decided_by")?,
-        "decided_at": r.try_get::<Option<DateTime<Utc>>, _>("decided_at")?.map(ts),
-        "can_review": can_review,
-    }))
+    Ok(ProposalView {
+        id: r.try_get::<Uuid, _>("id")?.to_string(),
+        rule_id: r.try_get("rule_id")?,
+        rule_name: r.try_get("rule_name")?,
+        kind: r.try_get("kind")?,
+        summary: r.try_get("summary")?,
+        note: r.try_get("note")?,
+        base_revision: r.try_get("base_revision")?,
+        base_rule: r.try_get::<sqlx::types::Json<Box<RawValue>>, _>("base_rule")?.0,
+        proposed_rule: r.try_get::<sqlx::types::Json<Box<RawValue>>, _>("proposed_rule")?.0,
+        author,
+        auto: r.try_get("auto")?,
+        alert_id: r.try_get::<Option<Uuid>, _>("alert_id")?.map(|u| u.to_string()),
+        created_at: ts(r.try_get("created_at")?),
+        state: r.try_get("state")?,
+        decided_by: r.try_get("decided_by")?,
+        decided_at: r.try_get::<Option<DateTime<Utc>>, _>("decided_at")?.map(ts),
+        can_review,
+    })
+}
+
+fn view(state: &ApiState, r: &sqlx::postgres::PgRow) -> Result<Value, ApiError> {
+    serde_json::to_value(raw_view(state, r)?).map_err(|e| ApiError::from(anyhow::anyhow!("proposal view: {e}")))
+}
+
+#[derive(Serialize)]
+struct ListOut {
+    items: Vec<ProposalView>,
 }
 
 fn scope(state: &ApiState, raw: Option<&str>) -> Result<Vec<String>, ApiError> {
@@ -74,7 +113,7 @@ fn scope(state: &ApiState, raw: Option<&str>) -> Result<Vec<String>, ApiError> {
     }
 }
 
-pub async fn list(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
+pub async fn list(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let teams = scope(&state, raw.as_deref())?;
     let st = param(raw.as_deref(), "state");
     if let Some(s) = &st
@@ -83,14 +122,15 @@ pub async fn list(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Res
         }
     let rows = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM proposals WHERE team = ANY($1) AND ($2::text IS NULL OR state = $2)
-         ORDER BY created_at DESC, id DESC LIMIT 500"
+         ORDER BY created_at DESC, id DESC LIMIT $3"
     ))
     .bind(&teams)
     .bind(&st)
+    .bind(LIST_LIMIT)
     .fetch_all(&state.pool)
     .await?;
-    let items = rows.iter().map(|r| view(&state, r)).collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(json!({"items": items})))
+    let items = rows.iter().map(|r| raw_view(&state, r)).collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(ListOut { items }).into_response())
 }
 
 pub async fn count(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
@@ -169,6 +209,23 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bod
         return Err(invalid("proposed_rule.team", "team cannot be changed on an existing rule"));
     }
     crate::rules::check_team(&state, &b.proposed_rule)?;
+    // Best effort (two concurrent creates can both pass): a bound, not an invariant.
+    let actor = state.session.actor();
+    let (per_rule, per_author): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE rule_id = $1), count(*) FILTER (WHERE author = $2)
+         FROM proposals WHERE state = 'pending' AND (rule_id = $1 OR author = $2)",
+    )
+    .bind(&b.rule_id)
+    .bind(&actor)
+    .fetch_one(&state.pool)
+    .await?;
+    if per_rule >= MAX_PENDING_PER_RULE || per_author >= MAX_PENDING_PER_AUTHOR {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_proposals",
+            format!("at most {MAX_PENDING_PER_RULE} pending proposals per rule and {MAX_PENDING_PER_AUTHOR} per author; review some first"),
+        ));
+    }
     let name = current.spec.get("name").and_then(Value::as_str).unwrap_or(&b.rule_id).to_string();
     let id = Uuid::now_v7();
     let row = sqlx::query(&format!(
@@ -185,7 +242,7 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bod
     .bind(b.base_revision)
     .bind(&current.spec)
     .bind(&b.proposed_rule)
-    .bind(state.session.actor())
+    .bind(&actor)
     .bind(alert_id)
     .fetch_one(&state.pool)
     .await?;

@@ -617,6 +617,18 @@ async fn proposal_and_mapping_guards(pool: PgPool) {
     let (s, e) = send(&h.app, "POST", "/api/schemas/preview", &h.csrf, Some(json!({"spec": wide, "event": {"kind": 1}}))).await;
     assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("fields")));
 
+    // Pending proposals are capped per rule; the list still carries both rule bodies.
+    let (_, r) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+    let flood = json!({"rule_id": "rates-rejected-trades", "base_revision": r["revision"], "kind": "other", "summary": "s", "proposed_rule": r["rule"]});
+    for _ in 0..10 {
+        assert_eq!(send(&h.app, "POST", "/api/proposals", &h.csrf, Some(flood.clone())).await.0, StatusCode::CREATED);
+    }
+    let (s, e) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(flood)).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("too_many_proposals")));
+    let (_, l) = get(&h.app, "/api/proposals?state=pending").await;
+    assert_eq!(l["items"].as_array().unwrap().len(), 10);
+    assert_eq!((l["items"][0]["base_rule"]["id"].as_str(), l["items"][0]["proposed_rule"]["team"].as_str()), (Some("rates-rejected-trades"), Some("rates")));
+
     // A non-admin author sees their own proposal as not reviewable, and can't review it.
     let session = Arc::new(Session::demo_with(&root().join("config"), "erin", false).unwrap());
     let csrf = session.csrf_token.clone();
