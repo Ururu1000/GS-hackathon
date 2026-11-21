@@ -101,13 +101,15 @@ The workload is `beacon-loadgen --duration 30 --batch 100 --distinct-keys 1000 -
 
 | Target rate | Commit, run | Accepted | Processed | Ingest → alert | Ingest → gateway (sms) | Ingest → Mailpit | Delivered |
 |---|---|---|---|---:|---:|---:|---|
+| 200 ev/s | `9b6dd76`, [run 44873549433](https://github.com/Ururu1000/GS-hackathon/actions/runs/44873549433) | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,807 alerts; drained 2.5 s after sending stopped | 138 / 852 | 502 / 1,346 | 502 / 1,483 | 700 SMS, 700 phone, 2,090 email; 0 missing, dead or duplicate |
 | 200 ev/s | `e5d7522`, [run 44870310169](https://github.com/Ururu1000/GS-hackathon/actions/runs/44870310169) | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,783 alerts; drained 2.5 s after sending stopped | 518 / 2,892 | 3,916 / 5,330 | 4,341 / 5,868 | 684 SMS, 684 phone, 2,129 email; 0 missing, dead or duplicate |
 | 200 ev/s | `631545c`, [run 44869239778](https://github.com/Ururu1000/GS-hackathon/actions/runs/44869239778) | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,806 alerts; drained 2.5 s after sending stopped | 281 / 1,690 | 1,286 / 3,045 | 1,387 / 3,107 | 709 SMS, 709 phone, 2,140 email; 0 missing, dead or duplicate |
+| 2,000 ev/s | `9b6dd76`, [run 44873549433](https://github.com/Ururu1000/GS-hackathon/actions/runs/44873549433) | 60,000 of 60,000 (2,000 ev/s), 0 rejected | 4,000 alerts; alerts drained 2.5 s after sending stopped, every delivery done by then | 2,198 / 13,607 | 13,423 / 23,153 | 14,672 / 23,067 | 1,000 SMS, 1,000 phone, 3,000 email; 0 missing, dead or duplicate |
 | 2,000 ev/s | `e5d7522`, [run 44870310169](https://github.com/Ururu1000/GS-hackathon/actions/runs/44870310169) | 60,000 of 60,000 (2,000 ev/s), 0 rejected | 4,000 alerts; alerts drained 6.5 s and deliveries 20.2 s after sending stopped | 3,904 / 8,495 | 41,214 / 49,649 | 41,010 / 49,514 | 1,000 SMS, 1,000 phone, 3,000 email; 0 missing, dead or duplicate |
 
-The two 200 ev/s runs used the same code path and workload, and their delivery p50 differs threefold. That is the noise of a shared 2-vCPU runner, so read these as ranges, not exact figures.
+Rows on `9b6dd76` run four router tasks (`ROUTER_TASKS=4`, the default since M7) with one job `INSERT` per notification; rows on `e5d7522` and `631545c` ran one router task. The two older 200 ev/s runs used the same code path and workload, and their delivery p50 differs threefold. That is the noise of a shared 2-vCPU runner, so read these as ranges, not exact figures.
 
-**At 2,000 ev/s**, nothing was lost, but delivery fell behind. Ingest and alerting kept up. Routing turns each notification into delivery jobs, and Beacon runs a single routing task: one batch of 100 per transaction, with per-row inserts. It handles about 30 batches/s, below the roughly 3,000 notifications/s this load produces, so the backlog grew for the whole run. Jobs were planned at p50 about 40 s, and the last delivery went out 20.2 s after sending stopped. The routing claim already uses `FOR UPDATE SKIP LOCKED`, and job inserts are idempotent, so more routing tasks or bigger batches are the next step. That change is out of scope for the demo.
+**At 2,000 ev/s**, nothing was lost. With one routing task (`e5d7522`), delivery fell behind: one batch of 100 per transaction with per-row inserts handled about 100 notifications/s, below what this burst produces, so jobs were planned at p50 about 40 s and the last delivery went out 20.2 s after sending stopped. M7 runs four routing tasks on the same outbox (claims use `FOR UPDATE SKIP LOCKED`, inserts are idempotent, throttle buckets are locked in one order) and writes each notification's jobs in one `INSERT`. On the same 2-vCPU runner that cut ingest → gateway to p50 13.4 s / p99 23.2 s. It is not 4×, because routers, engine, Postgres, Redpanda and Mailpit share two cores, and alert creation itself now reaches p99 13.6 s in this burst; the delivery workers are the next limit (planned → sent is about 3.5 s, up from about 1 s).
 
 ### Ingest → delivery latency
 
@@ -158,7 +160,7 @@ One binary, `beacon`, runs any mix of roles (`--role ingest,matcher,...`); the c
 
 **Scaling.** Every role is a replica set. Matchers and aggregators share Kafka consumer groups (aggregators fence by partition). Each API replica consumes `alerts.updates` in its own group for SSE. Router, delivery workers, scheduler and actions claim rows with `FOR UPDATE SKIP LOCKED` and leases. A crashed worker's jobs are picked up when their lease expires.
 
-**Single points of failure, by design for the hackathon:** one Postgres and one broker. Everything else can run several copies. Measured limits are in [Measured performance](#measured-performance); at 2,000 ev/s the single routing task is the bottleneck.
+**Single points of failure, by design for the hackathon:** one Postgres and one broker. Everything else can run several copies. Measured limits are in [Measured performance](#measured-performance); at 2,000 ev/s on 2 vCPU, alert creation and the delivery workers set the latency now that routing runs four tasks.
 
 ## Security and privacy
 
