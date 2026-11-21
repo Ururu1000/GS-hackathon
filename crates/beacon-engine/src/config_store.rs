@@ -377,6 +377,8 @@ mod tests {
         assert_eq!(validate(&bad).unwrap_err()[0].path, "group");
         let mut ok = rule();
         ok["group"] = json!({"by": ["raw.x"], "window": 300});
+        assert_eq!(validate(&ok).unwrap_err()[0].path, "group", "grouped rules must auto-resolve");
+        ok["auto_resolve"] = json!({"quiet_for": "10m"});
         assert!(validate(&ok).is_ok());
         let mut bad = rule();
         bad["present"]["__proto__"] = json!({"x": 1});

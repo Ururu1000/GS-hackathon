@@ -46,6 +46,7 @@ fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> Mat
             raw: serde_json::json!({"payload": {"tradeId": "T-1"}}),
         }),
         quiet_for_ms: None,
+        group_key: None,
     }
 }
 
@@ -231,4 +232,34 @@ async fn quiet_for_resolves_idle_alerts(pool: PgPool) {
     assert_eq!(sweep_quiet(&pool).await.unwrap(), 0, "idempotent");
     let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE kind = 'alert_update'").fetch_one(&pool).await.unwrap();
     assert_eq!(updates, 3 + 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn grouped_recovery_closes_every_window(pool: PgPool) {
+    let rule: beacon_core::rule::RuleSpec = serde_json::from_value(serde_json::json!({
+        "id": "lat", "team": "pricing",
+        "when": {"all": [{"path": "raw.kind", "op": "eq", "value": "latency"}, {"path": "raw.state", "op": "eq", "value": "high"}]},
+        "route": [{"to": "team:pricing"}], "present": {"title": "Latency {{ raw.instrument }}"},
+        "group": {"by": ["raw.instrument"], "window": "5m"},
+        "auto_resolve": {"recover_when": {"all": [{"path": "raw.kind", "op": "eq", "value": "latency"}, {"path": "raw.state", "op": "eq", "value": "ok"}]}}
+    }))
+    .unwrap();
+    let cfg = beacon_core::ConfigSnapshot::build(1, vec![], vec![rule]).unwrap();
+    let ev = |id: &str, state: &str, at: chrono::DateTime<Utc>| {
+        let mut e = beacon_core::Event::new(id.into(), "http:x".into(), serde_json::json!({"kind": "latency", "state": state, "instrument": "EURUSD"}));
+        e.ingested_at = at;
+        cfg.process(e).1.remove(0)
+    };
+    let t0 = Utc::now() - Duration::minutes(12);
+    // Two digests in different 5-minute windows, then a recovery in a third.
+    apply_batch(&pool, &[ev("a", "high", t0)]).await.unwrap();
+    apply_batch(&pool, &[ev("b", "high", t0 + Duration::minutes(6))]).await.unwrap();
+    let open: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE status = 'open'").fetch_one(&pool).await.unwrap();
+    assert_eq!(open, 2);
+    let rec = ev("r", "ok", t0 + Duration::minutes(11));
+    assert_eq!(rec.kind, MatchKind::Recover);
+    apply_batch(&pool, &[rec]).await.unwrap();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT status, resolved_reason FROM alerts").fetch_all(&pool).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(s, r)| s == "resolved" && r.as_deref() == Some("recovered")), "{rows:?}");
 }

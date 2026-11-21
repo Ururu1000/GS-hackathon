@@ -62,6 +62,10 @@ pub struct MatchRecord {
     /// `auto_resolve.quiet_for`: resolve the alert after this long without a match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_for_ms: Option<u64>,
+    /// Grouped rules: identity of the group tuple without the time bucket.
+    /// A recovery resolves every open digest with this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_key: Option<String>,
 }
 
 /// Values copied from the event into a match (dedup key values, card fields)
@@ -294,7 +298,10 @@ impl ConfigSnapshot {
                 }
             }
         }
-        if let Some((start, _)) = bucket {
+        // The group tuple alone identifies the series; recoveries use it so
+        // they close digests of every window, not just the current one.
+        let group_key = bucket.map(|_| fingerprint(rule.id(), &key, None));
+        if let (Some((start, _)), MatchKind::Fire) = (bucket, kind) {
             key.push(Value::from(start));
         }
         let fingerprint = fingerprint(rule.id(), &key, missing.then_some(event.id.as_str()));
@@ -341,6 +348,7 @@ impl ConfigSnapshot {
             key,
             dedup_window_ms: window_ms,
             quiet_for_ms: rule.spec.auto_resolve.as_ref().and_then(|a| a.quiet_for).map(|d| d.as_millis() as u64),
+            group_key,
             severity: severity.as_str().to_string(),
             color: rule
                 .spec

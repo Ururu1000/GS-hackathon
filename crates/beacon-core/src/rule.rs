@@ -140,6 +140,9 @@ fn parse_group(v: &Value) -> Result<Option<GroupBy>, String> {
     if window < Duration::from_secs(1) || window > Duration::from_secs(24 * 3600) {
         return Err("group.window must be between 1s and 24h".into());
     }
+    if by.len() > MAX_DEDUP_KEY {
+        return Err(format!("group.by takes at most {MAX_DEDUP_KEY} paths"));
+    }
     let by = by.iter().map(|p| Path::parse(p).map_err(|e| format!("group.by `{p}`: {e}"))).collect::<Result<Vec<_>, _>>()?;
     Ok(Some(GroupBy { by, window }))
 }
@@ -282,6 +285,14 @@ impl CompiledRule {
             None => None,
             Some(g) => parse_group(g).map_err(|message| RuleError::Group { rule: rule.clone(), message })?,
         };
+        // A digest per window that never closes would pile up open alerts.
+        let resolves = spec.auto_resolve.as_ref().is_some_and(|a| a.quiet_for.is_some() || a.recover_when.is_some());
+        if group.is_some() && !resolves {
+            return Err(RuleError::Group {
+                rule,
+                message: "grouped rules need auto_resolve.quiet_for or auto_resolve.recover_when, so old windows close".into(),
+            });
+        }
         Ok(CompiledRule {
             spec,
             revision,
