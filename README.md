@@ -166,6 +166,8 @@ One binary, `beacon`, runs any mix of roles (`--role ingest,matcher,...`); the c
 ## Security and privacy
 
 - **Ports:** every port binds to `127.0.0.1`. The demo session has no login, and writes need its `X-CSRF-Token`.
+- **DNS rebinding:** the API answers only `localhost`, IP literals, `PUBLIC_URL`'s host and `API_ALLOWED_HOSTS`, and any other `Host` gets `421`. A page on another domain that re-resolves to `127.0.0.1` can't read the session or its CSRF token.
+- **Webhook ingest:** `POST /ingest/*` must be `Content-Type: application/json`, so a page the user visits can't post events across sites. Set `INGEST_TOKEN` to require `Authorization: Bearer <token>`. Without it the ingest logs a warning when it listens beyond loopback.
 - **Redaction:** secret-looking fields are redacted before they reach alerts, samples or notifications. Delivery addresses and provider errors are masked in alert detail.
 - **Logs:** no message text, SMS codes or approval challenges. Phone numbers are masked.
 - **Approvals:** codes are stored hashed, single-use, expire after 15 min, and allow 5 attempts. Nobody approves their own request.
