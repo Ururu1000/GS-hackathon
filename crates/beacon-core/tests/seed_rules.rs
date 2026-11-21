@@ -36,7 +36,7 @@ fn settlements_workflow_failure() {
     assert_eq!(m.body, "TIMEOUT: Counterparty service did not respond in 5000 ms");
     assert_eq!(m.color, "red");
     assert_eq!(m.severity, "critical");
-    assert_eq!(m.route[0].to, "oncall:settlements");
+    assert_eq!(m.route[0].to, "oncall:settlements-primary");
     assert_eq!(m.fields[0].label, "Step");
 }
 

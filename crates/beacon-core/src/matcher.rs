@@ -77,6 +77,149 @@ fn bounded(v: Value) -> Value {
     bounded_to(v, MAX_PROJECTED_VALUE)
 }
 
+/// Keys whose values must be masked before leaving the hot path.
+fn is_secret_key(k: &str) -> bool {
+    const SECRET: &[&str] = &[
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "authorization",
+        "api_key",
+        "apikey",
+        "cookie",
+        "private_key",
+        "credential",
+        "access_key",
+        "session_id",
+        "ssn",
+        "credit_card",
+        "card_number",
+        "phone",
+        "mobile",
+        "telephone",
+        "msisdn",
+    ];
+    let lk = k.to_ascii_lowercase();
+    SECRET.iter().any(|s| lk.contains(s))
+}
+
+pub fn is_secret_path_str(p: &str) -> bool {
+    p.split(['.', '/']).any(is_secret_key)
+}
+
+fn is_secret_path(p: &Path) -> bool {
+    is_secret_path_str(p.as_str())
+}
+
+/// Scrub inline credentials (`Bearer ...`, `Basic ...`, `scheme://user:pass@`),
+/// labeled phone numbers, JSON-preview secret values, email addresses, and
+/// formatted phone numbers from strings before storage or display.
+pub fn redact_str(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static AUTH_RE: OnceLock<Regex> = OnceLock::new();
+    static URL_CRED_RE: OnceLock<Regex> = OnceLock::new();
+    static LABELED_PHONE_RE: OnceLock<Regex> = OnceLock::new();
+    static JSON_SECRET_RE: OnceLock<Regex> = OnceLock::new();
+    static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
+
+    let auth = AUTH_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}").expect("valid regex")
+    });
+    let url_cred = URL_CRED_RE.get_or_init(|| {
+        Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@").expect("valid regex")
+    });
+    let labeled_phone = LABELED_PHONE_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(phone|mobile|tel|telephone|msisdn)(\s*[:=]\s*["']?)(\+?\d{7,15})(["']?)"#)
+            .expect("valid regex")
+    });
+    let json_secret = JSON_SECRET_RE.get_or_init(|| {
+        Regex::new(r#"(?i)("(?:[^"]*(?:password|passwd|secret|token|authorization|api_key|apikey|cookie|private_key|credential|access_key|session_id|ssn|credit_card|card_number|phone|mobile|telephone|msisdn)[^"]*)"\s*:\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|-?\d+(?:\.\d+)?)"#)
+            .expect("valid regex")
+    });
+    let email = EMAIL_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b([A-Z0-9._%+-]+)@([A-Z0-9.-]+\.[A-Z]{2,})\b").expect("valid regex")
+    });
+
+    let s = auth.replace_all(s, "$1 [redacted]");
+    let s = url_cred.replace_all(&s, "${1}[redacted]@");
+    let s = json_secret.replace_all(&s, r#"${1}"[redacted]""#);
+    let s = labeled_phone.replace_all(&s, "${1}${2}[redacted]${4}");
+    let s = email.replace_all(&s, |caps: &regex::Captures| {
+        let user = &caps[1];
+        let domain = &caps[2];
+        let first: String = user.chars().take(1).collect();
+        format!("{first}***@{domain}")
+    });
+    mask_phones(&s)
+}
+
+/// Mask phone-number-like sequences (e.g. `+44 7700 900123`, `+447700900123`,
+/// `555-123-4567`) outside complete ISO date/timestamp spans, without
+/// disturbing timestamps, IPv4s, or plain numeric codes.
+pub fn mask_phones(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static TS_RE: OnceLock<Regex> = OnceLock::new();
+    static PHONE_RE: OnceLock<Regex> = OnceLock::new();
+    let ts_re = TS_RE.get_or_init(|| {
+        Regex::new(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b")
+            .expect("valid regex")
+    });
+    let phone_re = PHONE_RE.get_or_init(|| {
+        Regex::new(r"(?:\+\d[\d .()-]{5,18}\d|\b(?:\(\d{2,4}\)|\d{3,5})[ .()-]\d[\d .()-]{4,14}\d\b)")
+            .expect("valid regex")
+    });
+    let mask_chunk = |chunk: &str| -> String {
+        phone_re
+            .replace_all(chunk, |caps: &regex::Captures| {
+                let m = &caps[0];
+                let digits: Vec<char> = m.chars().filter(|c| c.is_ascii_digit()).collect();
+                let is_ipv4 = m.split('.').count() == 4 && m.split('.').all(|p| p.parse::<u8>().is_ok());
+                if is_ipv4 || digits.len() < 7 || digits.len() > 15 {
+                    return m.to_string();
+                }
+                let head: String = m.chars().take_while(|c| *c != ' ').take(3).collect();
+                let tail: String = digits[digits.len() - 3..].iter().collect();
+                format!("{head} *** {tail}")
+            })
+            .into_owned()
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    for ts in ts_re.find_iter(s) {
+        out.push_str(&mask_chunk(&s[pos..ts.start()]));
+        out.push_str(ts.as_str());
+        pos = ts.end();
+    }
+    out.push_str(&mask_chunk(&s[pos..]));
+    out
+}
+
+/// Mask values under secret-looking keys (password, token, authorization...)
+/// and inline credentials before an event leaves the hot path for storage or display.
+pub fn redact(v: Value) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| {
+                    if is_secret_key(&k) { (k, Value::String("[redacted]".into())) } else { (k, redact(v)) }
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.into_iter().map(redact).collect()),
+        Value::String(s) => {
+            if (s.starts_with('{') || s.starts_with('[')) && s.ends_with('…') {
+                Value::String("[truncated]".into())
+            } else {
+                Value::String(redact_str(&s))
+            }
+        }
+        other => other,
+    }
+}
+
 /// Cap a JSON value at `max` serialized bytes, replacing it with a truncated
 /// string preview when larger.
 pub fn bounded_to(v: Value, max: usize) -> Value {
@@ -311,8 +454,14 @@ impl ConfigSnapshot {
             .severity
             .or_else(|| event.fields.get("severity").and_then(Value::as_str).and_then(Severity::normalize))
             .unwrap_or(Severity::Warning);
-        let (title, body, fields) = if kind == MatchKind::Fire {
-            let ctx = template::context(event);
+        let (title, body, fields, notify_event) = if kind == MatchKind::Fire {
+            let redacted_raw = redact(event.raw.clone());
+            let redacted_fields = match redact(Value::Object(event.fields.clone())) {
+                Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            let redacted_id = redact_str(&event.id);
+            let ctx = template::context_from(&redacted_raw, &redacted_fields, &event.schema, &event.source, &redacted_id);
             let title = template::render(&self.env, &format!("{}:title", rule.id()), &ctx);
             let body = template::render(&self.env, &format!("{}:body", rule.id()), &ctx);
             let fields = rule
@@ -322,7 +471,11 @@ impl ConfigSnapshot {
                     p.resolve(event).map(|v| AlertField {
                         path: p.to_string(),
                         label: label.clone(),
-                        value: bounded(v.into_owned()),
+                        value: if is_secret_path(p) {
+                            Value::String("[redacted]".into())
+                        } else {
+                            bounded(redact(v.into_owned()))
+                        },
                     })
                 })
                 .collect::<Vec<_>>();
@@ -330,9 +483,16 @@ impl ConfigSnapshot {
             if let Some((start, end)) = bucket {
                 fields.push(AlertField { path: "group.window".into(), label: "Window".into(), value: Value::String(window_label(start, end)) });
             }
-            (title, body, fields)
+            let notify_event = rule.spec.runbook.is_some().then(|| NotifyEvent {
+                fields: match bounded_to(Value::Object(redacted_fields), 4096) {
+                    Value::Object(m) => m,
+                    _ => serde_json::Map::new(),
+                },
+                raw: bounded_to(redacted_raw, MAX_NOTIFY_RAW),
+            });
+            (title, body, fields, notify_event)
         } else {
-            (String::new(), String::new(), Vec::new())
+            (String::new(), String::new(), Vec::new(), None)
         };
         MatchRecord {
             match_id: match kind {
@@ -365,10 +525,7 @@ impl ConfigSnapshot {
             schema: event.schema.clone(),
             ingested_at: event.ingested_at,
             diagnostics,
-            event: (kind == MatchKind::Fire && rule.spec.runbook.is_some()).then(|| NotifyEvent {
-                fields: event.fields.clone(),
-                raw: bounded_to(event.raw.clone(), MAX_NOTIFY_RAW),
-            }),
+            event: notify_event,
             context: NotifyContext {
                 service: field_str(event, "service"),
                 environment: field_str(event, "environment"),
@@ -435,5 +592,79 @@ mod tests {
         assert!(big.as_str().unwrap().len() <= MAX_PROJECTED_VALUE + 4);
         let obj = bounded(json!({"blob": "y".repeat(100_000)}));
         assert!(obj.is_string(), "large objects become a truncated preview");
+    }
+
+    #[test]
+    fn redacts_secret_keys_inline_creds_and_phones() {
+        let v = redact(json!({
+            "password": "s3cr3t",
+            "phone": 7700900123i64,
+            "nested": {"api_key": "k123", "msg": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload contact bob@example.test or +44 7700 900123"},
+            "url": "smtp://alice:hunter2@mail.internal:587",
+            "ip": "192.168.100.200",
+            "ts": "2026-10-23 09:14:02",
+            "ok": "trade-42"
+        }));
+        assert_eq!(v["password"], json!("[redacted]"));
+        assert_eq!(v["phone"], json!("[redacted]"));
+        assert_eq!(v["nested"]["api_key"], json!("[redacted]"));
+        assert_eq!(
+            v["nested"]["msg"],
+            json!("Authorization: Bearer [redacted] contact b***@example.test or +44 *** 123")
+        );
+        assert_eq!(v["url"], json!("smtp://[redacted]@mail.internal:587"));
+        assert_eq!(v["ip"], json!("192.168.100.200"));
+        assert_eq!(v["ts"], json!("2026-10-23 09:14:02"));
+        assert_eq!(v["ok"], json!("trade-42"));
+
+        assert_eq!(mask_phones("dial +44 7700 900123 failed at 2026-10-23 09:14:02"), "dial +44 *** 123 failed at 2026-10-23 09:14:02");
+        assert_eq!(mask_phones("code 550 2026-10-23 09:14:02"), "code 550 2026-10-23 09:14:02");
+        assert_eq!(mask_phones("dial +44 7700 900123 2026-10-23 09:14:02"), "dial +44 *** 123 2026-10-23 09:14:02");
+        assert_eq!(mask_phones("sms to +447700900123 rejected (550)"), "sms to +44 *** 123 rejected (550)");
+        assert_eq!(redact_str("phone=07700900123 ts=1761210842000"), "phone=[redacted] ts=1761210842000");
+        assert_eq!(
+            redact_str(r#"{"password":"hunter2","ok":1,"token":"trunc…"#),
+            r#"{"password":"[redacted]","ok":1,"token":"[redacted]""#
+        );
+    }
+
+    #[test]
+    fn match_redacts_templates_fields_event_id_and_notify_event() {
+        let rule: crate::rule::RuleSpec = serde_json::from_value(json!({
+            "id": "r1",
+            "team": "payments",
+            "when": {"path": "raw.ok", "op": "eq", "value": true},
+            "route": [{"to": "team:payments"}],
+            "present": {
+                "title": "Alert {{ raw.headers.authorization }} ({{ id }})",
+                "body": "Contact {{ raw.note }}",
+                "fields": [{"path": "raw.headers.authorization", "label": "Auth"}, {"path": "raw.note", "label": "Note"}]
+            },
+            "dedup": {"key": ["raw.id"]},
+            "runbook": "rb-1"
+        }))
+        .unwrap();
+        let snap = ConfigSnapshot::build(1, vec![], vec![rule]).unwrap();
+        let mut ev = Event::new(
+            "http:src:bob@example.test".into(),
+            "http:test".into(),
+            json!({
+                "ok": true,
+                "id": "k1",
+                "headers": {"authorization": "Bearer topsecret12345"},
+                "note": "Bearer topsecret12345 bob@example.test"
+            }),
+        );
+        ev.fields.insert("api_key".into(), json!("secret-val"));
+        ev.fields.insert("msg".into(), json!("Bearer topsecret12345"));
+        let m1 = snap.match_event(&ev);
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].title, "Alert [redacted] (http:src:b***@example.test)");
+        assert_eq!(m1[0].body, "Contact Bearer [redacted] b***@example.test");
+        assert_eq!(m1[0].fields[0].value, json!("[redacted]"));
+        assert_eq!(m1[0].fields[1].value, json!("Bearer [redacted] b***@example.test"));
+        let notify_ev = m1[0].event.as_ref().unwrap();
+        assert_eq!(notify_ev.fields.get("api_key"), Some(&json!("[redacted]")));
+        assert_eq!(notify_ev.fields.get("msg"), Some(&json!("Bearer [redacted]")));
     }
 }

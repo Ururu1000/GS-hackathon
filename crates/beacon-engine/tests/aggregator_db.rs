@@ -263,3 +263,27 @@ async fn grouped_recovery_closes_every_window(pool: PgPool) {
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(s, r)| s == "resolved" && r.as_deref() == Some("recovered")), "{rows:?}");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn replayed_partition_next_to_new_work_is_not_fenced(pool: PgPool) {
+    use beacon_engine::aggregator::{Fence, active_fences, apply_batch_fenced, claim_partition};
+    use std::collections::HashMap;
+    let now = Utc::now();
+    let (ea, _) = claim_partition(&pool, 1).await.unwrap();
+    let (eb, _) = claim_partition(&pool, 2).await.unwrap();
+    apply_batch_fenced(&pool, &[rec("a", "fa", MatchKind::Fire, now)], &[Fence { partition: 1, epoch: ea, next_offset: 10 }]).await.unwrap().unwrap();
+    // Both partitions appear in the batch: partition 1 is fully replayed (next_offset == owned 10),
+    // partition 2 advances to 5. Production active_fences must drop partition 1's non-advancing fence.
+    let owned = HashMap::from([(1, (ea, 10)), (2, (eb, 0))]);
+    let raw = HashMap::from([
+        (1, Fence { partition: 1, epoch: ea, next_offset: 10 }),
+        (2, Fence { partition: 2, epoch: eb, next_offset: 5 }),
+    ]);
+    let fences = active_fences(raw, &owned);
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].partition, 2);
+    let r = apply_batch_fenced(&pool, &[rec("b", "fb", MatchKind::Fire, now)], &fences).await.unwrap();
+    assert!(r.is_ok());
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 2);
+}

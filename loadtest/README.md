@@ -102,7 +102,14 @@ Events go to the external `workflow-events` topic, which the `kafka:workflows` s
 
 | Measure | Value |
 |---|---|
-| Produced (acked) | 75,000 at 5,005 events/s, 0 failed |
-| First alert, ingest receipt → first update (p50 / p99) | 146.7 ms / 284.4 ms |
+| Produced (acked) | 75,000 at ~5,000 events/s, 0 failed |
+| Matching events produced | 59,925 |
+| Increase in alert counts for `kafka:workflows` | **59,925** (exact) |
+| Any update, intended send → `alerts.updates` (p50 / p99) | 233.9 ms / 343.0 ms |
+| First alert, ingest receipt → first update (p50 / p99) | 212.7 ms / 324.6 ms |
 
-This run measured only first-alert latency (server clock), and that clock starts when the Kafka source reads the event, so it leaves out the time an event waits in `workflow-events`. Since `security/pr17-fixes`, loadgen correlates each event by the topic/partition/offset in the broker ack, so later Kafka runs also report "any update" from the intended send time, including that wait. Each report now records its transport, topic and event types.
+The source publishes concurrent batches of up to 500 messages. It stores the upstream offsets only after every event in the batch is durably in `events.raw`.
+
+Before that change it published one event at a time, at about 440 events/s. At this rate that built a backlog of about 30 s, although the counts were still exact.
+
+The earlier run measured only first-alert latency (server clock), and that clock starts when the Kafka source reads the event, so it leaves out the time an event waits in `workflow-events`. Since `security/pr17-fixes`, loadgen correlates each event by the topic/partition/offset in the broker ack, so later Kafka runs also report "any update" from the intended send time, including that wait. Each report now records its transport, topic and event types.

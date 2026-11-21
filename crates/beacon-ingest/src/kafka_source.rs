@@ -202,55 +202,100 @@ pub async fn run_kafka_source(spec: SourceSpec, default_bootstrap: String, publi
     consumer.subscribe(&topics).with_context(|| format!("source {}: subscribing", spec.id))?;
     info!(source = %spec.id, ?topics, %group, "kafka source started");
     loop {
-        let msg = tokio::select! {
+        // Collect a small batch, publish it concurrently, then store the
+        // upstream offsets only after every event in it is durably written.
+        let first = tokio::select! {
             _ = shutdown.changed() => break,
             m = consumer.recv() => m,
         };
-        let msg = match msg {
-            Ok(m) => m,
+        let mut batch: Vec<rdkafka::message::OwnedMessage> = Vec::with_capacity(SOURCE_BATCH);
+        let mut bytes = 0usize;
+        match first {
+            Ok(m) => {
+                bytes += m.payload_len();
+                batch.push(m.detach());
+            }
             Err(e) => {
                 warn!(source = %spec.id, error = %e, "kafka source receive error");
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
-        };
-        let id = format!("{}:{}:{}:{}", spec.id, msg.topic(), msg.partition(), msg.offset());
-        let parsed = msg
-            .payload()
-            .ok_or_else(|| "empty payload".to_string())
-            .and_then(|p| serde_json::from_slice::<serde_json::Value>(p).map_err(|e| e.to_string()));
-        // Undecodable or oversized payloads go to quarantine; either way the
-        // upstream offset is stored only after the broker acknowledged a write.
-        let mut quarantine_reason: Option<String> = parsed.as_ref().err().cloned();
-        let mut backoff = Duration::from_millis(100);
-        loop {
-            let res = match (&parsed, &quarantine_reason) {
-                (_, Some(reason)) => quarantine(&publisher, &id, msg.payload().unwrap_or_default(), reason).await,
-                (Ok(raw), None) => publisher.publish(&Event::new(id.clone(), spec.id.clone(), raw.clone())).await,
-                (Err(_), None) => unreachable!("parse errors always set a quarantine reason"),
-            };
-            match res {
-                Ok(()) => break,
-                Err(PublishError::TooLarge) if quarantine_reason.is_none() => {
-                    let len = msg.payload().map_or(0, <[u8]>::len);
-                    quarantine_reason = Some(format!("too large for events.raw ({len} bytes)"));
+        }
+        let deadline = tokio::time::Instant::now() + SOURCE_LINGER;
+        while !batch_full(batch.len(), bytes) {
+            match tokio::time::timeout_at(deadline, consumer.recv()).await {
+                Ok(Ok(m)) => {
+                    bytes += m.payload_len();
+                    batch.push(m.detach());
                 }
-                Err(e) => {
-                    warn!(source = %spec.id, error = %e, "publish failed, retrying");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                    if *shutdown.borrow() {
-                        return Ok(());
-                    }
-                }
+                _ => break,
             }
         }
-        if let Err(e) = consumer.store_offset_from_message(&msg) {
-            error!(source = %spec.id, error = %e, "store offset failed");
+        let results = futures::future::join_all(batch.iter().map(|m| forward(&spec.id, &publisher, m, shutdown.clone()))).await;
+        if results.iter().any(|ok| !ok) {
+            // Shutting down mid-retry: nothing from this batch is stored.
+            return Ok(());
+        }
+        let mut last: std::collections::HashMap<(String, i32), i64> = std::collections::HashMap::new();
+        for m in &batch {
+            let e = last.entry((m.topic().to_string(), m.partition())).or_insert(m.offset());
+            *e = (*e).max(m.offset());
+        }
+        for ((topic, partition), offset) in last {
+            if let Err(e) = consumer.store_offset(&topic, partition, offset) {
+                error!(source = %spec.id, error = %e, "store offset failed");
+            }
         }
     }
     let _ = consumer.commit_consumer_state(CommitMode::Sync);
     Ok(())
+}
+
+const SOURCE_BATCH: usize = 500;
+/// Payload bytes held per batch, so a producer of large messages can't pin
+/// hundreds of MiB per source.
+const SOURCE_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const SOURCE_LINGER: Duration = Duration::from_millis(10);
+
+/// A batch closes at the message count or the byte budget, whichever comes first.
+fn batch_full(count: usize, bytes: usize) -> bool {
+    count >= SOURCE_BATCH || bytes >= SOURCE_BATCH_BYTES
+}
+
+/// Publish one upstream message (or quarantine it), retrying transient broker
+/// errors. Returns false only when shutting down before it was written.
+async fn forward(source_id: &str, publisher: &EventPublisher, msg: &rdkafka::message::OwnedMessage, shutdown: watch::Receiver<bool>) -> bool {
+    let id = format!("{}:{}:{}:{}", source_id, msg.topic(), msg.partition(), msg.offset());
+    let parsed = msg
+        .payload()
+        .ok_or_else(|| "empty payload".to_string())
+        .and_then(|p| serde_json::from_slice::<serde_json::Value>(p).map_err(|e| e.to_string()));
+    // Undecodable or oversized payloads go to quarantine; either way the
+    // upstream offset is stored only after the broker acknowledged a write.
+    let mut quarantine_reason: Option<String> = parsed.as_ref().err().cloned();
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        let res = match (&parsed, &quarantine_reason) {
+            (_, Some(reason)) => quarantine(publisher, &id, msg.payload().unwrap_or_default(), reason).await,
+            (Ok(raw), None) => publisher.publish(&Event::new(id.clone(), source_id.to_string(), raw.clone())).await,
+            (Err(_), None) => unreachable!("parse errors always set a quarantine reason"),
+        };
+        match res {
+            Ok(()) => return true,
+            Err(PublishError::TooLarge) if quarantine_reason.is_none() => {
+                let len = msg.payload().map_or(0, <[u8]>::len);
+                quarantine_reason = Some(format!("too large for events.raw ({len} bytes)"));
+            }
+            Err(e) => {
+                warn!(source = %source_id, error = %e, "publish failed, retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                if *shutdown.borrow() {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Quarantined copies are capped so the quarantine write itself always fits.
@@ -278,6 +323,16 @@ mod tests {
     }
 
     const OK: &str = "id: kafka:workflows\ntype: kafka\ntopics: [workflow-events]\n";
+
+    #[test]
+    fn batches_close_at_count_or_bytes() {
+        assert!(!batch_full(1, 1024));
+        assert!(batch_full(SOURCE_BATCH, 10));
+        // Three ~1 MiB messages are fine; eight reach the 8 MiB budget.
+        let mib = 1024 * 1024;
+        assert!(!batch_full(3, 3 * mib));
+        assert!(batch_full(8, 8 * mib));
+    }
 
     #[test]
     fn accepts_the_seed_sources() {

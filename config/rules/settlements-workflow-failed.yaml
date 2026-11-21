@@ -11,7 +11,7 @@ when:
     - { path: fields.environment, op: eq, value: prod }
 severity: critical
 route:
-  - to: oncall:settlements
+  - to: oncall:settlements-primary
     channels: [phone, sms]
 present:
   title: "Settlement workflow {{ raw.workflowId }} failed at {{ raw.step }}"

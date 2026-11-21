@@ -42,7 +42,12 @@ pub struct ApiState {
     pub schemas: Arc<Vec<beacon_core::mapping::SchemaMappingSpec>>,
     /// Configured Kafka sources (config/sources).
     pub sources: Arc<Vec<beacon_ingest::kafka_source::SourceSpec>>,
+    /// Bounds concurrent SSE streams on this replica.
+    pub streams: Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent SSE streams per replica before new ones get 503.
+pub const MAX_STREAMS: usize = 500;
 
 pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
     router_with(state, ui_dir, None)
@@ -86,7 +91,7 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         }));
         api = api.merge(gated);
     }
-    match ui_dir {
+    let app = match ui_dir {
         // The built UI (ui/dist) is served from the same origin, so the
         // session cookie and EventSource work without CORS.
         Some(dir) => {
@@ -94,7 +99,24 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
             api.fallback_service(tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(index)))
         }
         None => api,
+    };
+    app.layer(axum::middleware::from_fn(security_headers))
+}
+
+/// Baseline security headers; API responses are never cached (they carry
+/// session data and the CSRF token).
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let is_api = req.uri().path().starts_with("/api/");
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    if is_api && !h.contains_key(header::CACHE_CONTROL) {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
+    res
 }
 
 async fn api_not_found() -> error::ApiError {

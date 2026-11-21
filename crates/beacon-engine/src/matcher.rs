@@ -63,7 +63,12 @@ impl RecentIds {
     }
 
     /// True if `id` was seen within the window (and records it otherwise).
+    /// Server-generated HTTP UUIDs never repeat, so only non-UUID ids (HTTP
+    /// `Idempotency-Key` and Kafka-source ids) are tracked.
     pub fn seen(&mut self, id: &str) -> bool {
+        if uuid::Uuid::parse_str(id).is_ok() {
+            return false;
+        }
         let now = Instant::now();
         while let Some((t, _)) = self.order.front() {
             if now.duration_since(*t) > self.ttl || self.order.len() > self.cap {
@@ -83,7 +88,7 @@ impl RecentIds {
 }
 
 const RECENT_ID_TTL: Duration = Duration::from_secs(15 * 60);
-const RECENT_ID_CAP: usize = 200_000;
+const RECENT_ID_CAP: usize = 100_000;
 const TXN_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn run_transactional(
@@ -302,22 +307,6 @@ pub struct SampleSink {
 pub const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 const MAX_TRACKED_SCHEMAS: usize = 10_000;
 
-/// Samples are shown in the UI, so values under secret-looking keys are masked.
-fn redact(v: serde_json::Value) -> serde_json::Value {
-    const SECRET: &[&str] = &["password", "passwd", "secret", "token", "authorization", "api_key", "apikey", "cookie", "private_key", "credential"];
-    match v {
-        serde_json::Value::Object(o) => serde_json::Value::Object(
-            o.into_iter()
-                .map(|(k, v)| {
-                    let lk = k.to_ascii_lowercase();
-                    if SECRET.iter().any(|s| lk.contains(s)) { (k, serde_json::Value::String("[redacted]".into())) } else { (k, redact(v)) }
-                })
-                .collect(),
-        ),
-        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(redact).collect()),
-        other => other,
-    }
-}
 const SAMPLES_KEPT: i64 = 2000;
 
 impl SampleSink {
@@ -327,8 +316,8 @@ impl SampleSink {
         tokio::spawn(async move {
             let mut since_prune = 0usize;
             while let Some(e) = rx.recv().await {
-                let raw = beacon_core::matcher::bounded_to(redact(e.raw), beacon_core::model::MAX_NOTIFY_RAW);
-                let fields = beacon_core::matcher::bounded_to(serde_json::Value::Object(e.fields), 4096);
+                let raw = beacon_core::matcher::bounded_to(beacon_core::matcher::redact(e.raw), beacon_core::model::MAX_NOTIFY_RAW);
+                let fields = beacon_core::matcher::bounded_to(beacon_core::matcher::redact(serde_json::Value::Object(e.fields)), 4096);
                 let res = sqlx::query(
                     "INSERT INTO event_samples (event_id, source, schema, received_at, fields, raw) VALUES ($1, $2, $3, $4, $5, $6)",
                 )
@@ -457,11 +446,14 @@ mod tests {
     #[test]
     fn recent_ids_window() {
         let mut r = RecentIds::new(Duration::from_secs(60), 3);
-        assert!(!r.seen("a"));
-        assert!(r.seen("a"));
-        for id in ["b", "c", "d", "e"] {
+        assert!(!r.seen("http:a"));
+        assert!(r.seen("http:a"));
+        for id in ["http:b", "http:c", "orders:topic:0:1", "kafka:e"] {
             assert!(!r.seen(id));
         }
-        assert!(!r.seen("a"), "evicted past the cap");
+        assert!(r.seen("orders:topic:0:1"), "custom Kafka source ids without kafka: prefix are still tracked");
+        assert!(!r.seen("http:a"), "evicted past the cap");
+        let uuid = uuid::Uuid::now_v7().to_string();
+        assert!(!r.seen(&uuid) && !r.seen(&uuid), "server UUIDs are not tracked");
     }
 }

@@ -250,8 +250,10 @@ async fn main() -> Result<()> {
             Role::Api => {
                 // No real auth yet (demo session), so local-only unless asked.
                 let addr = env_or("API_ADDR", "127.0.0.1:8080");
+                // The demo user is an admin unless BEACON_DEMO_ADMIN=false.
+                let admin = env_or("BEACON_DEMO_ADMIN", "true") != "false";
                 let session = std::sync::Arc::new(
-                    beacon_api::Session::demo(&config_dir, &env_or("BEACON_DEMO_USER", "anna"))
+                    beacon_api::Session::demo_with(&config_dir, &env_or("BEACON_DEMO_USER", "anna"), admin)
                         .context("building the demo session from config/people and config/teams")?,
                 );
                 let (updates, _) = tokio::sync::broadcast::channel(beacon_api::feed::CHANNEL_CAPACITY);
@@ -263,7 +265,8 @@ async fn main() -> Result<()> {
                 beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
                 let schemas = std::sync::Arc::new(beacon_engine::config_store::load_schemas(&config_dir)?);
                 let sources = std::sync::Arc::new(beacon_ingest::kafka_source::load_sources(&config_dir.join("sources"))?);
-                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, schemas, sources };
+                let streams = std::sync::Arc::new(tokio::sync::Semaphore::new(beacon_api::MAX_STREAMS));
+                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, schemas, sources, streams };
                 // Same-origin ingest for the UI's sample replay (CSRF-gated).
                 let same_origin_ingest = {
                     let publisher = beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
