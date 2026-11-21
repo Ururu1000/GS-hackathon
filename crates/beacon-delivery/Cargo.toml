@@ -35,3 +35,6 @@ humantime-serde.workspace = true
 # already pinned in the workspace Cargo.lock (transitive deps of axum).
 tower = "0.5.3"
 http-body-util = "0.1.5"
+# The delivery_latency example (SPEC §9 M6) parses its CLI with clap, pinned to the
+# workspace version already in Cargo.lock (used by beacon-loadgen).
+clap = { workspace = true }

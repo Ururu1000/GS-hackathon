@@ -581,8 +581,10 @@ async fn replies_outside_the_replay_window_are_unauthorized(pool: PgPool) {
     .await;
     assert_eq!(status, 200, "{res}");
 
-    // Outside it — old or future — even a perfectly signed reply is 401.
-    for ts in [now - 301, now - 3_600, now + 301, now + 3_600] {
+    // Outside it — old or future — even a perfectly signed reply is 401. The margin is
+    // 30 s, not 1 s: `now` is read once, and as the test runs the server's clock moves
+    // toward a future timestamp (a `now + 301` reply is inside the window a second later).
+    for ts in [now - 330, now - 3_600, now + 330, now + 3_600] {
         let (status, res) =
             post_raw(&url, payload.clone(), &signed_reply(&secret, ts, &payload)).await;
         assert_eq!(status, 401, "ts {ts}: {res}");

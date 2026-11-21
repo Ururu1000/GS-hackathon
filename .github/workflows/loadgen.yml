@@ -1,0 +1,120 @@
+# Ingest -> delivery latency under beacon-loadgen (SPEC §9, M6). Not part of the PR checks.
+# - Manual: Actions -> loadgen -> Run workflow (needs this file on the default branch).
+# - Any branch: push a commit to `ci-run/m6-latency` to run it on that code.
+# For each rate, beacon-loadgen (open loop, alexey's harness) drives ingest; then
+# examples/delivery_latency.rs reconciles that run's alerts against gateway receipts and
+# Mailpit and reports ingest -> delivery p50/p90/p99/max per channel, with the workload.
+name: loadgen
+
+on:
+  workflow_dispatch:
+    inputs:
+      rates:
+        description: Loadgen rates in events/s, space separated
+        default: "200 2000"
+      duration:
+        description: Seconds per loadgen run
+        default: "30"
+  push:
+    branches: ["ci-run/m6-latency"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loadgen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  loadgen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      DATABASE_URL: postgres://beacon:beacon@localhost:5432/beacon
+      BEACON_KAFKA: localhost:19092
+      MAILPIT_URL: http://localhost:8025
+      RATES: ${{ inputs.rates || '200 2000' }}
+      DURATION: ${{ inputs.duration || '30' }}
+      # The stated workload; every report carries the full command line.
+      LG_BATCH: "100"
+      LG_DISTINCT_KEYS: "1000"
+      LG_MATCH_RATIO: "0.8"
+      LG_CONCURRENCY: "256"
+      LG_DRAIN: "15"
+    defaults:
+      run:
+        shell: bash  # -eo pipefail: a failure is not lost through `tee`
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librdkafka build)
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loadgen-release
+      - name: Start Postgres, Mailpit and Redpanda
+        run: docker compose -f deploy/docker-compose.yml up -d --wait
+      - name: Build release beacon, beacon-loadgen and delivery_latency
+        run: |
+          cargo build --locked --release -p beacon -p beacon-loadgen
+          cargo build --locked --release -p beacon-delivery --example delivery_latency
+      - name: delivery_latency unit tests
+        run: cargo test --locked --release -p beacon-delivery --example delivery_latency
+      - name: Start beacon (ingest .. delivery + fake gateway)
+        run: |
+          nohup ./target/release/beacon --migrate \
+            --role ingest,matcher,aggregator,relay,router,delivery,gateway > beacon.log 2>&1 &
+          for i in $(seq 1 120); do
+            if curl -s -o /dev/null http://127.0.0.1:8070/api/simulator/outage && curl -s -o /dev/null http://127.0.0.1:8090/; then
+              echo "stack ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "beacon did not become ready"; tail -50 beacon.log; exit 1
+      - name: Hardware
+        run: |
+          {
+            echo "## Hardware"
+            echo '```'
+            echo "runner: ubuntu-latest, $(nproc) vCPU"
+            lscpu | grep -E 'Model name' || true
+            free -h | head -2
+            echo "commit: $(git rev-parse --short HEAD)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Loadgen runs + delivery latency
+        run: |
+          status=0
+          mkdir -p results
+          for rate in $RATES; do
+            out="results/loadgen-$rate"
+            args="--rate $rate --duration $DURATION --batch $LG_BATCH --distinct-keys $LG_DISTINCT_KEYS --match-ratio $LG_MATCH_RATIO --concurrency $LG_CONCURRENCY --drain $LG_DRAIN --scenario m6-delivery-$rate --out $out"
+            ./target/release/beacon-loadgen $args | tee "results/loadgen-$rate.log" || status=1
+            # A failed loadgen run must not end the step: record it, go on to the next rate.
+            report=$(ls "$out"/*.md 2>/dev/null | head -1) || true
+            run_id=$( { head -1 "$report" | grep -o '([0-9a-f]\{12\})' | tr -d '()'; } 2>/dev/null) || true
+            if [ -z "$report" ] || [ -z "$run_id" ]; then
+              echo "## beacon-loadgen at $rate events/s: no report / run id (see results/loadgen-$rate.log)" >> "$GITHUB_STEP_SUMMARY"
+              status=1; continue
+            fi
+            echo "rate $rate: run $run_id ($report)"
+            ./target/release/examples/delivery_latency --run-id "$run_id" --wait-secs 300 \
+              --scenario "m6-delivery-$rate" --workload "beacon-loadgen $args" \
+              --out "results/delivery-$rate.md" --json "results/delivery-$rate.json" || status=1
+            {
+              echo "## beacon-loadgen at $rate events/s"
+              cat "$report"
+              cat "results/delivery-$rate.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$status"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loadgen-results
+          path: |
+            results/
+            beacon.log
+          if-no-files-found: warn
