@@ -52,8 +52,13 @@ export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Pr
   const [show, setShow] = useState<'pending' | 'all'>('pending')
   const [busy, setBusy] = useState<string | null>(null)
 
-  const load = () => Promise.all([listProposals(team, 'pending'), listProposals(team)])
-    .then(([pending, all]) => setLists({ pending, all }), (e: unknown) => setError(errorText(e)))
+  // Each list renders on its own: a failed All request must not hide the queue.
+  const load = () => Promise.allSettled([listProposals(team, 'pending'), listProposals(team)]).then(([pending, all]) => {
+    const failed = [pending, all].find((r) => r.status === 'rejected')
+    setError(failed ? errorText(failed.reason) : null)
+    if (pending.status === 'fulfilled' || all.status === 'fulfilled')
+      setLists({ pending: pending.status === 'fulfilled' ? pending.value : [], all: all.status === 'fulfilled' ? all.value : [] })
+  })
   useEffect(() => {
     setLists(null)
     setError(null)

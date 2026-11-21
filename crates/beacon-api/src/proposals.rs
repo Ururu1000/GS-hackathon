@@ -28,8 +28,9 @@ use crate::error::ApiError;
 const KINDS: &[&str] = &["noisy", "reroute", "template", "other"];
 const STATES: &[&str] = &["pending", "accepted", "rejected", "stale"];
 const MAX_BODY: usize = 128 * 1024;
-/// Newest proposals returned by a list call. With [`MAX_STORED_RULES`] per
-/// row this bounds a list response to roughly 15 MB.
+/// Newest proposals returned by a list call. Per row: [`MAX_STORED_RULES`] of
+/// rule bodies, plus a rule name (up to ~64 KiB) and a note (4000 chars, up to
+/// ~24 KB escaped), so a list response stays under about 22 MB.
 const LIST_LIMIT: i64 = 100;
 /// Both rule bodies of a proposal, measured as Postgres stores and returns
 /// them: jsonb prints numbers in full (`1e308` comes back as 309 digits), so
