@@ -346,6 +346,8 @@ it('starts, lists and ends a demo gateway outage', async () => {
   expect((await request('/api/simulator/outage')).outages).toHaveLength(1)
   await request('/api/simulator/outage?channel=fax', 400, 'DELETE')
   expect(await request('/api/simulator/outage?channel=sms', 200, 'DELETE')).toEqual({ outages: [] })
+})
+
 it('suggests a mapping for a pasted event without storing it', async () => {
   const before = await request('/api/schemas')
   const event = { alertname: 'DiskFull', level: 'WARN', labels: { service: 'ledger', env: 'prod' }, ts: 1763700000, summary: 'Disk 95% full' }
