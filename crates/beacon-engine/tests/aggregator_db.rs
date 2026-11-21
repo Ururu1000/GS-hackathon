@@ -202,4 +202,9 @@ async fn fenced_checkpoints(pool: PgPool) {
     assert_eq!(count, 15);
     let next: i64 = sqlx::query_scalar("SELECT next_offset FROM checkpoints WHERE partition = 3").fetch_one(&pool).await.unwrap();
     assert_eq!(next, 15);
+    // A retry of the same batch after a lost commit acknowledgement is a no-op.
+    let again = apply_batch_fenced(&pool, &b2, &[Fence { partition: 3, epoch: e2, next_offset: 15 }]).await.unwrap();
+    assert!(again.is_ok(), "already applied is not a fence error");
+    let count: i64 = sqlx::query_scalar("SELECT count FROM alerts").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 15, "the retried batch is not applied twice");
 }

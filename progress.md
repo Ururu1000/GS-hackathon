@@ -22,7 +22,8 @@ Last updated: 2026-11-21.
 | Rules in Postgres, live reload, rules / test panel / schemas API | Done | PR #13 |
 | One-command `docker compose up --build` | Done, verified end to end | PR #13 |
 | Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
-| Kafka-mode load test, exact counts under replay (M1) | Later | |
+| Exact counts under replay and crashes (M1) | Done: scenario e exact | PR #15 |
+| Kafka-mode load test | Later | |
 
 PR merge order: #5 → #8 → #7 → #9 → #11 → #12 → #13. Each PR is stacked on the previous one.
 
@@ -91,6 +92,13 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
 - **The UI** is served at http://localhost:8080.
 - **Delivery sent 3 emails to Mailpit** (http://localhost:8025): Anna for `HighErrorRate`, Erin and Bob for the rejected rates trade.
 
+## Exact counts (M1)
+
+Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
+- Main run: 199,999 matching events accepted, and the alert counts total 200,000 (+1 warm-up probe). Nothing was lost or doubled.
+- The tester agent repeated it with one kill and with two kills: both exact.
+- Exactly-once costs about 170 ms of p99 at 20k events/s on a loaded laptop. See [loadtest/README.md](loadtest/README.md).
+
 ## Reviews and testing
 
 - **After each milestone:** an independent tester agent ran the tests, an end-to-end run and a code review. Every finding was fixed or explained.
@@ -123,7 +131,11 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
 
 ## Known limitations
 
-- **Pipeline delivery is at-least-once.** A crash replay or a repeated `Idempotency-Key` can bump a count twice. Exact counts are M1.
+- **Exactly-once covers the matcher and aggregator** (Kafka transactions plus fenced Postgres checkpoints).
+  - Duplicate event ids are dropped within a bounded window per matcher. That is 200k ids, about 80 s at 20k ev/s.
+  - A client that retries without an `Idempotency-Key` can still double-count.
+  - After a crash, processing pauses up to about 10 s while the dead matcher's transaction times out.
+- **A deleted and recreated `alerts.matches` topic** is not detected. Stored checkpoints would skip the new topic's first offsets.
 - **Rare event reorderings can merge incidents.** An older fire arriving after a newer one, across batches, merges two incidents into one. The open/resolved state stays correct; only history is affected.
 - **Schema mappings are read-only through the API for now.** They come from `config/schemas`, and edits arrive with the schemas write endpoints.
 - **The demo session is a fixed user** (`BEACON_DEMO_USER`, default `anna`). There is no real authentication yet, so the API listens on localhost by default.

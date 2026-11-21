@@ -115,6 +115,22 @@ async fn run_transactional(
         .set("queue.buffering.max.messages", "500000")
         .create()?;
     tokio::task::block_in_place(|| producer.init_transactions(TXN_TIMEOUT))?;
+    let res = transactional_loop(&consumer, &producer, config, samples, &mut shutdown).await;
+    if res.is_err() {
+        // Don't leave an open transaction stalling read_committed readers.
+        let _ = tokio::task::block_in_place(|| producer.abort_transaction(TXN_TIMEOUT));
+    }
+    res
+}
+
+async fn transactional_loop(
+    consumer: &StreamConsumer,
+    producer: &FutureProducer,
+    config: watch::Receiver<Arc<ConfigSnapshot>>,
+    samples: Option<SampleSink>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    use rdkafka::producer::Producer;
     {
         let c = config.borrow();
         info!(revision = c.revision, rules = c.rules.len(), schemas = c.mappings.len(), "matcher started (transactional)");
@@ -162,7 +178,7 @@ async fn run_transactional(
                         for rec in matches {
                             let (key, payload) = encode_bounded(rec)?;
                             // The transaction commit waits for delivery.
-                            drop(send(&producer, &key, payload).await?);
+                            drop(send(producer, &key, payload).await?);
                         }
                     }
                     Some(Err(e)) => error!(offset = m.offset(), error = %e, "undecodable event in events.raw; skipped"),
@@ -171,12 +187,12 @@ async fn run_transactional(
             }
         }
         if in_txn && (in_batch >= FLUSH_EVERY || batch_start.elapsed() >= txn_flush) {
-            commit_txn(&consumer, &producer, &mut offsets)?;
+            commit_txn(consumer, producer, &mut offsets)?;
             in_txn = false;
         }
     }
     if in_txn {
-        commit_txn(&consumer, &producer, &mut offsets)?;
+        commit_txn(consumer, producer, &mut offsets)?;
     }
     Ok(())
 }
@@ -217,6 +233,7 @@ async fn run_at_least_once(
         info!(revision = c.revision, rules = c.rules.len(), schemas = c.mappings.len(), "matcher started");
     }
 
+    let mut recent = RecentIds::new(RECENT_ID_TTL, RECENT_ID_CAP);
     let mut pending: Vec<DeliveryFuture> = Vec::new();
     let mut offsets: HashMap<i32, i64> = HashMap::new();
     let mut last_flush = Instant::now();
@@ -242,6 +259,7 @@ async fn run_at_least_once(
                 seen += 1;
                 offsets.insert(m.partition(), m.offset());
                 match m.payload().map(serde_json::from_slice::<Event>) {
+                    Some(Ok(event)) if recent.seen(&event.id) => {}
                     Some(Ok(event)) => {
                         let snapshot = config.borrow().clone();
                         let (event, matches, diags) = snapshot.process(event);

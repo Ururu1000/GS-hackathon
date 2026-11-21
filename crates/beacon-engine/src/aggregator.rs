@@ -487,9 +487,10 @@ pub async fn apply_batch_fenced(pool: &PgPool, batch: &[MatchRecord], fences: &[
         let epochs: Vec<i64> = fences.iter().map(|f| f.epoch).collect();
         let nexts: Vec<i64> = fences.iter().map(|f| f.next_offset).collect();
         let advanced = sqlx::query(
-            "UPDATE checkpoints c SET next_offset = GREATEST(c.next_offset, f.next), updated_at = now()
+            "UPDATE checkpoints c SET next_offset = f.next, updated_at = now()
              FROM unnest($3::int[], $4::bigint[], $5::bigint[]) AS f(part, epoch, next)
-             WHERE c.pipeline = $1 AND c.topic = $2 AND c.partition = f.part AND c.epoch = f.epoch",
+             WHERE c.pipeline = $1 AND c.topic = $2 AND c.partition = f.part AND c.epoch = f.epoch
+               AND c.next_offset < f.next",
         )
         .bind(CHECKPOINT_PIPELINE)
         .bind(ALERTS_MATCHES)
@@ -502,6 +503,28 @@ pub async fn apply_batch_fenced(pool: &PgPool, batch: &[MatchRecord], fences: &[
         .rows_affected();
         if advanced != fences.len() as u64 {
             tx.rollback().await?;
+            // Either a newer owner took a partition, or this exact batch was
+            // already committed and only the acknowledgement was lost (the
+            // retry after an ambiguous commit). Only the latter is fine.
+            let rows = sqlx::query(
+                "SELECT partition, epoch, next_offset FROM checkpoints
+                 WHERE pipeline = $1 AND topic = $2 AND partition = ANY($3)",
+            )
+            .bind(CHECKPOINT_PIPELINE)
+            .bind(ALERTS_MATCHES)
+            .bind(&parts)
+            .fetch_all(pool)
+            .await?;
+            let already = fences.iter().all(|f| {
+                rows.iter().any(|r| {
+                    r.get::<i32, _>("partition") == f.partition
+                        && r.get::<i64, _>("epoch") == f.epoch
+                        && r.get::<i64, _>("next_offset") >= f.next_offset
+                })
+            });
+            if already {
+                return Ok(Ok(Plan::default()));
+            }
             return Ok(Err(Fenced));
         }
     }
@@ -623,10 +646,10 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
         let mut batch = Vec::with_capacity(msgs.len());
         for m in &msgs {
             let p = m.partition();
-            if !owned.contains_key(&p) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = owned.entry(p) {
                 let claim = claim_partition(&pool, p).await?;
                 info!(partition = p, epoch = claim.0, next_offset = claim.1, "claimed partition");
-                owned.insert(p, claim);
+                slot.insert(claim);
             }
             let (epoch, next) = owned[&p];
             let f = fences.entry(p).or_insert(Fence { partition: p, epoch, next_offset: next });
