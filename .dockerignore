@@ -6,3 +6,7 @@ ui/dist/
 loadtest/results/
 *.log
 .DS_Store
+.env
+.env.*
+!.env.example
+CLAUDE.local.md

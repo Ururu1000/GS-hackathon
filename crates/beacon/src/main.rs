@@ -40,7 +40,7 @@
 //! | `SUGGEST_MIN_ALERTS` | `20` (noisy: alerts in the lookback)      | aggregator        |
 //! | `SUGGEST_LOOKBACK_HOURS` | `168` (7 days)                        | aggregator        |
 //! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
-//! | `API_ALLOWED_HOSTS`  | unset; extra `Host` names the API answers (DNS-rebinding guard: `localhost`, IP literals and `PUBLIC_URL`'s host always pass; `*` = any) | api |
+//! | `API_ALLOWED_HOSTS`  | unset; extra `Host` names the API and ingest answer (DNS-rebinding guard: `localhost`, IP literals and `PUBLIC_URL`'s host always pass; `*` = any) | api, ingest |
 //! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
 //! | `BEACON_LLM`         | `off`; `mock` or `claude` turns on mapping suggestions | api |
 //! | `BEACON_LLM_MODEL`   | `claude-opus-5-5` (with `BEACON_LLM=claude`, needs `ANTHROPIC_API_KEY`) | api |
@@ -289,6 +289,10 @@ async fn main() -> Result<()> {
                 let state = beacon_ingest::http::IngestState::new(publisher, max_inflight);
                 let token = std::env::var("INGEST_TOKEN").ok().filter(|t| !t.is_empty());
                 let app = beacon_ingest::http::router_with_token(state, token.clone());
+                // Same DNS-rebinding guard as the API: a page on another domain that
+                // re-resolves to this port can't inject events (callers by name need
+                // API_ALLOWED_HOSTS).
+                let app = beacon_api::host_guard(app, beacon_api::AllowedHosts::from_env());
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("binding {addr}"))?;
