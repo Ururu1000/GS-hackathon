@@ -17,6 +17,7 @@
 //! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
 //! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery, api (simulator mount) |
 //! | `ESCALATE_AFTER_OVERRIDE_MS` | unset (demo: replaces rule `escalate_after`) | router |
+//! | `ROUTER_TASKS`       | `4` (router loops sharing the outbox)     | router            |
 //! | `REPLY_SECRET`       | unset = SMS replies rejected              | gateway, api, delivery-api |
 //! | `DELIVERY_API_ADDR`  | `127.0.0.1:8071`                          | delivery-api      |
 //! | `DELIVERY_API_URL`   | this process's `API_ADDR` with the api role (and no delivery-api), else `http://127.0.0.1:8071` (reply forward) | gateway |
@@ -534,15 +535,23 @@ async fn main() -> Result<()> {
                     )),
                     Err(_) => None,
                 };
-                tasks.spawn(beacon_delivery::router::run_router(
-                    pool.clone(),
-                    Arc::new(dir),
-                    RouterConfig {
-                        escalate_after_override,
-                        ..RouterConfig::default()
-                    },
-                    shutdown_rx.clone(),
-                ));
+                // Several routers share the outbox: claims use SKIP LOCKED, inserts are
+                // idempotent and throttle buckets are locked in one order (M7). Only the
+                // first runs the throttle digest pass.
+                let router_tasks = workers("ROUTER_TASKS", "4")?;
+                let dir = Arc::new(dir);
+                for i in 0..router_tasks {
+                    tasks.spawn(beacon_delivery::router::run_router(
+                        pool.clone(),
+                        dir.clone(),
+                        RouterConfig {
+                            escalate_after_override,
+                            digest: i == 0,
+                            ..RouterConfig::default()
+                        },
+                        shutdown_rx.clone(),
+                    ));
+                }
             }
             Role::Actions => {
                 let dir_path = PathBuf::from(env_or("BEACON_CONFIG_DIR", "config"));
@@ -816,6 +825,14 @@ fn pool_size(roles: &[Role]) -> Result<u32> {
                 channels * workers.max(1) * per_worker
             }
             Role::Gateway => 4,
+            // One connection per router task while it holds its batch transaction, plus the
+            // directory stamp read and the digest pass.
+            Role::Router => {
+                let tasks: u32 = env_or("ROUTER_TASKS", "4")
+                    .parse()
+                    .context("ROUTER_TASKS")?;
+                tasks.max(1) + 2
+            }
             _ => 4,
         };
     }

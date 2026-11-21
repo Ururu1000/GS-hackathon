@@ -71,17 +71,42 @@ pub async fn route_once(
         return Ok(stats);
     }
 
+    let mut parsed = Vec::with_capacity(rows.len());
     for (outbox_id, alert_id, raw) in &rows {
-        let payload: NotifyPayload = match serde_json::from_value(raw.clone()) {
-            Ok(p) => p,
+        match serde_json::from_value::<NotifyPayload>(raw.clone()) {
+            Ok(payload) => {
+                let policy = dir.rules.for_payload(&payload.rule_id, raw);
+                parsed.push((*outbox_id, *alert_id, raw, payload, policy));
+            }
             Err(err) => {
                 // Still marked processed below: a poison row must not block the queue.
                 warn!(outbox_id, %alert_id, %err, "malformed notify payload, dropping");
                 stats.malformed += 1;
-                continue;
             }
+        }
+    }
+
+    // Several router tasks may run (M7, `ROUTER_TASKS`): lock every throttle bucket this
+    // batch could debit, in one sorted order, before any `take` (see `throttle::lock_buckets`).
+    // The set is a superset of what the loop below takes (the same `expand` per entry).
+    let mut bucket_keys: Vec<(&str, &str, throttle::ThrottleSpec)> = Vec::new();
+    for (_, _, _, payload, policy) in &parsed {
+        let Some(spec) = policy.throttle else {
+            continue;
         };
-        let ctx = routing_context(&payload, raw);
+        for entry in &payload.route {
+            if let Ok(people) = dir.expand(&entry.to) {
+                for person in people {
+                    bucket_keys.push((&payload.rule_id, &person.id, spec));
+                }
+            }
+        }
+    }
+    throttle::lock_buckets(&mut tx, &bucket_keys).await?;
+
+    for (outbox_id, alert_id, raw, payload, policy) in &parsed {
+        let (outbox_id, alert_id, raw) = (*outbox_id, alert_id, *raw);
+        let ctx = routing_context(payload, raw);
 
         // (person, channel) pairs already planned for this payload: a person reached by
         // several entries gets the union of channels, and the first decision for a pair
@@ -90,7 +115,6 @@ pub async fn route_once(
         // Planned jobs per person (ordered for deterministic inserts); written after the
         // throttle decision below (M5a: one token per recipient notification).
         let mut planned_by_person: BTreeMap<String, Vec<PlannedJob>> = BTreeMap::new();
-        let policy = dir.rules.for_payload(&payload.rule_id, raw);
 
         for entry in &payload.route {
             let people = match dir.expand(&entry.to) {
@@ -336,6 +360,14 @@ fn team_for_target<'a>(
     }
 }
 
+/// Postgres `40P01` (deadlock detected) or `40001` (serialization failure): the transaction
+/// was aborted as a whole and can simply run again.
+fn is_retryable_conflict(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == "40P01" || code == "40001")
+}
+
 /// Loop `route_once` until shutdown. Polls again immediately after a full batch, otherwise
 /// sleeps `cfg.poll_interval`. Logs and backs off on DB errors instead of exiting.
 ///
@@ -345,12 +377,15 @@ fn team_for_target<'a>(
 pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, shutdown: Shutdown) {
     let mut shutdown = shutdown;
     let effective = Arc::new(crate::overrides::EffectiveDirectory::new(dir));
+    let mut conflicts: u64 = 0;
     while !*shutdown.borrow() {
         // Throttle digests ride along with routing: cheap when nothing is parked.
-        match throttle::digest_once(&pool, 100).await {
-            Ok(d) if d.digests > 0 => debug!(?d, "throttle digests"),
-            Ok(_) => {}
-            Err(err) => error!(%err, "throttle digest pass failed"),
+        if cfg.digest {
+            match throttle::digest_once(&pool, 100).await {
+                Ok(d) if d.digests > 0 => debug!(?d, "throttle digests"),
+                Ok(_) => {}
+                Err(err) => error!(%err, "throttle digest pass failed"),
+            }
         }
         let dir = effective.get(&pool).await;
         let wait = match route_once(&pool, &dir, &cfg).await {
@@ -362,6 +397,13 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
                     continue; // full batch: more is probably waiting
                 }
                 cfg.poll_interval
+            }
+            // A deadlock or serialization failure rolled the whole batch back (nothing was
+            // marked processed): retry it right away instead of waiting out the error backoff.
+            Err(err) if is_retryable_conflict(&err) => {
+                conflicts += 1;
+                warn!(%err, conflicts, "router batch hit a lock conflict, retrying");
+                Duration::from_millis(10)
             }
             Err(err) => {
                 error!(%err, "router batch failed, retrying in 1s");
