@@ -66,7 +66,7 @@ Everything below was measured, not estimated. Each row lists its hardware, workl
 
 ### Throughput
 
-The workload is `beacon-loadgen --duration 30 --batch 100 --distinct-keys 1000 --match-ratio 0.8 --concurrency 256`. It sends open-loop HTTP batches of all four sample event types, and 80% of the events match a rule. It ran on *CI* through `.github/workflows/loadgen.yml`. Each latency starts at server ingest of the first event for an alert key, not at every event. All figures are p50 / p99 in milliseconds.
+The workload is `beacon-loadgen --duration 30 --batch 100 --distinct-keys 1000 --match-ratio 0.8 --concurrency 256`. It sends open-loop HTTP batches of all four sample event types, and 80% of the events match a rule. It ran on *CI* through `.github/workflows/loadgen.yml`. Each latency starts at server ingest of the first event for an alert key, not at every event. All figures are p50 / p99 in milliseconds. The per-channel tables and the bottleneck analysis are in [docs/DELIVERY.md](docs/DELIVERY.md#under-beacon-loadgen-200-and-2000-eventss).
 
 | Target rate | Commit, run | Accepted | Processed | Ingest → alert | Ingest → gateway (sms) | Ingest → Mailpit | Delivered |
 |---|---|---|---|---:|---:|---:|---|
