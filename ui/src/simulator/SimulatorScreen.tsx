@@ -146,21 +146,14 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
 
   return (
     <div className="screen feature-screen">
-      <header className="screen-head">
-        <div className="screen-title">
-          <h1>Device simulator</h1>
-          <span className="muted small">SMS and phone calls Beacon sent through the demo gateway. Reply to an SMS to approve or acknowledge.</span>
-        </div>
-        <span className="spacer" />
-        <div className={connected ? 'sr-only' : 'conn conn-down'} role="status">{connected ? 'Gateway connected' : 'Gateway disconnected'}</div>
-        {MAILPIT_URL && <a className="btn" href={MAILPIT_URL} target="_blank" rel="noopener noreferrer">Open Mailpit</a>}
-      </header>
+      <h1 className="sr-only">Device simulator</h1>
       <div className="feature-body">
       {error && <div className="notice notice-error" role="alert">{error}</div>}
       <div className="feature-columns simulator-layout">
         <section className="feature-card">
-          <div className="card-head">
+          <div className="card-head simulator-inbox-head">
             <h2>Inbox {page && <span className="count">{items.length}</span>}</h2>
+            <span className={connected ? 'sr-only' : 'conn conn-down'} role="status">{connected ? 'Gateway connected' : 'Gateway disconnected'}</span>
             <span className="spacer" />
             <label>
               <span className="sr-only">Recipient</span>
@@ -169,6 +162,7 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
                 {recipients.map((name) => <option key={name} value={name}>{name.replace(/^user:/, '')}</option>)}
               </select>
             </label>
+            {MAILPIT_URL && <a className="btn btn-sm" href={MAILPIT_URL} target="_blank" rel="noopener noreferrer">Open Mailpit</a>}
           </div>
           {items.length ? <ul className="simulator-inbox">
             {items.map((item) => (

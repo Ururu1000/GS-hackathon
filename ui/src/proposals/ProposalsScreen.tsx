@@ -94,26 +94,20 @@ export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Pr
 
   return (
     <div className="screen">
-      <header className="screen-head">
-        <div className="screen-title">
-          <h1>Proposals</h1>
-          <span className="muted small">Changes people (and Beacon) suggested for alert rules. The rule’s team reviews them.</span>
-        </div>
-        <span className="spacer" />
-        <div className="chips" role="group" aria-label="Show">
+      <h1 className="sr-only">Proposals</h1>
+      <div className="proposal-list">
+        <div className="chips" role="group" aria-label="Filter proposals">
           <button className="chip" aria-pressed={show === 'pending'} onClick={() => setShow('pending')}>Waiting <span className="chip-n">{pending}</span></button>
           <button className="chip" aria-pressed={show === 'all'} onClick={() => setShow('all')}>All <span className="chip-n">{lists?.all.length ?? 0}</span></button>
         </div>
-      </header>
-      {error && <div className="notice notice-error banner">Couldn’t load proposals: {error}</div>}
-      {!items && !error && <div className="empty"><p>Loading…</p></div>}
-      {items && shown.length === 0 && (
-        <div className="empty">
-          <p>{show === 'pending' ? 'Nothing waiting for review.' : 'No proposals yet.'}</p>
-          <p className="small">Open an alert and choose “Suggest a change” when it’s too noisy, goes to the wrong people, or is missing information.</p>
-        </div>
-      )}
-      <div className="proposal-list">
+        {error && <div className="notice notice-error">Couldn’t load proposals: {error}</div>}
+        {!items && !error && <div className="empty"><p>Loading…</p></div>}
+        {items && shown.length === 0 && (
+          <div className="empty">
+            <p>{show === 'pending' ? 'Nothing waiting for review.' : 'No proposals yet.'}</p>
+            <p className="small">Open an alert and choose “Suggest a change” when it’s too noisy, goes to the wrong people, or is missing information.</p>
+          </div>
+        )}
         {shown.map((p) => (
           <article key={p.id} id={`proposal-${p.id}`} className={`proposal state-${p.state} ${p.id === id ? 'is-target' : ''}`} aria-labelledby={`ph-${p.id}`}>
             <header className="proposal-head">

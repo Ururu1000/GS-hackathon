@@ -79,12 +79,7 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
 
   return (
     <div className="screen feature-screen">
-      <header className="screen-head">
-        <div className="screen-title">
-          <h1>Runbooks</h1>
-          <span className="muted small">Step-by-step checklists that responders follow from an alert. Attach one to a rule in the rule editor.</span>
-        </div>
-      </header>
+      <h1 className="sr-only">Runbooks</h1>
       <div className="feature-body">
       {!canImport && <div className="notice">The live service loads runbooks from its configuration.</div>}
       {!canImport && problem && <div className="notice notice-error" role="alert">{problem}</div>}

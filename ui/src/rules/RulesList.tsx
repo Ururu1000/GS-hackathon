@@ -61,22 +61,17 @@ export function RulesList({ team, teamName, onNavigate }: Props) {
   const now = Date.now()
   return (
     <div className="screen">
-      <header className="screen-head">
-        <div className="screen-title">
-          <h1>Rules</h1>
-          <span className="muted small">Which events become alerts for {team ? teamName : 'each team'}, who hears about them, and how they look.</span>
-        </div>
-        <span className="spacer" />
+      <h1 className="sr-only">Rules</h1>
+      <div className="inline rules-controls">
         <input className="input" type="search" placeholder="Find a rule" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Find a rule" />
         <button className="btn btn-primary" onClick={() => setPicking(true)}>New rule</button>
-      </header>
+      </div>
 
       {error && <div className="notice notice-error banner">Couldn’t load rules: {error}</div>}
       {!items && !error && <div className="empty"><p>Loading…</p></div>}
       {items && shown.length === 0 && (
         <div className="empty">
           <p>{items.length === 0 ? `No rules for ${teamName} yet.` : 'No rule matches that search.'}</p>
-          {items.length === 0 && <button className="btn btn-primary" onClick={() => setPicking(true)}>Create the first one</button>}
         </div>
       )}
       {shown.length > 0 && (

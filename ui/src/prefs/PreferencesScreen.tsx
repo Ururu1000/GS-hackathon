@@ -43,12 +43,7 @@ export function PreferencesScreen({ kind, id, me, onNavigate, onToast }: Props) 
 
   return (
     <div className="screen">
-      <header className="screen-head">
-        <div className="screen-title">
-          <h1>Preferences</h1>
-          <span className="muted small">Who gets alerts on which channel. Rules can name channels explicitly; otherwise these decide.</span>
-        </div>
-      </header>
+      <h1 className="sr-only">Preferences</h1>
       {error && <div className="notice notice-error banner">Couldn’t load people and teams: {error}</div>}
       <div className="split">
         <nav className="side-list" aria-label="People and teams">
