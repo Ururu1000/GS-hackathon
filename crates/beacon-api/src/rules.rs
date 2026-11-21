@@ -171,7 +171,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes, what: &str) -> Resul
 
 /// Writers must be able to see (own) the rule's team, before and after, and
 /// may only route to teams/schedules they can see (or themselves).
-fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
+pub(crate) fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
     let t = team_of(spec);
     if !(t.is_empty() || state.session.can_see(&t)) {
         return Err(ApiError::forbidden(format!("you can't publish rules for team `{t}`")));
@@ -211,11 +211,11 @@ async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
         .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {limit} bytes")))
 }
 
-fn require_admin(state: &ApiState) -> Result<(), ApiError> {
+fn require_admin(state: &ApiState, what: &str) -> Result<(), ApiError> {
     if state.session.admin {
         Ok(())
     } else {
-        Err(ApiError::forbidden("events from every source are visible to admins only"))
+        Err(ApiError::forbidden(format!("{what} is limited to admins")))
     }
 }
 
@@ -369,7 +369,7 @@ fn render(v: &Value) -> String {
 }
 
 pub async fn recent_events(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
-    require_admin(&state)?;
+    require_admin(&state, "seeing events from every source")?;
     let limit: i64 = query_param(raw.as_deref(), "limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 50);
     let rows = sqlx::query(
         "SELECT event_id, source, schema, received_at, raw FROM event_samples ORDER BY id DESC LIMIT $1",
@@ -414,7 +414,7 @@ struct SchemaWrite {
 pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     state.session.check_csrf(&headers)?;
     check_body(&body)?;
-    require_admin(&state)?;
+    require_admin(&state, "publishing schema mappings")?;
     let b: SchemaWrite = parse_body(&body, "{\"spec\": {...}, \"expected_revision\"?: <int>}")?;
     match config_store::save_schema(&state.pool, &b.spec, b.expected_revision, &state.session.actor()).await? {
         Ok((s, created)) => {
@@ -468,7 +468,7 @@ pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, b
 }
 
 pub async fn discovered(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    require_admin(&state)?;
+    require_admin(&state, "seeing events from every source")?;
     let rows = sqlx::query(
         "SELECT DISTINCT ON (schema) schema, source, raw,
                 count(*) OVER (PARTITION BY schema) AS count,

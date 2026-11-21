@@ -162,9 +162,9 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Byt
     if spec.id != b.rule_id {
         return Err(invalid("proposed_rule.id", "must be the rule being changed"));
     }
-    if !state.session.can_see(&spec.team) {
-        return Err(ApiError::forbidden(format!("you can't move rules to team `{}`", spec.team)));
-    }
+    // Same team and routing rules as a direct edit.
+    crate::rules::check_team(&state, &b.proposed_rule)?;
+    let _ = &spec;
     let name = current.spec.get("name").and_then(Value::as_str).unwrap_or(&b.rule_id).to_string();
     let id = Uuid::now_v7();
     let row = sqlx::query(&format!(
@@ -195,9 +195,13 @@ pub async fn decide(State(state): State<ApiState>, headers: HeaderMap, Path((id,
     if decision != "accept" && decision != "reject" {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "decision must be accept or reject"));
     }
-    let row = sqlx::query(&format!("SELECT {COLUMNS} FROM proposals WHERE id = $1"))
+    // One transaction: the proposal row is locked, so a concurrent accept and
+    // reject can't both act, and an accepted rule write commits together with
+    // the proposal's state.
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(&format!("SELECT {COLUMNS} FROM proposals WHERE id = $1 FOR UPDATE"))
         .bind(id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(not_found)?;
     let team: String = row.try_get("team")?;
@@ -209,16 +213,22 @@ pub async fn decide(State(state): State<ApiState>, headers: HeaderMap, Path((id,
         return Err(ApiError::conflict("invalid_state", format!("the proposal is already {st}"), view(&state, &row)?));
     }
     let actor = state.session.actor();
+    let author: String = row.try_get("author")?;
+    if author == actor && !state.session.admin {
+        return Err(ApiError::forbidden("someone other than the author has to review this proposal"));
+    }
     let new_state = if decision == "reject" {
         "rejected"
     } else {
         let proposed: Value = row.try_get("proposed_rule")?;
         let rule_id: String = row.try_get("rule_id")?;
         let base: i64 = row.try_get("base_revision")?;
-        match config_store::update(&state.pool, &rule_id, &proposed, base, &actor).await? {
+        crate::rules::check_team(&state, &proposed)?;
+        match config_store::update_in(&mut tx, &rule_id, &proposed, base, &actor).await? {
             Ok(_) => "accepted",
             Err(WriteError::Conflict(_)) | Err(WriteError::NotFound) => {
-                let stale = set_state(&state, id, "stale", &actor).await?;
+                let stale = set_state(&state, &mut tx, id, "stale", &actor).await?;
+                tx.commit().await?;
                 return Err(ApiError::conflict("revision_conflict", "the rule changed after this proposal was made", stale));
             }
             Err(WriteError::Invalid(d)) => {
@@ -228,18 +238,19 @@ pub async fn decide(State(state): State<ApiState>, headers: HeaderMap, Path((id,
             }
         }
     };
-    Ok(Json(set_state(&state, id, new_state, &actor).await?))
+    let out = set_state(&state, &mut tx, id, new_state, &actor).await?;
+    tx.commit().await?;
+    Ok(Json(out))
 }
 
-async fn set_state(state: &ApiState, id: Uuid, new_state: &str, actor: &str) -> Result<Value, ApiError> {
+async fn set_state(state: &ApiState, tx: &mut sqlx::PgConnection, id: Uuid, new_state: &str, actor: &str) -> Result<Value, ApiError> {
     let row = sqlx::query(&format!(
         "UPDATE proposals SET state = $2, decided_by = $3, decided_at = now() WHERE id = $1 AND state = 'pending' RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(new_state)
     .bind(actor)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "invalid_state", "the proposal was decided concurrently"))?;
+    .fetch_one(&mut *tx)
+    .await?;
     view(state, &row)
 }
