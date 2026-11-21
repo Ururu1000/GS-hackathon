@@ -1,0 +1,82 @@
+# Ingest -> delivery latency benchmark (SPEC §9, M6). Not part of the PR checks.
+# - Manual: Actions -> loadtest -> Run workflow (needs this file on the default branch).
+# - Any branch: push a commit to `ci-run/loadtest-<name>` to run it on that code.
+# Brings up Postgres + Mailpit + Redpanda (deploy/docker-compose.yml), builds release
+# `beacon`, runs scripts/demo_latency.sh and uploads results.json / results.md / beacon.log.
+name: loadtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: Events to post (after warmup)
+        default: "500"
+      rate:
+        description: Events per second (open loop)
+        default: "50"
+  push:
+    branches: ["ci-run/loadtest**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loadtest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  latency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      DATABASE_URL: postgres://beacon:beacon@localhost:5432/beacon
+      EVENTS: ${{ inputs.events || '500' }}
+      RATE: ${{ inputs.rate || '50' }}
+    defaults:
+      run:
+        shell: bash  # -eo pipefail: a failing benchmark fails the job even through `tee`
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies (librdkafka build)
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loadtest-release
+      - name: Start Postgres, Mailpit and Redpanda
+        run: docker compose -f deploy/docker-compose.yml up -d --wait
+      - name: Build release beacon + benchmark
+        run: cargo build --locked --release -p beacon && cargo build --locked --release -p beacon-delivery --example latency_bench
+      - name: Benchmark unit tests
+        run: cargo test --locked --release -p beacon-delivery --example latency_bench
+      - name: Start beacon (ingest .. delivery + fake gateway)
+        run: |
+          nohup ./target/release/beacon --migrate \
+            --role ingest,matcher,aggregator,relay,router,delivery,gateway > beacon.log 2>&1 &
+          for i in $(seq 1 120); do
+            if curl -s -o /dev/null http://127.0.0.1:8070/api/simulator/outage && curl -s -o /dev/null http://127.0.0.1:8090/; then
+              echo "stack ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "beacon did not become ready"; tail -50 beacon.log; exit 1
+      - name: Run the latency benchmark
+        run: |
+          status=0
+          ./scripts/demo_latency.sh --events "$EVENTS" --rate "$RATE" --out results.json | tee results.md || status=$?
+          {
+            echo "## Ingest -> delivery latency (events=$EVENTS, rate=$RATE/s, ubuntu-latest)"
+            cat results.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-results
+          path: |
+            results.json
+            results.md
+            beacon.log
+          if-no-files-found: warn

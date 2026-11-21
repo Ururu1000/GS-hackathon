@@ -78,7 +78,7 @@ cargo run -p beacon -- --migrate \
 
 ## Demos and measured results
 
-All measured on one laptop with `docker compose`, debug build.
+Measured on one laptop with `docker compose` and a debug build, except the latency row, which ran on GitHub Actions (release build).
 
 | Scenario | Result |
 |---|---|
@@ -88,8 +88,36 @@ All measured on one laptop with `docker compose`, debug build.
 | Escalation (4 s override) | unacked alert: carol (next on call) paged by phone + SMS; acked alert: timer cancelled, nobody else paged |
 | Throttle `{max: 2, per: 1m}`, 5 trades | 2 emails per person, 3 held back, then one digest each: "3 more alert(s) … were held back by throttling" |
 | Settlement-timeout runbook (SPEC M5) | health check ok → `retry_workflow` fails twice → `escalate` unlocks → approval SMS to carol → her `Y <code>` approves → `counterparty-support` (gina) emailed with the runbook steps; full audit timeline; no approval code left at rest |
+| **Ingest → delivery latency** (SPEC §9, M6), `./scripts/demo_latency.sh --events 500 --rate 50` on CI ([run 44867217055](https://github.com/Ururu1000/GS-hackathon/actions/runs/44867217055), commit `9140087`, ubuntu-latest, 2 vCPU, release build) | 500/500 events delivered, 0 missing, 0 dead. Ingest → fake-gateway receipt (sms + phone): **p50 862 ms, p90 1361 ms, p99 1751 ms, max 1970 ms**. Ingest → Mailpit email: **p50 904 ms, p90 1317 ms, p99 1542 ms, max 1578 ms**. Full table below. |
 
 Run the settlement-timeout flow by hand against the stack above. The mock workflow engine is set to fail with `POST :8070/api/simulator/mock {"target":"workflows","mode":"fail"}` plus the gateway token. Post `samples/events/workflow-failed.json` to `:8090/ingest/webhook`, then run the steps with `POST :8071/api/alerts/<id>/steps/<s1|s2|s3>/run`, and answer the approval SMS through `POST :8070/api/simulator/reply`.
+
+### Measuring ingest → delivery latency
+
+`./scripts/demo_latency.sh` (SPEC §9, M6, runs `beacon-delivery/examples/latency_bench.rs`) drives the running stack with an **open-loop** load: it posts unique `workflow-failed` (→ `oncall:settlements-primary`, phone + sms through the fake gateway) and `trade-rejected` (→ `team:rates`, email through Mailpit) sample events on a fixed schedule — never waiting for a response before the next send — and reports count/p50/p90/p99/max in ms (nearest-rank percentiles) per metric:
+
+- **ingest → gateway receipt**: `gateway_receipts.received_at − t0` for each alert's phone and sms jobs,
+- **ingest → email receipt**: the Mailpit message `Created` time − t0, falling back to `delivery_jobs.sent_at` when the message cannot be found,
+- **the internal split**: **ingest → alert** (`alerts.first_seen − t0`) and **alert → delivered** (`sent_at − first_seen`).
+
+`t0` is the client clock just before each POST; `--warmup` events prime the caches and are excluded from the stats. The report carries its workload parameters (events, rate, mix, warmup, timestamp, git commit, host CPUs) and the command exits non-zero when any expected receipt is missing or any POST failed. CI-friendly example: `./scripts/demo_latency.sh --events 200 --rate 20`; add `--out results.json` for the same report as JSON.
+
+Caveat: gateway receipts are timestamped by Postgres and email by Mailpit, so the numbers are only valid when the client, Postgres and Mailpit share a clock (same machine / NTP-synced) — the benchmark prints that warning with every run.
+
+**Measured result.** One CI run, [run 44867217055](https://github.com/Ururu1000/GS-hackathon/actions/runs/44867217055): commit `9140087`, a GitHub `ubuntu-latest` runner (2 vCPU), release `beacon --role ingest,matcher,aggregator,relay,router,delivery,gateway` and the `deploy/docker-compose.yml` services all on that runner, so every timestamp shares one clock. Workload: 500 measured events plus 20 warmup at 50 events/s, mix `both` (250 sms/phone events and 250 email events). The `results.json` artifact holds every sample.
+
+| metric (ms) | count | p50 | p90 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| ingest → gateway receipt (phone + sms jobs) | 500 | 862 | 1361 | 1751 | 1970 |
+| ingest → email receipt (Mailpit, per recipient) | 500 | 904 | 1317 | 1542 | 1578 |
+| client → ingest accept (`first_seen − t0`) | 500 | 0 | 1 | 4 | 7 |
+| accept → delivered (`sent_at − first_seen`, per job) | 1000 | 902 | 1355 | 1694 | 1973 |
+
+0 ingest errors, 0 missing alerts, receipts or Mailpit messages, 0 pending, dead or cancelled jobs, 0 fallbacks.
+
+`alerts.first_seen` is stamped with the event's `ingested_at`, so the "ingest → alert" split measures only the client → ingest accept step. Nearly all of the ~0.9 s median is in the pipeline after that: Kafka → matcher → aggregator linger → outbox relay → router → polling delivery worker → provider.
+
+Re-run it: Actions → `loadtest` → Run workflow (once this file is on `main`), or push any commit to a `ci-run/loadtest-<name>` branch.
 
 ## What is mocked
 
