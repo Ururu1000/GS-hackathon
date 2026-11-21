@@ -7,6 +7,13 @@
 //! ```
 //!
 //! `Idempotency-Key` keeps the event id stable across client retries.
+//!
+//! Every POST must say `Content-Type: application/json` (or a `+json` type;
+//! parameters such as `charset` are ignored), else `415`. A cross-site page
+//! can only send `text/plain` or form bodies without a CORS preflight, which
+//! this server never grants, so it can't make a visitor's browser inject
+//! events. [`router_with_token`] additionally requires
+//! `Authorization: Bearer <INGEST_TOKEN>` on the `/ingest` routes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +65,63 @@ impl<S: Sink> IngestState<S> {
 }
 
 pub fn router<S: Sink>(state: Arc<IngestState<S>>) -> Router {
-    ingest_routes(state).route("/ready", get(|| async { "ok" }))
+    router_with_token(state, None)
+}
+
+/// [`router`], with `/ingest/...` requiring `Authorization: Bearer <token>`
+/// when `token` is set (`/ready` stays open for health checks).
+pub fn router_with_token<S: Sink>(state: Arc<IngestState<S>>, token: Option<String>) -> Router {
+    let routes = ingest_routes(state);
+    let routes = match token {
+        Some(t) => token_gated(routes, Arc::from(t)),
+        None => routes,
+    };
+    routes.route("/ready", get(|| async { "ok" }))
+}
+
+/// Requests to `routes` need `Authorization: Bearer <token>` (constant-time compare).
+fn token_gated(routes: Router, token: Arc<str>) -> Router {
+    routes.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        let token = token.clone();
+        async move {
+            let supplied = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, t)| t.trim());
+            match supplied {
+                Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => next.run(req).await,
+                _ => {
+                    let mut r = error(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid Authorization: Bearer token");
+                    r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                    r
+                }
+            }
+        }
+    }))
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `application/json` or `application/<anything>+json`, parameters ignored.
+#[allow(clippy::result_large_err)] // the Err is a ready-made HTTP response
+fn require_json(headers: &HeaderMap) -> Result<(), Response> {
+    let media = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let json = media == "application/json" || (media.starts_with("application/") && media.ends_with("+json"));
+    if json {
+        Ok(())
+    } else {
+        Err(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "send Content-Type: application/json (curl: -H 'content-type: application/json')"))
+    }
 }
 
 /// Only the `/ingest/...` routes, for mounting next to another app.
@@ -140,6 +203,9 @@ async fn ingest_one<S: Sink>(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(r) = require_json(&headers) {
+        return r;
+    }
     if !valid_source(&source) {
         return error(StatusCode::BAD_REQUEST, "bad_source", "source must match [A-Za-z0-9-_.]{1,64}");
     }
@@ -173,6 +239,9 @@ async fn ingest_batch<S: Sink>(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(r) = require_json(&headers) {
+        return r;
+    }
     if !valid_source(&source) {
         return error(StatusCode::BAD_REQUEST, "bad_source", "source must match [A-Za-z0-9-_.]{1,64}");
     }
@@ -270,7 +339,50 @@ mod tests {
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {
-        Request::post(uri).body(Body::from(body.to_string())).unwrap()
+        Request::post(uri).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn requires_a_json_content_type() {
+        let mem = Arc::new(Mem::default());
+        let app = router(IngestState::new(mem.clone(), 10));
+        // What a cross-site page can send without a CORS preflight.
+        for ct in [None, Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("multipart/form-data; boundary=x")] {
+            let mut req = Request::post("/ingest/x");
+            if let Some(ct) = ct {
+                req = req.header("content-type", ct);
+            }
+            let (s, v) = call(app.clone(), req.body(Body::from("{}")).unwrap()).await;
+            assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{ct:?}");
+            assert_eq!(v["error"]["code"], "unsupported_media_type");
+            let batch = Request::post("/ingest/x/batch").header("content-type", ct.unwrap_or("text/plain")).body(Body::from("[{}]")).unwrap();
+            assert_eq!(call(app.clone(), batch).await.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        for ct in ["application/json", "Application/JSON; charset=utf-8", "application/cloudevents+json"] {
+            let req = Request::post("/ingest/x").header("content-type", ct).body(Body::from("{}")).unwrap();
+            assert_eq!(call(app.clone(), req).await.0, StatusCode::ACCEPTED, "{ct}");
+        }
+        assert_eq!(mem.events.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn token_guards_ingest_but_not_ready() {
+        let mem = Arc::new(Mem::default());
+        let app = router_with_token(IngestState::new(mem.clone(), 10), Some("s3cret".into()));
+        let (s, v) = call(app.clone(), post("/ingest/x", "{}")).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(v["error"]["code"], "unauthorized");
+        for auth in ["Bearer wrong", "Bearer s3cre", "Basic s3cret", "s3cret"] {
+            let mut req = post("/ingest/x/batch", "[{}]");
+            req.headers_mut().insert(header::AUTHORIZATION, auth.parse().unwrap());
+            assert_eq!(call(app.clone(), req).await.0, StatusCode::UNAUTHORIZED, "{auth}");
+        }
+        let mut req = post("/ingest/x", "{}");
+        req.headers_mut().insert(header::AUTHORIZATION, "bearer s3cret".parse().unwrap());
+        assert_eq!(call(app.clone(), req).await.0, StatusCode::ACCEPTED);
+        assert_eq!(mem.events.lock().unwrap().len(), 1);
+        let ready = app.oneshot(Request::get("/ready").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -289,7 +401,7 @@ mod tests {
     async fn idempotency_key_makes_id_stable() {
         let mem = Arc::new(Mem::default());
         let app = router(IngestState::new(mem.clone(), 10));
-        let req = Request::post("/ingest/x").header("Idempotency-Key", "abc-1").body(Body::from("{}")).unwrap();
+        let req = Request::post("/ingest/x").header("content-type", "application/json").header("Idempotency-Key", "abc-1").body(Body::from("{}")).unwrap();
         let (_, v) = call(app, req).await;
         assert_eq!(v["id"], json!("http:x:abc-1"));
     }
@@ -346,7 +458,7 @@ mod tests {
     async fn batch() {
         let mem = Arc::new(Mem::default());
         let app = router(IngestState::new(mem.clone(), 100));
-        let req = Request::post("/ingest/lg/batch").header("Idempotency-Key", "b1").body(Body::from("[{}, {\"a\": 1}]")).unwrap();
+        let req = Request::post("/ingest/lg/batch").header("content-type", "application/json").header("Idempotency-Key", "b1").body(Body::from("[{}, {\"a\": 1}]")).unwrap();
         let (s, v) = call(app.clone(), req).await;
         assert_eq!(s, StatusCode::ACCEPTED);
         assert_eq!(v["ids"], json!(["http:lg:b1-0", "http:lg:b1-1"]));

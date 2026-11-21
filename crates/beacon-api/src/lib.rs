@@ -18,6 +18,7 @@
 pub mod alerts;
 pub mod error;
 pub mod feed;
+pub mod host;
 pub mod mapping_suggest;
 pub mod proposals;
 pub mod rules;
@@ -33,6 +34,7 @@ use beacon_core::FeedAlert;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, watch};
 
+pub use host::{AllowedHosts, host_guard};
 pub use session::Session;
 
 #[derive(Clone)]

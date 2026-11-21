@@ -30,7 +30,8 @@
 //! | `DB_MAX_CONNECTIONS` | sized from the roles (see `pool_size`)    | all               |
 //! | `SHUTDOWN_GRACE_SECS`| `20` (drain time after SIGTERM/SIGINT)    | all               |
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
-//! | `INGEST_ADDR`        | `0.0.0.0:8090`                            | ingest            |
+//! | `INGEST_ADDR`        | `127.0.0.1:8090` (set `0.0.0.0:8090` in a container) | ingest |
+//! | `INGEST_TOKEN`       | unset = no auth (warns off loopback); set = `/ingest/*` needs `Authorization: Bearer` | ingest |
 //! | `INGEST_MAX_INFLIGHT`| `20000` (events in flight before 429)     | ingest            |
 //! | `MATCHER_WORKERS`    | `8` (consumers in the matcher group)      | matcher           |
 //! | `AGGREGATOR_WORKERS` | `2` (consumers in the aggregator group)   | aggregator        |
@@ -39,6 +40,7 @@
 //! | `SUGGEST_MIN_ALERTS` | `20` (noisy: alerts in the lookback)      | aggregator        |
 //! | `SUGGEST_LOOKBACK_HOURS` | `168` (7 days)                        | aggregator        |
 //! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
+//! | `API_ALLOWED_HOSTS`  | unset; extra `Host` names the API answers (DNS-rebinding guard: `localhost`, IP literals and `PUBLIC_URL`'s host always pass; `*` = any) | api |
 //! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
 //! | `BEACON_LLM`         | `off`; `mock` or `claude` turns on mapping suggestions | api |
 //! | `BEACON_LLM_MODEL`   | `claude-opus-5-5` (with `BEACON_LLM=claude`, needs `ANTHROPIC_API_KEY`) | api |
@@ -280,15 +282,24 @@ async fn main() -> Result<()> {
     for role in &args.roles {
         match role {
             Role::Ingest => {
-                let addr = env_or("INGEST_ADDR", "0.0.0.0:8090");
+                let addr = env_or("INGEST_ADDR", "127.0.0.1:8090");
                 let max_inflight = workers("INGEST_MAX_INFLIGHT", "20000")?;
                 let publisher =
                     beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
                 let state = beacon_ingest::http::IngestState::new(publisher, max_inflight);
-                let app = beacon_ingest::http::router(state);
+                let token = std::env::var("INGEST_TOKEN").ok().filter(|t| !t.is_empty());
+                let app = beacon_ingest::http::router_with_token(state, token.clone());
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("binding {addr}"))?;
+                let loopback = listener.local_addr().is_ok_and(|a| a.ip().is_loopback());
+                if token.is_none() && !loopback {
+                    tracing::warn!(
+                        %addr,
+                        "webhook ingest is unauthenticated and reachable beyond loopback; \
+                         set INGEST_TOKEN for anything shared"
+                    );
+                }
                 info!(%addr, "ingest listening");
                 let mut rx = shutdown_rx.clone();
                 tasks.spawn(async move {
@@ -482,6 +493,8 @@ async fn main() -> Result<()> {
                     Some(same_origin_ingest),
                     Some(delivery),
                 );
+                // DNS-rebinding guard: only known Host names reach the session.
+                let app = beacon_api::host_guard(app, beacon_api::AllowedHosts::from_env());
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("binding {addr}"))?;
