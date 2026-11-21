@@ -2,7 +2,8 @@
 # - Manual: Actions -> loadtest -> Run workflow (needs this file on the default branch).
 # - Any branch: push a commit to `ci-run/loadtest-<name>` to run it on that code.
 # Brings up Postgres + Mailpit + Redpanda (deploy/docker-compose.yml), builds release
-# `beacon`, runs scripts/demo_latency.sh and uploads results.json / results.md / beacon.log.
+# `beacon`, runs scripts/demo_latency.sh, then the 60 s SMS outage demo (SPEC §9 c), and
+# uploads results.json / results.md / outage.md / beacon.log.
 name: loadtest
 
 on:
@@ -14,6 +15,10 @@ on:
       rate:
         description: Events per second (open loop)
         default: "50"
+      outage:
+        description: Also run the 60 s SMS outage demo (50 events)
+        type: boolean
+        default: true
   push:
     branches: ["ci-run/loadtest**"]
 
@@ -47,7 +52,7 @@ jobs:
       - name: Start Postgres, Mailpit and Redpanda
         run: docker compose -f deploy/docker-compose.yml up -d --wait
       - name: Build release beacon + benchmark
-        run: cargo build --locked --release -p beacon && cargo build --locked --release -p beacon-delivery --example latency_bench
+        run: cargo build --locked --release -p beacon && cargo build --locked --release -p beacon-delivery --example latency_bench --example sms_outage_demo
       - name: Benchmark unit tests
         run: cargo test --locked --release -p beacon-delivery --example latency_bench
       - name: Start beacon (ingest .. delivery + fake gateway)
@@ -70,6 +75,18 @@ jobs:
             cat results.md
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - name: 60 s SMS outage (SPEC §9 c)
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.outage) }}
+        run: |
+          status=0
+          cargo run -q --locked --release -p beacon-delivery --example sms_outage_demo -- --events 50 --outage-secs 60 | tee outage.md || status=$?
+          {
+            echo "## 60 s SMS outage (50 events, ubuntu-latest)"
+            echo '```'
+            cat outage.md
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,5 +95,6 @@ jobs:
           path: |
             results.json
             results.md
+            outage.md
             beacon.log
           if-no-files-found: warn
