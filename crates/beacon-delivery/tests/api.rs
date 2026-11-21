@@ -99,6 +99,7 @@ fn api_state(pool: &PgPool, reply_secret: Option<Vec<u8>>) -> ApiState {
         registry: ActionRegistry::default(),
         alert_ops: Arc::new(SqlAlertOps),
         reply_secret: reply_secret.map(Arc::new),
+        email_link: None,
     }
 }
 

@@ -1,5 +1,5 @@
-//! Approvals (SPEC §6.3): one state machine for every channel (UI button and mock SMS reply;
-//! the signed email link is M7). Table `approvals`.
+//! Approvals (SPEC §6.3): one state machine for every channel (UI button, mock SMS reply
+//! and the M7 signed email link). Table `approvals`.
 //!
 //! - **Request** (`request`): called by the run-step API when the step needs approval
 //!   (`approval: required`, or the action's risk is `high`). Inside the caller's tx: if a pending
@@ -22,13 +22,22 @@
 //!   (`eligible && $1::text[]`), and redraw while the candidate hashes equal any of their
 //!   `sms_code_hash` (up to 50 tries, then `RequestError::NoFreeCode`): two pending approvals
 //!   that share an eligible person never share a code, so an SMS reply can never decide the
-//!   wrong request. Then send the prompt: one `sms` job
-//!   per eligible person with a phone, via `router::insert_jobs`, `route_info = {"target":
-//!   "approval", "approval": {"id", "code", "step_id", "action"}}` (the code is in the job so
-//!   the SMS can carry it; `GatewayChannel::render` turns it into `... Reply "Y 4821" to
-//!   approve, "N 4821" to reject.` and sets `ProviderRequest.approval_challenge = "Y 4821"`),
-//!   `notify_seq` = the alert's current `notify_seq`, `escalation_step` = the person's next free slot >= 200 on this notification (unique key; several approvals on one alert each reach the same person).
-//!   Audit `approval` "requested <action> (step <id>)".
+//!   wrong request. Then send the prompts: one `sms` job per eligible person with a phone
+//!   AND one `email` job per eligible person with an email address (M7), both via
+//!   `router::insert_jobs` in one call per person. The sms job's `route_info = {"target":
+//!   "approval", "approval": {"id", "code", "step_id", "action"}}` carries the code
+//!   (the SMS must name it; `GatewayChannel::render` turns it into `... Reply "Y 4821" to
+//!   approve, "N 4821" to reject.` and sets `ProviderRequest.approval_challenge = "Y 4821"`).
+//!   The email job's `route_info` is the same object WITHOUT the `code` key — a code must
+//!   never enter an email — and `worker::render_approval_email` renders it as a prompt
+//!   carrying an HMAC-signed link ([`crate::email_link`]) that decides through this same
+//!   state machine. A person with neither address is not prompted at all. Both jobs use
+//!   `notify_seq` = the alert's current `notify_seq` and the person's next free prompt
+//!   slot (at least 200) on this notification (unique key; several approvals on one
+//!   alert each reach the same person). The two channels SHARE that slot — the unique
+//!   key includes the channel — and the free-slot count spans sms and email prompts by
+//!   DISTINCT slot, so a person without a phone still gets a fresh slot per approval
+//!   for their email prompt. Audit `approval` "requested <action> (step <id>)".
 //!
 //!   The old schema-forced deviation is gone: the unique key now includes `escalation_step`,
 //!   so a prompt for someone this notification already paged on sms (the demo's on-call bob)
@@ -68,7 +77,8 @@
 //!
 //! **Codes never survive at rest after the decision (audit #11).** The plaintext code exists in
 //! exactly two places outside the `approvals` row's hash: the prompt jobs'
-//! `delivery_jobs.route_info.approval.code` (the SMS must carry it) and the gateway's
+//! `delivery_jobs.route_info.approval.code` (the SMS must carry it — an EMAIL prompt's
+//! `route_info` never has the key at all, its `scrub_code` update is a no-op) and the gateway's
 //! `gateway_receipts.text`/`approval_challenge` once the provider accepted the prompt. The
 //! moment an approval stops being `pending` — approved or rejected in `decide_in_tx`, expired
 //! on a decide, expired by the 5-wrong-attempt rule, or swept by [`expire_stale`] — the same
@@ -103,6 +113,8 @@ pub enum Decision {
 pub enum Via {
     Ui,
     Sms,
+    /// The M7 signed email link (`api::POST /api/approvals/email`).
+    Email,
 }
 
 impl Via {
@@ -110,6 +122,7 @@ impl Via {
         match self {
             Via::Ui => "ui",
             Via::Sms => "sms",
+            Via::Email => "email",
         }
     }
 }
@@ -408,9 +421,11 @@ pub async fn request(
         return Err(sqlx::Error::RowNotFound.into());
     }
 
-    // The SMS prompt: one sms job per eligible person with a phone (the requester is not in
-    // `eligible`, so they are never prompted for their own request). The code travels in the
-    // job (the SMS must carry it); the table keeps only its hash.
+    // The prompts: one sms job per eligible person with a phone (the code travels in the
+    // job because the SMS text must name it) and one email job per eligible person with
+    // an email address (M7, SPEC §6.3 — NEVER carrying the code: the email renders a
+    // signed link at send time instead, `worker::render_approval_email`). The requester
+    // is not in `eligible`, so they are never prompted for their own request.
     for who in &eligible {
         let Some(person_id) = who.strip_prefix("user:") else {
             continue;
@@ -418,16 +433,24 @@ pub async fn request(
         let Some(person) = dir.people.get(person_id) else {
             continue;
         };
-        let Some(phone) = person.contact.phone.clone() else {
+        let phone = person.contact.phone.clone();
+        let email = crate::config::address_for(person, "email").map(str::to_string);
+        if phone.is_none() && email.is_none() {
+            // No address on either prompt channel: not prompted at all.
             continue;
-        };
-        // Next free prompt slot for this person on this notification: several approvals on one
-        // alert (different steps) each page the same person, so the slot is per person, not
-        // per request. The per-person advisory lock taken above makes the count race-free.
+        }
+        // Next free prompt slot for this person on this notification: several approvals on
+        // one alert (different steps) each prompt the same person, so the slot is per
+        // person, not per request. Both prompt channels share the slot (the unique key
+        // includes the channel), so the count spans sms AND email prompts by DISTINCT
+        // slot: a person with a phone counts one slot per earlier approval, and a person
+        // without one still gets a fresh slot per approval for their email prompt. The
+        // per-person advisory lock taken above makes the count race-free.
         let (taken,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM delivery_jobs \
-             WHERE alert_id = $1 AND recipient_id = $2 AND channel = 'sms' \
-               AND notify_seq = $3 AND escalation_step >= 200",
+            "SELECT count(DISTINCT escalation_step) FROM delivery_jobs \
+             WHERE alert_id = $1 AND recipient_id = $2 \
+               AND channel IN ('sms', 'email') AND notify_seq = $3 \
+               AND escalation_step >= 200",
         )
         .bind(alert_id)
         .bind(person_id)
@@ -435,28 +458,39 @@ pub async fn request(
         .fetch_one(&mut **tx)
         .await?;
         let slot = 200 + i32::try_from(taken).unwrap_or(i32::MAX - 200);
-        let route_info = json!({
-            "target": "approval",
-            "approval": {
-                "id": id,
-                "code": code,
-                "step_id": step_id,
-                "action": action,
-            },
-        });
-        crate::router::insert_jobs(
-            tx,
-            alert_id,
-            notify_seq,
-            person_id,
-            &[PlannedJob {
+        let mut jobs: Vec<PlannedJob> = Vec::new();
+        if let Some(phone) = phone {
+            jobs.push(PlannedJob {
                 channel: "sms".to_string(),
                 address: phone,
-                route_info,
-            }],
-            Some(slot),
-        )
-        .await?;
+                route_info: json!({
+                    "target": "approval",
+                    "approval": {
+                        "id": id,
+                        "code": code,
+                        "step_id": step_id,
+                        "action": action,
+                    },
+                }),
+            });
+        }
+        if let Some(email) = email {
+            jobs.push(PlannedJob {
+                channel: "email".to_string(),
+                address: email,
+                route_info: json!({
+                    "target": "approval",
+                    // No "code" key: the code must never enter an email (audit #11's
+                    // email analogue); the link is signed at render time instead.
+                    "approval": {
+                        "id": id,
+                        "step_id": step_id,
+                        "action": action,
+                    },
+                }),
+            });
+        }
+        crate::router::insert_jobs(tx, alert_id, notify_seq, person_id, &jobs, Some(slot)).await?;
     }
 
     audit::record(

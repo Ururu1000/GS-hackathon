@@ -42,6 +42,7 @@ actions     runs queued runbook actions; approvals gate the risky ones
 - **Actions** (`actions` role): `http_get` to allowlisted targets (`config/actions/targets.yaml`, no redirects, size caps), `retry_workflow`, `restart_service`, `open_ticket`, `escalate`, `notify`. Each runs off the alert pipeline with a lease. Conditions such as "retry fails twice" unlock steps; `resolves: true` resolves the alert.
 - **Approvals:** high-risk or `approval: required` steps need the team lead or the current on-call person. The requester can never approve their own request.
   - **Code:** 4 digits, stored only as a hash, valid 15 min, 5 SMS attempts, single-use. It's scrubbed from jobs and gateway receipts once the approval is decided or expires.
+  - **Email link (M7):** each eligible person with an email address also gets an approval email in Mailpit. It links to `{PUBLIC_URL}/api/approvals/email?a=<approval>&p=<person>&e=<expiry>&s=<signature>`, where the signature is HMAC-SHA256 under `REPLY_SECRET` over the approval, the person and the approval's own expiry. Opening the link only shows a confirm page, because mail scanners prefetch links. Approve or Reject on that page is a form POST that decides through the same path as the UI and the SMS reply, as that person, `via = email`. So the 15-minute expiry, single use, "lead or on-call, never the requester" and the 409 for an already-decided request all apply unchanged. A forged or altered link gets a 401 and uses up no SMS attempts. The email never contains the SMS code. Without `REPLY_SECRET` the email has no link and says to decide in Beacon.
   - **Where to approve:** in the UI, or by replying `Y 1234` / `N 1234` on the fake phone. `ACK` acks the alert.
 
 ## Running it
@@ -160,7 +161,7 @@ Re-run it: Actions → `loadgen` → Run workflow (inputs: rates, duration), or 
 - **Email** is real SMTP; in the demo it goes to Mailpit. A real relay (SES, SendGrid, ...) is configuration only.
 - **Action targets** (workflow engine, service restart, tickets, health checks) are mock endpoints on the gateway, each switchable between `ok` and `fail`.
 - **People, teams and preferences** come from `config/people` and `config/teams` (synthetic: `example.test` addresses, `+44 7700 900xxx` numbers). Edits through `PUT /api/people/{id}/preferences` and `PUT /api/teams/{id}` (the Preferences screen) are stored in Postgres (`directory_overrides`) and apply on the router's next pass, with no restart.
-- **Not built:** signed email approval links (approvals are by SMS code or in the UI) and a recipient-wide throttle (throttles are per rule and recipient).
+- **Not built:** a recipient-wide throttle (throttles are per rule and recipient). Approvals work by SMS code, in the UI, or through the signed email link.
 
 ## Security notes
 
@@ -182,4 +183,4 @@ cargo test -p beacon-delivery          # unit + integration (sqlx::test: a fresh
 DELIVERY_LOAD_TEST=1 cargo test -p beacon-delivery --test delivery_m0   # adds the 1,000-email Mailpit run
 ```
 
-The integration suites are `delivery_m0` (router/worker/email), `delivery_m4` (breaker, fallback, outage), `gateway`, `escalation`, `throttle`, `runbooks`, `actions`, `approvals`, `api`, `security_gateway` and `security_api`.
+The integration suites are `delivery_m0` (router/worker/email), `delivery_m4` (breaker, fallback, outage), `gateway`, `escalation`, `throttle`, `runbooks`, `actions`, `approvals`, `email_approval`, `router_concurrency`, `api`, `security_gateway` and `security_api`.

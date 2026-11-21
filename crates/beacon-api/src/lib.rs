@@ -128,6 +128,9 @@ pub fn router_full(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
                 async move {
                     if req.method() != axum::http::Method::GET
                         && req.uri().path() != "/api/replies"
+                        // Signed email approval links (M7): the HMAC in the form body is the
+                        // authorization, the session Actor is ignored there (beacon_delivery::api).
+                        && req.uri().path() != "/api/approvals/email"
                         && let Err(e) = s.check_csrf(req.headers())
                     {
                         return axum::response::IntoResponse::into_response(e);
