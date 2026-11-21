@@ -9,7 +9,6 @@ CREATE TABLE offhours_held (
     alert_id     uuid        NOT NULL REFERENCES alerts (id),
     notify_seq   integer     NOT NULL,
     rule_id      text        NOT NULL,
-    address      text        NOT NULL,              -- the person's email, frozen at routing time
     route_info   jsonb       NOT NULL,              -- provenance as the router decided it
     release_at   timestamptz NOT NULL,              -- the preference window's next start
     created_at   timestamptz NOT NULL DEFAULT now(),

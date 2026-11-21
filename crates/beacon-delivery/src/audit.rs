@@ -159,15 +159,14 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
     .bind(alert_id)
     .fetch_all(pool)
     .await?;
-    for (recipient, at, release_at, released_at, sent_at, has_job) in held {
+    for (recipient, at, _release_at, released_at, sent_at, has_job) in held {
         entries.push(Entry {
             at,
             actor: "system".to_string(),
             kind: "held".to_string(),
-            message: format!(
-                "held for {recipient}'s off-hours digest until {}",
-                release_at.to_rfc3339_opts(SecondsFormat::Secs, true)
-            ),
+            // No release time: it would reveal the person's working hours to everyone on the
+            // alert's team, while /api/people hides other people's preferences.
+            message: format!("held for {recipient}'s off-hours digest"),
         });
         match (released_at, sent_at) {
             (_, Some(sent)) => entries.push(Entry {

@@ -48,21 +48,19 @@ pub async fn hold(
     alert_id: Uuid,
     notify_seq: i32,
     rule_id: &str,
-    address: &str,
     route_info: &Value,
     release_at: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "INSERT INTO offhours_held \
-           (recipient_id, alert_id, notify_seq, rule_id, address, route_info, release_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+           (recipient_id, alert_id, notify_seq, rule_id, route_info, release_at) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (alert_id, recipient_id, notify_seq) DO NOTHING",
     )
     .bind(recipient_id)
     .bind(alert_id)
     .bind(notify_seq)
     .bind(rule_id)
-    .bind(address)
     .bind(route_info)
     .bind(release_at)
     .execute(&mut **tx)
@@ -97,9 +95,15 @@ pub async fn release_once(
 
     let mut stats = ReleaseStats::default();
     for recipient_id in &people {
-        if let Some(rows) = release_person(pool, dir, recipient_id, now).await? {
-            stats.digests += 1;
-            stats.rows_released += rows;
+        // One person's failure (a DB error mid-release) must not block everyone ordered after
+        // them: log it and go on; their rows stay held and the next pass retries.
+        match release_person(pool, dir, recipient_id, now).await {
+            Ok(Some(rows)) => {
+                stats.digests += 1;
+                stats.rows_released += rows;
+            }
+            Ok(None) => {}
+            Err(err) => warn!(recipient = %recipient_id, %err, "off-hours digest release failed"),
         }
     }
     Ok(stats)
@@ -125,8 +129,8 @@ async fn release_person(
         return Ok(None);
     }
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(i64, Uuid, i32, String, Value, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT id, alert_id, notify_seq, address, route_info, created_at, release_at \
+    let rows: Vec<(i64, Uuid, i32, Value, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, alert_id, notify_seq, route_info, created_at, release_at \
              FROM offhours_held \
              WHERE recipient_id = $1 AND released_at IS NULL AND release_at <= $2 \
              ORDER BY id FOR UPDATE SKIP LOCKED",
@@ -147,10 +151,10 @@ async fn release_person(
         .filter(|r| seen.insert(r.1))
         .map(|r| r.1.to_string())
         .collect();
-    let held_since = rows.iter().map(|r| r.5).min().unwrap_or(now);
-    let release_at = rows.iter().map(|r| r.6).max().unwrap_or(now);
+    let held_since = rows.iter().map(|r| r.4).min().unwrap_or(now);
+    let release_at = rows.iter().map(|r| r.5).max().unwrap_or(now);
 
-    let mut route_info = latest.4.clone();
+    let mut route_info = latest.3.clone();
     if let Some(obj) = route_info.as_object_mut() {
         obj.remove("fallback");
         obj.insert("target".into(), Value::String(TARGET.into()));
@@ -168,6 +172,8 @@ async fn release_person(
 
     // The CURRENT address, not the one frozen at hold time: the digest waits hours, and the
     // person may have changed or removed their email, or left the directory, meanwhile.
+    // Known limit: team membership isn't rechecked here, so someone removed from a team in the
+    // evening still gets that night's held titles for it in the morning.
     // Known limit: during a rolling deploy a scheduler on an older directory can drop holds
     // for a person only the newer router knows. Keeping such rows pending would need a
     // backoff so a really removed person doesn't stall the batch; out of scope for the demo.
@@ -233,6 +239,24 @@ pub struct DigestLine {
     pub count: i64,
 }
 
+/// At most this many alerts are listed in a digest body (the counts above still cover all).
+const MAX_LINES: usize = 50;
+/// Titles are cut to this many characters in a digest line.
+const MAX_TITLE: usize = 200;
+
+/// `s` on one line (control characters become spaces), cut to `max` characters with `…`.
+fn one_line(s: &str, max: usize) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 /// Title and body of a digest email from the covered alerts' CURRENT rows (oldest first).
 pub fn render(lines: &[DigestLine]) -> (String, String) {
     let total = lines.len();
@@ -266,7 +290,9 @@ pub fn render(lines: &[DigestLine]) -> (String, String) {
             parts.join(", ")
         ));
     }
-    for l in lines {
+    // Bounded body (a noisy night must not make an email SMTP rejects as too big, which would
+    // kill the whole digest) and one line per alert (a newline in a title can't forge lines).
+    for l in lines.iter().take(MAX_LINES) {
         let repeats = if l.count > 1 {
             format!(" (x{})", l.count)
         } else {
@@ -274,8 +300,14 @@ pub fn render(lines: &[DigestLine]) -> (String, String) {
         };
         body.push_str(&format!(
             "- [{}] {}: {}{}\n",
-            l.status, l.severity, l.title, repeats
+            l.status,
+            l.severity,
+            one_line(&l.title, MAX_TITLE),
+            repeats
         ));
+    }
+    if lines.len() > MAX_LINES {
+        body.push_str(&format!("...and {} more.\n", lines.len() - MAX_LINES));
     }
     body.push_str("\nOpen the Beacon feed for details.");
     (title, body)
@@ -370,6 +402,26 @@ mod tests {
         ];
         assert_eq!(highest_severity(&lines).as_deref(), Some("error"));
         assert_eq!(highest_severity(&[]), None);
+    }
+
+    #[test]
+    fn render_caps_lines_and_keeps_titles_on_one_line() {
+        let mut lines: Vec<DigestLine> = (0..60)
+            .map(|i| line("open", "warning", &format!("alert {i}"), 1))
+            .collect();
+        lines[0].title = "fake\n- [resolved] critical: all clear".into();
+        lines[1].title = "x".repeat(500);
+        let (title, body) = render(&lines);
+        assert_eq!(title, "While you were off: 60 alerts");
+        assert!(body.starts_with("Held outside your working hours: 60 warning."));
+        assert_eq!(body.matches("\n- [").count(), 50, "{body}");
+        assert!(body.contains("...and 10 more.\n"), "{body}");
+        assert!(
+            !body.contains("\n- [resolved]"),
+            "a title can't forge a line: {body}"
+        );
+        assert!(body.contains(&format!("{}…", "x".repeat(200))));
+        assert!(!body.contains(&"x".repeat(201)));
     }
 
     #[test]

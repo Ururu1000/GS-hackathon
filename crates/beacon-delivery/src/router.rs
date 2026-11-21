@@ -256,7 +256,6 @@ pub async fn route_once(
                 *alert_id,
                 payload.notify_seq,
                 &payload.rule_id,
-                &job.address,
                 &job.route_info,
                 *release_at,
             )
