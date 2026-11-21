@@ -113,6 +113,8 @@ jobs:
         run: docker compose up -d --build --wait beacon
       - name: Demo seed finished
         run: |
+          # One-shot service: start it after beacon is healthy (not under --wait, it exits by design).
+          docker compose up -d --no-build demo-seed
           code=$(docker compose wait demo-seed)
           docker compose logs demo-seed
           test "$code" = 0
@@ -155,6 +157,7 @@ jobs:
 
           # Alert detail (deliveries + delivery timeline + runbook), then ack it like the UI does.
           first=$(jq -c '[.items[] | select(.status == "open")][0]' <<<"$alerts")
+          [ "$first" != null ] || fail "no open alert to ack: statuses $(jq -c '[.items[].status]' <<<"$alerts")"
           id=$(jq -r .id <<<"$first"); version=$(jq -r .version <<<"$first")
           detail=$(curl -fsS "$api/api/alerts/$id")
           jq -e '(.deliveries | type) == "array" and (.timeline | length) > 0 and has("runbook")' <<<"$detail" >/dev/null \
