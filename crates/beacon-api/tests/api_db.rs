@@ -47,8 +47,7 @@ fn harness(pool: PgPool) -> Harness {
     let (updates, _) = broadcast::channel(64);
     let (ready_tx, ready) = watch::channel(true);
     let csrf = session.csrf_token.clone();
-    let schemas = Arc::new(beacon_engine::config_store::load_schemas(&root().join("config")).unwrap());
-    let state = ApiState { pool, updates: updates.clone(), ready, session, schemas, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let state = ApiState { pool, updates: updates.clone(), ready, session, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
     Harness { app: router(state, None), updates, ready: ready_tx, csrf }
 }
 
@@ -321,11 +320,12 @@ async fn rules_crud_with_revisions(pool: PgPool) {
     assert_eq!(send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": foreign}))).await.0, StatusCode::FORBIDDEN);
 
     let rev: i64 = sqlx::query_scalar("SELECT revision FROM config_state WHERE key = 'rules'").fetch_one(&pool).await.unwrap();
-    assert_eq!(rev, 4 + 4, "4 seeds + create, update, delete, recreate");
+    assert_eq!(rev, 4 + 4 + 4, "4 schema seeds + 4 rule seeds + create, update, delete, recreate");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn rule_test_panel_and_discovery(pool: PgPool) {
+    beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
     let h = harness(pool.clone());
     let rule = json!({"id": "disk-full", "team": "settlements", "when": {"all": [{"path": "raw.event_kind", "op": "eq", "value": "disk_full"}, {"path": "raw.used_pct", "op": "gte", "value": 95}]},
         "route": [{"to": "team:settlements"}], "present": {"title": "Disk {{ raw.mount }} on {{ raw.host }}"}});
@@ -377,7 +377,7 @@ async fn same_origin_ingest_needs_csrf(pool: PgPool) {
     let (updates, _) = broadcast::channel(8);
     let (_r, ready) = watch::channel(true);
     let csrf = session.csrf_token.clone();
-    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let state = ApiState { pool, updates, ready, session, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
     let ingest = Router::new().route("/ingest/{source}", axum::routing::post(|| async { (StatusCode::ACCEPTED, "{\"id\":\"x\"}") }));
     let app = beacon_api::router_with(state, None, Some(ingest));
     assert_eq!(post(&app, "/ingest/demo", None, json!({})).await.0, StatusCode::FORBIDDEN);
@@ -411,7 +411,7 @@ async fn hardening_headers_scoping_and_masking(pool: PgPool) {
     let csrf = session.csrf_token.clone();
     let (updates, _) = broadcast::channel(8);
     let (_r, ready) = watch::channel(true);
-    let state = ApiState { pool: pool.clone(), updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let state = ApiState { pool: pool.clone(), updates, ready, session, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
     let app = router(state, None);
     assert_eq!(get(&app, "/api/events/recent").await.0, StatusCode::FORBIDDEN);
     assert_eq!(get(&app, "/api/schemas/discovered").await.0, StatusCode::FORBIDDEN);
@@ -478,4 +478,74 @@ async fn hardening_headers_scoping_and_masking(pool: PgPool) {
     let sse_res = app.clone().oneshot(Request::get("/api/stream").body(Body::empty()).unwrap()).await.unwrap();
     let cc = sse_res.headers()["cache-control"].to_str().unwrap();
     assert!(cc.contains("no-cache") && cc.contains("no-store"), "got {cc}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn schema_preview_and_publish(pool: PgPool) {
+    beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
+    let h = harness(pool.clone());
+    let event: Value = serde_json::from_str(&std::fs::read_to_string(root().join("samples/events/unknown-shape.json")).unwrap()).unwrap();
+    let spec = json!({"schema": "infra.disk", "priority": 40,
+        "detect": {"all": [{"path": "event_kind", "op": "exists"}, {"path": "host", "op": "exists"}]},
+        "fields": {"type": {"path": "event_kind"}, "service": {"path": "host"}, "used": {"path": "used_pct", "as": "number"}}});
+    let (s, p) = send(&h.app, "POST", "/api/schemas/preview", &h.csrf, Some(json!({"spec": spec, "event": event, "source": "http:judges"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!((p["matched"].clone(), p["fields"]["service"].clone()), (json!(true), json!("batch-07")));
+    let (s, e) = send(&h.app, "POST", "/api/schemas/preview", &h.csrf, Some(json!({"spec": {"schema": "x", "detect": {"path": "a", "op": "regex", "value": "("}}, "event": {}, "source": "s"}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("detect")));
+
+    let (s, created) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec}))).await;
+    assert_eq!((s, created["revision"].as_i64()), (StatusCode::CREATED, Some(1)));
+    let (s, _) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec}))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "exists without expected_revision");
+    let (s, upd) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec, "expected_revision": 1}))).await;
+    assert_eq!((s, upd["revision"].as_i64()), (StatusCode::OK, Some(2)));
+    // The rule test panel now sees the published mapping.
+    let rule = json!({"id": "disk", "team": "settlements", "when": {"path": "fields.service", "op": "eq", "value": "batch-07"},
+        "route": [{"to": "team:settlements"}], "present": {"title": "Disk on {{ fields.service }}"}});
+    let (_, r) = send(&h.app, "POST", "/api/rules/test", &h.csrf, Some(json!({"rule": rule, "event": event}))).await;
+    assert_eq!((r["schema"].clone(), r["matched"].clone()), (json!("infra.disk"), json!(true)));
+    // And the live matcher snapshot picks it up.
+    let snap = beacon_engine::config_store::load_snapshot(&pool).await.unwrap();
+    assert!(snap.mappings.iter().any(|m| m.schema == "infra.disk"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn proposals_lifecycle(pool: PgPool) {
+    beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
+    let h = harness(pool.clone());
+    let (_, r) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+    let mut proposed = r["rule"].clone();
+    proposed["dedup"] = json!({"key": ["raw.payload.tradeId"], "window": "30m"});
+    let body = json!({"rule_id": "rates-rejected-trades", "base_revision": 1, "kind": "noisy", "summary": "Longer dedup window", "proposed_rule": proposed});
+    let (s, p) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(body.clone())).await;
+    assert_eq!((s, p["state"].as_str(), p["can_review"].as_bool()), (StatusCode::CREATED, Some("pending"), Some(true)));
+    assert_eq!(get(&h.app, "/api/proposals/count").await.1["pending"], json!(1));
+    let (_, l) = get(&h.app, "/api/proposals?state=pending").await;
+    assert_eq!(l["items"].as_array().unwrap().len(), 1);
+
+    // Accept publishes against base_revision.
+    let pid = p["id"].as_str().unwrap().to_string();
+    let (s, a) = send(&h.app, "POST", &format!("/api/proposals/{pid}/accept"), &h.csrf, None).await;
+    assert_eq!((s, a["state"].as_str(), a["decided_by"].as_str()), (StatusCode::OK, Some("accepted"), Some("user:anna")));
+    let (_, r2) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+    assert_eq!((r2["revision"].as_i64(), r2["rule"]["dedup"]["window"].as_str()), (Some(2), Some("30m")));
+    assert_eq!(send(&h.app, "POST", &format!("/api/proposals/{pid}/accept"), &h.csrf, None).await.0, StatusCode::CONFLICT);
+
+    // A proposal against an old revision can't be created; one that goes stale can't be accepted.
+    let (s, _) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(body)).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let mut p2 = r2["rule"].clone();
+    p2["present"]["title"] = json!("Rejected trade {{ raw.payload.tradeId }}");
+    let (_, created) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(json!({"rule_id": "rates-rejected-trades", "base_revision": 2, "kind": "template", "summary": "Shorter title", "proposed_rule": p2}))).await;
+    let mut moved = r2["rule"].clone();
+    moved["enabled"] = json!(false);
+    send(&h.app, "PUT", "/api/rules/rates-rejected-trades", &h.csrf, Some(json!({"rule": moved, "expected_revision": 2}))).await;
+    let (s, e) = send(&h.app, "POST", &format!("/api/proposals/{}/accept", created["id"].as_str().unwrap()), &h.csrf, None).await;
+    assert_eq!((s, e["error"]["current"]["state"].as_str()), (StatusCode::CONFLICT, Some("stale")));
+
+    // Validation.
+    let (s, e) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(json!({"rule_id": "rates-rejected-trades", "base_revision": 3, "kind": "weird", "summary": "x", "proposed_rule": moved}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("kind")));
+    assert_eq!(get(&h.app, "/api/proposals?state=nope").await.0, StatusCode::BAD_REQUEST);
 }
