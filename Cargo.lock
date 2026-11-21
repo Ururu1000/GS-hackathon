@@ -279,6 +279,7 @@ dependencies = [
  "beacon-core",
  "chrono",
  "chrono-tz",
+ "clap",
  "futures",
  "hex",
  "hmac",
