@@ -20,6 +20,8 @@ use crate::path::{Path, PathError, Root};
 /// Upper bound on tree size, so a pasted rule can't blow up evaluation.
 pub const MAX_NODES: usize = 256;
 pub const MAX_REGEX_LEN: usize = 1024;
+/// Upper bound on `in` / `not_in` lists.
+pub const MAX_LIST: usize = 256;
 /// Bound compiled NFA/DFA size so short regexes like `(a{50}){50}` cannot blow up memory.
 const MAX_REGEX_SIZE_BYTES: usize = 256 * 1024;
 
@@ -241,7 +243,7 @@ impl Condition {
             }
             Condition::Not(c) => !c.test_into(event, child(0), false, out),
             Condition::Leaf(leaf) => {
-                out[idx].actual = leaf.path.resolve(event).map(|v| v.into_owned());
+                out[idx].actual = leaf.path.resolve(event).map(|v| crate::matcher::bounded_to(v.into_owned(), 1024));
                 leaf.eval(event)
             }
         };
@@ -305,6 +307,9 @@ fn compile(
             match op {
                 Op::In | Op::NotIn if !value.is_array() => {
                     return Err(ConditionError::NeedsList { op: *op, path: p });
+                }
+                Op::In | Op::NotIn if value.as_array().is_some_and(|a| a.len() > MAX_LIST) => {
+                    return Err(ConditionError::TooLarge);
                 }
                 Op::StartsWith if !value.is_string() => {
                     return Err(ConditionError::NeedsString { op: *op, path: p });

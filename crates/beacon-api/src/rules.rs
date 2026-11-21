@@ -147,13 +147,39 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes, what: &str) -> Resul
     serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("body must be {what}: {e}")))
 }
 
-/// Writers must be able to see (own) the rule's team, before and after.
+/// Writers must be able to see (own) the rule's team, before and after, and
+/// may only route to teams they can see (no paging other teams' rotations).
 fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
     let t = team_of(spec);
-    if t.is_empty() || state.session.can_see(&t) {
+    if !(t.is_empty() || state.session.can_see(&t)) {
+        return Err(ApiError::forbidden(format!("you can't publish rules for team `{t}`")));
+    }
+    if let Some(routes) = spec.get("route").and_then(Value::as_array) {
+        for r in routes {
+            if let Some(target) = r.get("to").and_then(Value::as_str).and_then(|to| to.strip_prefix("team:"))
+                && !state.session.can_see(target) {
+                    return Err(ApiError::forbidden(format!("you can't route to team `{target}`")));
+                }
+        }
+    }
+    Ok(())
+}
+
+/// Rule writes are small; anything bigger is refused before parsing.
+const MAX_WRITE_BODY: usize = 128 * 1024;
+
+fn check_body(body: &Bytes) -> Result<(), ApiError> {
+    if body.len() > MAX_WRITE_BODY {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_WRITE_BODY} bytes")));
+    }
+    Ok(())
+}
+
+fn require_admin(state: &ApiState) -> Result<(), ApiError> {
+    if state.session.admin {
         Ok(())
     } else {
-        Err(ApiError::forbidden(format!("you can't publish rules for team `{t}`")))
+        Err(ApiError::forbidden("events from every source are visible to admins only"))
     }
 }
 
@@ -181,8 +207,14 @@ async fn map_write(state: &ApiState, e: WriteError) -> ApiError {
 
 pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     state.session.check_csrf(&headers)?;
+    check_body(&body)?;
     let b: WriteBody = parse_body(&body, "{\"rule\": {...}}")?;
     check_team(&state, &b.rule)?;
+    // Recreating a deleted id must not take over another team's rule history.
+    if let Some(id) = b.rule.get("id").and_then(Value::as_str)
+        && let Some(prev) = config_store::get_any(&state.pool, id).await? {
+            check_team(&state, &prev.spec)?;
+        }
     match config_store::create(&state.pool, &b.rule, &state.session.actor()).await? {
         Ok(r) => Ok((StatusCode::CREATED, Json(item_with_stats(&state, &r).await?)).into_response()),
         Err(e) => Err(map_write(&state, e).await),
@@ -191,6 +223,7 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Byt
 
 pub async fn update(State(state): State<ApiState>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
+    check_body(&body)?;
     let b: WriteBody = parse_body(&body, "{\"rule\": {...}, \"expected_revision\": <int>}")?;
     let expected = b.expected_revision.ok_or_else(|| ApiError::bad_request("expected_revision is required"))?;
     if let Some(existing) = config_store::get(&state.pool, &id).await? {
@@ -231,7 +264,12 @@ pub async fn test(State(state): State<ApiState>, headers: HeaderMap, body: Bytes
         return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_TEST_BODY} bytes")));
     }
     let b: TestBody = parse_body(&body, "{\"rule\": {...}, \"event\": {...}}")?;
-    Ok(Json(run_test(&state.schemas, b.rule, b.event, b.source)))
+    // Compiling and evaluating is CPU work: keep it off the async workers.
+    let schemas = state.schemas.clone();
+    let out = tokio::task::spawn_blocking(move || run_test(&schemas, b.rule, b.event, b.source))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("rule test task failed: {e}")))?;
+    Ok(Json(out))
 }
 
 pub fn run_test(schemas: &[beacon_core::mapping::SchemaMappingSpec], rule: Value, raw: Value, source: Option<String>) -> Value {
@@ -291,6 +329,7 @@ fn render(v: &Value) -> String {
 }
 
 pub async fn recent_events(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
+    require_admin(&state)?;
     let limit: i64 = query_param(raw.as_deref(), "limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 50);
     let rows = sqlx::query(
         "SELECT event_id, source, schema, received_at, raw FROM event_samples ORDER BY id DESC LIMIT $1",
@@ -319,6 +358,7 @@ pub async fn schemas(State(state): State<ApiState>) -> Json<Value> {
 }
 
 pub async fn discovered(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    require_admin(&state)?;
     let rows = sqlx::query(
         "SELECT DISTINCT ON (schema) schema, source, raw,
                 count(*) OVER (PARTITION BY schema) AS count,

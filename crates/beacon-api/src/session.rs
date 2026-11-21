@@ -23,6 +23,9 @@ pub struct Session {
     pub user: Named,
     pub teams: Vec<Named>,
     pub csrf_token: String,
+    /// Admins see every team and the cross-team views (recent events,
+    /// discovered schemas). Others see only teams they belong to or lead.
+    pub admin: bool,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +40,10 @@ struct TeamFile {
     team: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    lead: Option<String>,
 }
 
 fn title_case(id: &str) -> String {
@@ -49,7 +56,12 @@ fn title_case(id: &str) -> String {
 
 impl Session {
     /// Build the demo session from `config/people` and `config/teams`.
+    /// `admin` grants every team; otherwise only the user's own teams.
     pub fn demo(config_dir: &Path, user_id: &str) -> anyhow::Result<Session> {
+        Self::demo_with(config_dir, user_id, true)
+    }
+
+    pub fn demo_with(config_dir: &Path, user_id: &str, admin: bool) -> anyhow::Result<Session> {
         let people: Vec<PersonFile> = beacon_core::config::load_yaml_files(&config_dir.join("people"))?;
         let teams: Vec<TeamFile> = beacon_core::config::load_yaml_files(&config_dir.join("teams"))?;
         let user = people
@@ -59,11 +71,12 @@ impl Session {
             .unwrap_or_else(|| Named { id: user_id.to_string(), name: title_case(user_id) });
         let mut teams: Vec<Named> = teams
             .into_iter()
+            .filter(|t| admin || t.members.iter().any(|m| m == user_id) || t.lead.as_deref() == Some(user_id))
             .map(|t| Named { name: t.name.unwrap_or_else(|| title_case(&t.team)), id: t.team })
             .collect();
         teams.sort_by(|a, b| a.id.cmp(&b.id));
         let csrf_token = hex::encode(rand::rng().random::<[u8; 16]>());
-        Ok(Session { user, teams, csrf_token })
+        Ok(Session { user, teams, csrf_token, admin })
     }
 
     pub fn actor(&self) -> String {

@@ -26,6 +26,9 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 pub const CONFIG_CHANNEL: &str = "beacon_config";
+/// Size bounds that keep any valid rule's matches far below the Kafka limit.
+pub const MAX_RULE_BYTES: usize = 64 * 1024;
+pub const MAX_ROUTES: usize = 16;
 const RECHECK: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -59,6 +62,9 @@ pub fn validate(spec: &Value) -> Result<RuleSpec, Vec<Invalid>> {
     if let Some(p) = forbidden_key_path(spec, "") {
         return Err(vec![inv(&p, "this key name is not allowed".into())]);
     }
+    if spec.to_string().len() > MAX_RULE_BYTES {
+        return Err(vec![inv("", format!("a rule must be under {} KiB", MAX_RULE_BYTES / 1024))]);
+    }
     let rule: RuleSpec = match serde_json::from_value(spec.clone()) {
         Ok(r) => r,
         Err(e) => return Err(vec![inv("", format!("not a valid rule: {e}"))]),
@@ -75,6 +81,14 @@ pub fn validate(spec: &Value) -> Result<RuleSpec, Vec<Invalid>> {
     }
     if rule.route.is_empty() {
         problems.push(inv("route", "at least one recipient is required".into()));
+    }
+    if rule.route.len() > MAX_ROUTES {
+        problems.push(inv("route", format!("at most {MAX_ROUTES} recipients")));
+    }
+    for (which, t) in [("title", &rule.present.title), ("body", &rule.present.body)] {
+        if t.as_ref().is_some_and(|t| t.len() > beacon_core::template::MAX_TEMPLATE_LEN) {
+            problems.push(inv(&format!("present.{which}"), format!("longer than {} characters", beacon_core::template::MAX_TEMPLATE_LEN)));
+        }
     }
     if rule.present.title.as_deref().is_none_or(|t| t.trim().is_empty()) {
         problems.push(inv("present.title", "required".into()));
@@ -171,6 +185,12 @@ async fn current(tx: &mut PgConnection, id: &str, lock: bool) -> Result<Option<S
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<StoredRule>> {
     let mut c = pool.acquire().await?;
     Ok(current(&mut c, id, false).await?.filter(|r| !r.deleted))
+}
+
+/// Including soft-deleted rows (recreate checks).
+pub async fn get_any(pool: &PgPool, id: &str) -> Result<Option<StoredRule>> {
+    let mut c = pool.acquire().await?;
+    current(&mut c, id, false).await
 }
 
 pub async fn list(pool: &PgPool) -> Result<Vec<StoredRule>> {
@@ -291,10 +311,15 @@ pub fn load_schemas(config_dir: &Path) -> Result<Vec<SchemaMappingSpec>> {
 pub async fn load_snapshot(pool: &PgPool, schemas: &[SchemaMappingSpec]) -> Result<ConfigSnapshot> {
     let revision = rules_revision(pool).await?;
     let mut rules = Vec::new();
+    // Each rule is validated on its own: one bad stored rule is skipped
+    // (and logged) instead of making the whole ruleset fail to load.
     for r in list(pool).await? {
-        match serde_json::from_value::<RuleSpec>(r.spec.clone()) {
+        match validate(&r.spec) {
             Ok(spec) => rules.push((spec, r.revision)),
-            Err(e) => error!(error = %e, "stored rule no longer parses; skipped"),
+            Err(problems) => {
+                let id = r.spec.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                error!(rule = %id, ?problems, "stored rule is invalid; skipped");
+            }
         }
     }
     ConfigSnapshot::build_with(revision, schemas.to_vec(), rules)
@@ -380,6 +405,12 @@ mod tests {
         assert_eq!(validate(&ok).unwrap_err()[0].path, "group", "grouped rules must auto-resolve");
         ok["auto_resolve"] = json!({"quiet_for": "10m"});
         assert!(validate(&ok).is_ok());
+        let mut bad = rule();
+        bad["present"]["title"] = json!("x".repeat(5000));
+        assert_eq!(validate(&bad).unwrap_err()[0].path, "present.title");
+        let mut bad = rule();
+        bad["when"] = json!({"path": "raw.x", "op": "in", "value": (0..300).collect::<Vec<i32>>()});
+        assert_eq!(validate(&bad).unwrap_err()[0].path, "when");
         let mut bad = rule();
         bad["present"]["__proto__"] = json!({"x": 1});
         assert_eq!(validate(&bad).unwrap_err()[0].path, "present.__proto__");

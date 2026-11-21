@@ -26,12 +26,17 @@ use crate::alerts::{FeedQuery, api_alert, feed_page};
 use crate::error::ApiError;
 
 const READY_WAIT: Duration = Duration::from_secs(10);
+/// Alerts tracked per stream before it closes for a resync.
+const MAX_TRACKED: usize = 20_000;
 
 pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let q = FeedQuery::parse(raw.as_deref())?;
     // Only the team filter applies to the stream; the snapshot is the default page.
     let q = FeedQuery { team: q.team, ..FeedQuery::parse(None)? };
 
+    let Ok(slot) = state.streams.clone().try_acquire_owned() else {
+        return Err(ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "too_many_streams", "too many live streams, retry"));
+    };
     // Without an assigned consumer, updates between snapshot and assignment
     // would be lost; wait briefly, else ask the client to retry.
     let mut ready = state.ready.clone();
@@ -57,7 +62,11 @@ pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> R
 
     let visible: Vec<String> = state.session.teams.iter().map(|t| t.id.clone()).collect();
     let live = upserts(rx, state.ready.clone(), seen, q.team.clone(), visible);
-    let events = stream::once(async move { Ok::<_, Infallible>(first) }).chain(live);
+    // The permit lives as long as the stream.
+    let events = stream::once(async move { Ok::<_, Infallible>(first) }).chain(live).map(move |e| {
+        let _hold = &slot;
+        e
+    });
 
     let mut resp = Sse::new(events)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
@@ -97,6 +106,10 @@ pub fn upserts(
                         let in_scope = visible.contains(&a.team) && team.as_ref().is_none_or(|t| *t == a.team);
                         if !in_scope || seen.get(&a.id).is_some_and(|&v| a.version <= v) {
                             continue;
+                        }
+                        if seen.len() >= MAX_TRACKED && !seen.contains_key(&a.id) {
+                            // Bound per-client memory: resync from a fresh snapshot.
+                            return None;
                         }
                         seen.insert(a.id, a.version);
                         let ev = Event::default().event("alert.upsert").data(api_alert(&a).to_string());

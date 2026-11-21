@@ -37,6 +37,36 @@ pub fn api_alert(a: &FeedAlert) -> Value {
     v
 }
 
+/// `anna@example.test` → `a***@example.test`, `+44 7700 900123` → `+44 *** 123`.
+pub fn mask_address(a: &str) -> String {
+    if let Some((user, domain)) = a.split_once('@') {
+        let first: String = user.chars().take(1).collect();
+        return format!("{first}***@{domain}");
+    }
+    let digits: Vec<char> = a.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 6 {
+        let head: String = a.chars().take_while(|c| *c != ' ').take(3).collect();
+        let tail: String = digits[digits.len() - 3..].iter().collect();
+        return format!("{head} *** {tail}");
+    }
+    "***".into()
+}
+
+/// Provider errors can quote addresses; mask emails and cap the length.
+fn scrub_error(e: &str) -> String {
+    let masked: Vec<String> = e.split_whitespace().map(|w| if w.contains('@') { mask_address(w.trim_matches(|c: char| "<>,;:()\"'".contains(c))) } else { w.to_string() }).collect();
+    let mut s = masked.join(" ");
+    if s.len() > 200 {
+        let mut cut = 200;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+        s.push('…');
+    }
+    s
+}
+
 fn render_value(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -186,10 +216,10 @@ pub async fn detail(State(state): State<ApiState>, Path(id): Path<String>) -> Re
             "id": j.try_get::<Uuid, _>("id")?.to_string(),
             "recipient": recipient,
             "channel": channel,
-            "address": j.try_get::<String, _>("address")?,
+            "address": mask_address(&j.try_get::<String, _>("address")?),
             "state": j.try_get::<String, _>("status")?,
             "attempts": j.try_get::<i32, _>("attempts")?,
-            "last_error": j.try_get::<Option<String>, _>("last_error")?,
+            "last_error": j.try_get::<Option<String>, _>("last_error")?.map(|e| scrub_error(&e)),
             "sent_at": sent_at.map(ts),
             "updated_at": ts(j.try_get("updated_at")?),
         }));
@@ -294,6 +324,13 @@ pub async fn apply_transition(pool: &PgPool, session: &Session, id: Uuid, expect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_contact_details() {
+        assert_eq!(mask_address("anna@example.test"), "a***@example.test");
+        assert_eq!(mask_address("+44 7700 900123"), "+44 *** 123");
+        assert_eq!(scrub_error("550 rejected <bob@example.test> unknown"), "550 rejected b***@example.test unknown");
+    }
 
     #[test]
     fn cursor_round_trip() {

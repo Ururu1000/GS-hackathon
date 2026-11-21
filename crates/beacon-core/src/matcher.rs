@@ -77,6 +77,24 @@ fn bounded(v: Value) -> Value {
     bounded_to(v, MAX_PROJECTED_VALUE)
 }
 
+/// Mask values under secret-looking keys (password, token, authorization...)
+/// before an event leaves the hot path for storage or display.
+pub fn redact(v: Value) -> Value {
+    const SECRET: &[&str] = &["password", "passwd", "secret", "token", "authorization", "api_key", "apikey", "cookie", "private_key", "credential"];
+    match v {
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| {
+                    let lk = k.to_ascii_lowercase();
+                    if SECRET.iter().any(|s| lk.contains(s)) { (k, Value::String("[redacted]".into())) } else { (k, redact(v)) }
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.into_iter().map(redact).collect()),
+        other => other,
+    }
+}
+
 /// Cap a JSON value at `max` serialized bytes, replacing it with a truncated
 /// string preview when larger.
 pub fn bounded_to(v: Value, max: usize) -> Value {
@@ -366,8 +384,11 @@ impl ConfigSnapshot {
             ingested_at: event.ingested_at,
             diagnostics,
             event: (kind == MatchKind::Fire && rule.spec.runbook.is_some()).then(|| NotifyEvent {
-                fields: event.fields.clone(),
-                raw: bounded_to(event.raw.clone(), MAX_NOTIFY_RAW),
+                fields: match bounded_to(Value::Object(event.fields.clone()), 4096) {
+                    Value::Object(m) => m,
+                    _ => serde_json::Map::new(),
+                },
+                raw: bounded_to(redact(event.raw.clone()), MAX_NOTIFY_RAW),
             }),
             context: NotifyContext {
                 service: field_str(event, "service"),

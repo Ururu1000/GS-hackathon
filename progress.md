@@ -152,6 +152,25 @@ Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
     - a missing stats index
 - **Tests:** 70+ Rust tests across core, ingest, engine and API, many of them against a real Postgres.
 
+## Security fixes (audit of #12, #13, #15)
+
+- **Aggregator:** fixed a crash-loop when a batch mixed a fully replayed partition with new work (regression test). The dedup window now tracks only ids that can repeat, which cuts its memory roughly 4×.
+- **Rules:**
+  - Template, size, route and `in`-list limits are validated.
+  - The stored ruleset loads rule by rule, so one bad rule can't stop reloads.
+  - Rules can only route to visible teams.
+  - Recreating a deleted id is checked against its previous team.
+  - Write bodies are capped.
+  - The test panel runs off the async workers, and condition values are capped.
+- **Session and API:**
+  - The demo user is an admin (`BEACON_DEMO_ADMIN=false` gives membership-only teams).
+  - Cross-team views (recent events, discovered schemas) are admin-only.
+  - Security headers are set, and API responses are `no-store`.
+  - SSE connections and per-stream tracking are capped.
+- **Personal data:**
+  - Delivery addresses and provider errors are masked in alert detail.
+  - The pinned runbook event is redacted and size-bounded.
+
 ## Known limitations
 
 - **Exactly-once covers the matcher and aggregator** (Kafka transactions plus fenced Postgres checkpoints).
@@ -162,6 +181,7 @@ Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
 - **A deleted and recreated `alerts.matches` topic** is not detected. Stored checkpoints would skip the new topic's first offsets.
 - **Rare event reorderings can merge incidents.** An older fire arriving after a newer one, across batches, merges two incidents into one. The open/resolved state stays correct; only history is affected.
 - **Schema mappings are read-only through the API for now.** They come from `config/schemas`, and edits arrive with the schemas write endpoints.
+- **Audit #16 findings are deferred:** quiet_for overflow, and the shared group key when a group field is missing.
 - **The demo session is a fixed user** (`BEACON_DEMO_USER`, default `anna`). There is no real authentication yet, so the API listens on localhost by default.
 
 ## Next

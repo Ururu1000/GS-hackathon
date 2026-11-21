@@ -765,7 +765,14 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                 None => {}
             }
         }
-        let fences: Vec<Fence> = fences.into_values().collect();
+        // Only partitions that move forward get a fence. A partition whose
+        // messages were all below its checkpoint (replay) has nothing to
+        // advance; fencing it would make the "advance only forward" check fail
+        // for the whole batch and the role would crash-loop.
+        let fences: Vec<Fence> = fences
+            .into_values()
+            .filter(|f| owned.get(&f.partition).is_some_and(|o| f.next_offset > o.1))
+            .collect();
         let mut backoff = Duration::from_millis(50);
         loop {
             match apply_batch_fenced(&pool, &batch, &fences).await {

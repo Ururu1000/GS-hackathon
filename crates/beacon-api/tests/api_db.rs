@@ -48,7 +48,7 @@ fn harness(pool: PgPool) -> Harness {
     let (ready_tx, ready) = watch::channel(true);
     let csrf = session.csrf_token.clone();
     let schemas = Arc::new(beacon_engine::config_store::load_schemas(&root().join("config")).unwrap());
-    let state = ApiState { pool, updates: updates.clone(), ready, session, schemas, sources: Arc::new(vec![]) };
+    let state = ApiState { pool, updates: updates.clone(), ready, session, schemas, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
     Harness { app: router(state, None), updates, ready: ready_tx, csrf }
 }
 
@@ -377,10 +377,48 @@ async fn same_origin_ingest_needs_csrf(pool: PgPool) {
     let (updates, _) = broadcast::channel(8);
     let (_r, ready) = watch::channel(true);
     let csrf = session.csrf_token.clone();
-    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]) };
+    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
     let ingest = Router::new().route("/ingest/{source}", axum::routing::post(|| async { (StatusCode::ACCEPTED, "{\"id\":\"x\"}") }));
     let app = beacon_api::router_with(state, None, Some(ingest));
     assert_eq!(post(&app, "/ingest/demo", None, json!({})).await.0, StatusCode::FORBIDDEN);
     assert_eq!(post(&app, "/ingest/demo", Some(&csrf), json!({})).await.0, StatusCode::ACCEPTED);
     assert_eq!(get(&app, "/ready").await.0, StatusCode::OK, "no route clash with the API's /ready");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn hardening_headers_scoping_and_masking(pool: PgPool) {
+    // Security headers and no caching of API responses.
+    let h = harness(pool.clone());
+    let res = h.app.clone().oneshot(Request::get("/api/session").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.headers()["cache-control"], "no-store");
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(res.headers()["x-frame-options"], "DENY");
+
+    // Masked delivery address in alert detail.
+    seed(&pool, &["trade-rejected.json"]).await;
+    let (_, v) = get(&h.app, "/api/alerts").await;
+    let id = v["items"][0]["id"].as_str().unwrap().to_string();
+    sqlx::query("INSERT INTO delivery_jobs (alert_id, notify_seq, recipient_id, channel, address, status, last_error) VALUES ($1::uuid, 1, 'bob', 'email', 'bob@example.test', 'pending', '550 no such user <bob@example.test>')")
+        .bind(&id).execute(&pool).await.unwrap();
+    let (_, d) = get(&h.app, &format!("/api/alerts/{id}")).await;
+    assert_eq!(d["deliveries"][0]["address"], json!("b***@example.test"));
+    assert!(!d["deliveries"][0]["last_error"].as_str().unwrap().contains("bob@"));
+
+    // A non-admin only sees their own teams and not the cross-team views.
+    let session = Arc::new(Session::demo_with(&root().join("config"), "anna", false).unwrap());
+    let teams: Vec<&str> = session.teams.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(teams, vec!["payments"], "anna belongs to payments only");
+    let csrf = session.csrf_token.clone();
+    let (updates, _) = broadcast::channel(8);
+    let (_r, ready) = watch::channel(true);
+    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let app = router(state, None);
+    assert_eq!(get(&app, "/api/events/recent").await.0, StatusCode::FORBIDDEN);
+    assert_eq!(get(&app, "/api/schemas/discovered").await.0, StatusCode::FORBIDDEN);
+    let (_, feed) = get(&app, "/api/alerts").await;
+    assert!(feed["items"].as_array().unwrap().is_empty(), "rates alert is invisible to anna");
+    let rule = json!({"id": "sneaky", "team": "payments", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "team:rates"}], "present": {"title": "t"}});
+    let (s, e) = send(&app, "POST", "/api/rules", &csrf, Some(json!({"rule": rule}))).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")), "can't page another team");
 }
