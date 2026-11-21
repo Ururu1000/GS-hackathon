@@ -95,6 +95,7 @@ Rows marked *CI* (and the latency rows) ran on a GitHub Actions `ubuntu-latest` 
 | *CI, on main* (`b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383)): the same latency workload again | 500/500 delivered, 0 missing. Gateway: **p50 952 / p90 1225 / p99 1606 / max 1804 ms**. Email: **p50 936 / p90 1204 / p99 1391 / max 1556 ms** |
 | *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): `--events 500 --rate 50` | 500/500 delivered, 0 missing. Gateway: **p50 464 / p90 618 / p99 743 / max 765 ms**. Email: **p50 380 / p90 491 / p99 549 / max 618 ms** |
 | *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): `--events 2000 --rate 200` | 2000/2000 delivered, 0 missing, 0 dead. Gateway: **p50 653 / p90 833 / p99 959 / max 1085 ms**. Email: **p50 650 / p90 819 / p99 944 / max 1030 ms** |
+| **Under beacon-loadgen** (*CI*, [run 44870310169](https://github.com/Ururu1000/GS-hackathon/actions/runs/44870310169), `e5d7522`): 200 and 2000 ev/s for 30 s, 1000 keys per type | ingest accepted 203 / 2000 ev/s, 0 rejected; every job reconciled (0 missing). Ingest (first event per alert) → gateway receipt **p50 3.9 s / p99 5.3 s** at 200 ev/s, **p50 41 s / p99 50 s** at 2000 ev/s, where the router is the bottleneck on 2 vCPU. Details under [Under beacon-loadgen](#under-beacon-loadgen-200-and-2000-eventss). |
 
 Run the settlement-timeout flow by hand against the stack above. The mock workflow engine is set to fail with `POST :8070/api/simulator/mock {"target":"workflows","mode":"fail"}` plus the gateway token. Post `samples/events/workflow-failed.json` to `:8090/ingest/webhook`, then run the steps with `POST :8071/api/alerts/<id>/steps/<s1|s2|s3>/run`, and answer the approval SMS through `POST :8070/api/simulator/reply`.
 
@@ -124,6 +125,29 @@ Caveat: gateway receipts are timestamped by Postgres and email by Mailpit, so th
 `alerts.first_seen` is stamped with the event's `ingested_at`, so the "ingest → alert" split measures only the client → ingest accept step. Nearly all of the ~0.9 s median is in the pipeline after that: Kafka → matcher → aggregator linger → outbox relay → router → polling delivery worker → provider.
 
 Re-run it: Actions → `loadtest` → Run workflow (once this file is on `main`), or push any commit to a `ci-run/loadtest-<name>` branch.
+
+### Under beacon-loadgen (200 and 2000 events/s)
+
+The same latency under the team's load harness. `beacon-loadgen` (open loop, all four Appendix A event shapes) drives ingest, and then `scripts/delivery_latency.sh` (`beacon-delivery/examples/delivery_latency.rs`) reconciles that run's alerts. It finds them by loadgen's run id and leaves out its warm-up probe. Every alert's first-notification jobs are checked against gateway receipts (sms, phone) and Mailpit messages (email, `Message-ID <job_id@beacon>`). The tool waits until the router has processed every one of the run's `notify` outbox rows and every job is sent, and fails otherwise. Latencies are measured from `alerts.first_seen`, the ingest accept time of the alert's **first** event. Later duplicates of an alert are counted but not delivered again, so they aren't timed.
+
+Workload (both rates): `beacon-loadgen --rate <R> --duration 30 --batch 100 --distinct-keys 1000 --match-ratio 0.8 --concurrency 256 --drain 15` over HTTP `POST /ingest/lg/batch`. Infrastructure: GitHub `ubuntu-latest` (2 vCPU), release build, `beacon --role ingest,matcher,aggregator,relay,router,delivery,gateway`, and `deploy/docker-compose.yml` (Redpanda, Postgres, Mailpit), all on that one runner. Routes: workflow failures go to on-call phone + sms, rejected trades to the rates team by email, Prometheus alerts to anna (email by her preferences), and pricing warnings to the UI only, so those aren't measured. Workflow: `.github/workflows/loadgen.yml`; the reports and JSON are in each run's `loadgen-results` artifact.
+
+[Run 44870310169](https://github.com/Ururu1000/GS-hackathon/actions/runs/44870310169) (commit `e5d7522`):
+
+| rate | ingest | alerts | jobs reconciled | ingest (first event) → gateway receipt, sms / phone | ingest (first event) → Mailpit | of which: → job planned (sms) |
+|---|---|---|---|---|---|---|
+| **200 ev/s** | 6000 sent, 6000 accepted, **203 ev/s**, 0 rejected / failed | 2783 | 684 sms, 684 phone, 2129 email: all sent, 0 missing / dead / duplicate | p50 **3.9 s** / p99 **5.3 s**; phone p50 3.9 s / p99 5.6 s | p50 **4.3 s** / p99 **5.9 s** | p50 2.7 s / p99 4.3 s |
+| **2000 ev/s** | 60000 sent, 60000 accepted, **2000 ev/s**, 0 rejected / failed | 4000 | 1000 sms, 1000 phone, 3000 email: all sent, 0 missing / dead / duplicate | p50 **41.2 s** / p99 **49.6 s**; phone p50 41.1 s / p99 49.6 s | p50 **41.0 s** / p99 **49.5 s** | p50 40.2 s / p99 48.4 s |
+
+A second 200 ev/s sample, from [run 44869239778](https://github.com/Ururu1000/GS-hackathon/actions/runs/44869239778) (commit `631545c`, same workload, a different runner): 709 sms / 709 phone / 2140 email jobs, all sent. Gateway sms p50 **1.3 s** / p99 **3.0 s**, phone p50 1.1 s / p99 2.9 s, Mailpit p50 **1.4 s** / p99 **3.1 s**. Shared 2-vCPU runners differ that much from run to run. That run's 2000 ev/s figures are **not** used: the tool then stopped before the router had processed its outbox, so it measured only 30% of the notifications. The current tool waits and fails on unrouted rows.
+
+What the numbers say:
+
+- **Ingest keeps up**: 2000 ev/s accepted with 0 rejected. Alerts reach `alerts.updates` with first-alert p50 3.9 s / p99 8.5 s at 2000 ev/s (loadgen's own report), and p50 0.5 s / p99 2.9 s at 200 ev/s.
+- **At 2000 ev/s the delivery router is the bottleneck on 2 vCPU.** With 1000 keys per event type, all 4000 alerts open in the first seconds, which is a burst of 4000 notifications and 5000 jobs. The router expands about 100 notifications/s while it shares the two cores with the engine, Postgres, Redpanda and Mailpit, so jobs are planned 40 s after ingest. Once a job is planned, sending takes about 1 s. Nothing is lost: every job reconciles with exactly one receipt.
+- On a 10-core machine the same pipeline delivers 200 ev/s with gateway p99 under 1 s (alexey's Mac rows above).
+
+Re-run it: Actions → `loadgen` → Run workflow (inputs: rates, duration), or push to `ci-run/m6-latency`. By hand, against a running stack: `beacon-loadgen ... | tee lg.out`, then `scripts/delivery_latency.sh --run-id <the id in the report title>`.
 
 ## What is mocked
 
