@@ -66,12 +66,16 @@ Everything below was measured, not estimated. Each row lists its hardware, workl
 
 ### Throughput
 
-| Workload | Hardware, run | Accepted ev/s | Processed ev/s | Ingest → gateway p50 / p99 | Ingest → Mailpit p50 / p99 |
-|---|---|---:|---:|---:|---:|
-| `beacon-loadgen --rate 200 --duration 30` | *CI*, run _TBD_ (`.github/workflows/loadgen.yml`) | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| `beacon-loadgen --rate 2000 --duration 30` | *CI*, run _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+The workload is `beacon-loadgen --duration 30 --batch 100 --distinct-keys 1000 --match-ratio 0.8 --concurrency 256`. It sends open-loop HTTP batches of all four sample event types, and 80% of the events match a rule. It ran on *CI* at commit `631545c` ([run 44869239778](https://github.com/Ururu1000/GS-hackathon/actions/runs/44869239778), `.github/workflows/loadgen.yml`). Each latency starts at server ingest of the first event for an alert key, not at every event. All figures are p50 / p99 in milliseconds.
 
-<!-- M6: filled from loadgen run 44869239778 -->
+| Target rate | Accepted | Processed | Ingest → alert | Ingest → gateway (sms) | Ingest → Mailpit |
+|---|---|---|---:|---:|---:|
+| 200 ev/s | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,806 alerts; backlog drained 2.5 s after sending stopped | 281 / 1,690 | 1,286 / 3,045 | 1,387 / 3,107 |
+| 2,000 ev/s | 60,000 of 60,000 (1,996 ev/s), 0 rejected | 4,000 alerts; drained 5.5 s after sending stopped (about 1,690 ev/s end to end) | 3,949 / 12,526 | not met, see below | not met, see below |
+
+At 200 ev/s, delivery kept up: 709 SMS, 709 phone calls and 2,140 emails were sent, with 0 missing, 0 dead and 0 duplicates.
+
+At 2,000 ev/s, ingest and alerting kept up on the 2-vCPU runner, but routing did not. When the measurement ran, 2,101 of the 3,000 alerts that notify someone still had no delivery jobs (the 1,000 pricing alerts show only in the UI). The jobs that did exist were planned at p50 24.8 s, and they reached the gateway at p50 28.5 s. The tool that measures delivery stopped before routing finished, so this run gives no valid delivery percentile at 2,000 ev/s. The fix is tracked on the board.
 
 ### Ingest → delivery latency
 
