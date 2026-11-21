@@ -773,7 +773,7 @@ pub async fn work_once(
 
 /// Loop `work_once` until shutdown (the value becomes `true` or the sender is dropped); poll
 /// again at once after a non-empty batch, else sleep `cfg.poll_interval` or until `cfg.wake`
-/// fires (a newly inserted job, any channel). Logs and backs off on
+/// fires (a newly inserted job on this channel). Logs and backs off on
 /// DB errors instead of exiting.
 pub async fn run_worker(
     pool: PgPool,
@@ -782,17 +782,16 @@ pub async fn run_worker(
     shutdown: Shutdown,
 ) {
     let mut shutdown = shutdown;
-    let mut wake = cfg.wake.clone();
     info!(worker_id = %cfg.worker_id, channel = channel.name(), "delivery worker started");
     while !*shutdown.borrow() && shutdown.has_changed().is_ok() {
-        // Before claiming: a job inserted after this pass's claim wakes the next wait.
-        wake.mark_seen();
+        let pass_started = tokio::time::Instant::now();
         match work_once(&pool, &channel, &cfg).await {
             Ok(stats) if stats.claimed > 0 || stats.dead_on_claim > 0 => continue,
             Ok(_) => {
                 tokio::select! {
                     _ = tokio::time::sleep(cfg.poll_interval) => {}
-                    _ = wake.changed() => {}
+                    // A new job on this channel: this worker was picked (paced under load).
+                    _ = cfg.wake.notified() => crate::wake::Wake::pace(pass_started).await,
                     res = shutdown.changed() => {
                         // Sender dropped: the owner is gone, so stop like the router does
                         // instead of spinning forever with a pool clone (QA M9).

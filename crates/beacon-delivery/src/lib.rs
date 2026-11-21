@@ -58,8 +58,8 @@ pub struct RouterConfig {
     /// Run the throttle digest pass before each batch. With several router tasks
     /// (`ROUTER_TASKS`) only one needs it; the others would only repeat empty queries.
     pub digest: bool,
-    /// Woken early by `NOTIFY beacon_outbox` ([`wake::OUTBOX_CHANNEL`]); `Wake::never()`
-    /// (the default) only polls.
+    /// Woken early by `NOTIFY beacon_outbox` ([`wake::OUTBOX_CHANNEL`], key
+    /// [`wake::OUTBOX_KEY`]); `Wake::never()` (the default) only polls.
     pub wake: wake::Wake,
 }
 
@@ -107,8 +107,8 @@ pub struct WorkerConfig {
     pub concurrency: usize,
     pub backoff: BackoffPolicy,
     pub breaker: breaker::BreakerPolicy,
-    /// Woken early by `NOTIFY beacon_delivery_jobs` ([`wake::JOBS_CHANNEL`]);
-    /// `Wake::never()` (the default) only polls.
+    /// Woken early by `NOTIFY beacon_delivery_jobs` ([`wake::JOBS_CHANNEL`], keyed by this
+    /// worker's channel name); `Wake::never()` (the default) only polls.
     pub wake: wake::Wake,
 }
 

@@ -386,10 +386,8 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
     let mut shutdown = shutdown;
     let effective = Arc::new(crate::overrides::EffectiveDirectory::new(dir));
     let mut conflicts: u64 = 0;
-    let mut wake = cfg.wake.clone();
     while !*shutdown.borrow() {
-        // Before looking: a NOTIFY for rows this pass misses wakes the next wait.
-        wake.mark_seen();
+        let pass_started = tokio::time::Instant::now();
         // Throttle digests ride along with routing: cheap when nothing is parked.
         if cfg.digest {
             match throttle::digest_once(&pool, 100).await {
@@ -423,7 +421,8 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
-            _ = wake.changed() => {}
+            // A new outbox row: this task was picked to route it (paced under load).
+            _ = cfg.wake.notified() => crate::wake::Wake::pace(pass_started).await,
             // `Err` means the sender is gone, so nobody can signal shutdown any more: stop.
             res = shutdown.changed() => {
                 if res.is_err() {

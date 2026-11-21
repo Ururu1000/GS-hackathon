@@ -540,12 +540,13 @@ async fn main() -> Result<()> {
                 // first runs the throttle digest pass.
                 let router_tasks = workers("ROUTER_TASKS", "4")?;
                 let dir = Arc::new(dir);
-                // One LISTEN connection for all router tasks: woken by every outbox write.
-                let wake = beacon_delivery::wake::Wake::listen(
+                // One LISTEN connection for all router tasks; each outbox write wakes one.
+                let wake = beacon_delivery::wake::Wakes::listen(
                     &pool,
                     beacon_delivery::wake::OUTBOX_CHANNEL,
                     shutdown_rx.clone(),
-                );
+                )
+                .get(beacon_delivery::wake::OUTBOX_KEY);
                 for i in 0..router_tasks {
                     tasks.spawn(beacon_delivery::router::run_router(
                         pool.clone(),
@@ -627,8 +628,9 @@ async fn main() -> Result<()> {
                         .filter(|t| !t.is_empty()),
                     ..GatewayClientConfig::default()
                 };
-                // One LISTEN connection for every worker: woken by each delivery_jobs insert.
-                let jobs_wake = beacon_delivery::wake::Wake::listen(
+                // One LISTEN connection for every worker; a delivery_jobs insert wakes one
+                // worker of each channel it inserted.
+                let jobs_wakes = beacon_delivery::wake::Wakes::listen(
                     &pool,
                     beacon_delivery::wake::JOBS_CHANNEL,
                     shutdown_rx.clone(),
@@ -686,7 +688,7 @@ async fn main() -> Result<()> {
                             pool.clone(),
                             channel.clone(),
                             WorkerConfig {
-                                wake: jobs_wake.clone(),
+                                wake: jobs_wakes.get(name),
                                 ..WorkerConfig::default()
                             },
                             shutdown_rx.clone(),

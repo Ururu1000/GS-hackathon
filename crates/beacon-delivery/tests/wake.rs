@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beacon_delivery::config::{Contact, Directory, Person, Team};
-use beacon_delivery::wake::{JOBS_CHANNEL, OUTBOX_CHANNEL, Wake};
+use beacon_delivery::wake::{JOBS_CHANNEL, OUTBOX_CHANNEL, OUTBOX_KEY, Wakes};
 use beacon_delivery::{RouterConfig, WorkerConfig, router, worker};
 use common::*;
 use serde_json::json;
@@ -69,7 +69,7 @@ async fn inserted_job_wakes_an_idle_worker(pool: PgPool) {
     let (fake, channel) = FakeChannel::new().into_channel();
     let cfg = WorkerConfig {
         poll_interval: LONG_POLL,
-        wake: Wake::listen(&pool, JOBS_CHANNEL, stop_rx.clone()),
+        wake: Wakes::listen(&pool, JOBS_CHANNEL, stop_rx.clone()).get("email"),
         ..worker_cfg("w-wake")
     };
     let task = tokio::spawn(worker::run_worker(pool.clone(), channel, cfg, stop_rx));
@@ -99,7 +99,7 @@ async fn outbox_notify_wakes_an_idle_router(pool: PgPool) {
     let (stop_tx, stop_rx) = watch::channel(false);
     let cfg = RouterConfig {
         poll_interval: LONG_POLL,
-        wake: Wake::listen(&pool, OUTBOX_CHANNEL, stop_rx.clone()),
+        wake: Wakes::listen(&pool, OUTBOX_CHANNEL, stop_rx.clone()).get(OUTBOX_KEY),
         ..RouterConfig::default()
     };
     let task = tokio::spawn(router::run_router(
