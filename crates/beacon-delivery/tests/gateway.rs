@@ -1152,7 +1152,11 @@ async fn open_simulator_stream_does_not_block_shutdown(pool: PgPool) {
         .send()
         .await
         .expect("GET stream");
-    stream.chunk().await.expect("snapshot chunk").expect("snapshot");
+    stream
+        .chunk()
+        .await
+        .expect("snapshot chunk")
+        .expect("snapshot");
 
     shutdown_tx.send(true).expect("signal shutdown");
     tokio::time::timeout(Duration::from_secs(5), server)

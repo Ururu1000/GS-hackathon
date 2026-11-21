@@ -739,7 +739,7 @@ mod tests {
         for t in ["settlements", "pricing", "rates", "payments"] {
             assert!(!d.expand(&format!("team:{t}")).unwrap().is_empty(), "{t}");
         }
-        assert_eq!(d.expand("oncall:settlements").unwrap().len(), 1);
+        assert_eq!(d.expand("oncall:settlements-primary").unwrap().len(), 1);
 
         // Every route target in the seed rules (owned by part (a)) must expand against the
         // seed directory, so a renamed team or schedule fails here instead of at runtime.

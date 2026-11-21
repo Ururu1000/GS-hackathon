@@ -47,12 +47,12 @@ export function facetCounts(alerts: Iterable<FeedAlert>, f: Filters) {
   return { status, severity, rules }
 }
 
-// Persist filters per browser (a convenience, never required).
+// Persist filters per browser tab session (avoids leaking filters on shared workstations).
 const KEY = 'beacon.filters.v1'
 
 export function loadFilters(): Filters {
   try {
-    const raw = localStorage.getItem(KEY)
+    const raw = sessionStorage.getItem(KEY)
     if (!raw) return defaultFilters
     const j = JSON.parse(raw) as { status?: string[]; severity?: string[]; rule?: string }
     return {
@@ -68,7 +68,7 @@ export function loadFilters(): Filters {
 
 export function saveFilters(f: Filters) {
   try {
-    localStorage.setItem(KEY, JSON.stringify({ status: [...f.status], severity: [...f.severity], rule: f.rule }))
+    sessionStorage.setItem(KEY, JSON.stringify({ status: [...f.status], severity: [...f.severity], rule: f.rule }))
   } catch {
     /* storage unavailable */
   }

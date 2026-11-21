@@ -36,6 +36,11 @@ impl std::fmt::Debug for ConfigSnapshot {
 impl ConfigSnapshot {
     /// Compile a full snapshot. Every problem is reported, not just the first.
     pub fn build(revision: i64, schemas: Vec<SchemaMappingSpec>, rules: Vec<RuleSpec>) -> Result<ConfigSnapshot> {
+        Self::build_with(revision, schemas, rules.into_iter().map(|r| (r, revision)).collect())
+    }
+
+    /// Like [`build`](Self::build), with a revision per rule (rules stored in Postgres).
+    pub fn build_with(revision: i64, schemas: Vec<SchemaMappingSpec>, rules: Vec<(RuleSpec, i64)>) -> Result<ConfigSnapshot> {
         let mut errors: Vec<String> = Vec::new();
 
         let mut seen = HashSet::new();
@@ -55,12 +60,12 @@ impl ConfigSnapshot {
         let mut env = template::new_env();
         let mut seen = HashSet::new();
         let mut compiled = Vec::new();
-        for r in rules {
+        for (r, rule_revision) in rules {
             if !seen.insert(r.id.clone()) {
                 errors.push(format!("duplicate rule id `{}`", r.id));
                 continue;
             }
-            let rule = match CompiledRule::compile(r, revision) {
+            let rule = match CompiledRule::compile(r, rule_revision) {
                 Ok(rule) => rule,
                 Err(e) => {
                     errors.push(e.to_string());

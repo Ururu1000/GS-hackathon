@@ -99,7 +99,7 @@ async fn insert_sms_job(
 /// Route info with a one-hop fallback (SPEC §5.6), as the M4 router freezes it.
 fn fallback_route(fallback_channel: &str, address: &str) -> Value {
     json!({
-        "target": "oncall:settlements",
+        "target": "oncall:settlements-primary",
         "rule_id": "settlements-workflow-failed",
         "reason": "new",
         "fallback": { "channel": fallback_channel, "address": address },
@@ -660,7 +660,7 @@ async fn dead_job_creates_exactly_one_fallback_job(pool: PgPool) {
     assert_eq!(fb.attempts, 0);
     assert_eq!(fb.fallback_of, Some(sms_id));
     // Provenance chain (SPEC §5.6).
-    assert_eq!(fb.route_info["target"], "oncall:settlements");
+    assert_eq!(fb.route_info["target"], "oncall:settlements-primary");
     assert_eq!(fb.route_info["rule_id"], "settlements-workflow-failed");
     assert_eq!(fb.route_info["reason"], "new");
     assert_eq!(fb.route_info["fallback_from"], "sms");
@@ -758,7 +758,7 @@ async fn existing_job_on_the_fallback_channel_prevents_a_duplicate(pool: PgPool)
         "bob",
         "email",
         "bob@example.test",
-        json!({"target": "oncall:settlements"}),
+        json!({"target": "oncall:settlements-primary"}),
     )
     .await;
 
@@ -778,7 +778,7 @@ async fn existing_job_on_the_fallback_channel_prevents_a_duplicate(pool: PgPool)
     assert_eq!(email.len(), 1);
     assert_eq!(email[0].id, existing, "the pre-existing job is untouched");
     assert_eq!(email[0].fallback_of, None);
-    assert_eq!(email[0].route_info["target"], "oncall:settlements");
+    assert_eq!(email[0].route_info["target"], "oncall:settlements-primary");
     let sms = job_row(&pool, sms_id).await;
     assert_eq!(sms.status, "dead");
 }
@@ -1070,9 +1070,17 @@ async fn jobs_queued_behind_a_send_slot_do_not_send_once_the_breaker_opens(pool:
     let stats = work_once_bounded(&pool, &bad, &cfg).await;
     assert_eq!(stats.claimed, 3, "{stats:?}");
     assert_eq!(stats.deferred, 3, "{stats:?}");
-    assert_eq!(fake.calls(), 1, "only the send that opened the breaker goes out");
+    assert_eq!(
+        fake.calls(),
+        1,
+        "only the send that opened the breaker goes out"
+    );
     let jobs = job_rows(&pool, alert).await;
-    assert!(jobs.iter().all(|j| j.status == "pending" && j.attempts == 0), "{jobs:?}");
+    assert!(
+        jobs.iter()
+            .all(|j| j.status == "pending" && j.attempts == 0),
+        "{jobs:?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

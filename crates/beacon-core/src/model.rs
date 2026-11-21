@@ -27,6 +27,34 @@ pub enum NotifyReason {
     Renotify,
 }
 
+/// Canonical facts about the event that opened (or escalated) an alert, for
+/// delivery preferences such as "critical + payments-api" (board #100).
+/// Absent values are omitted; delivery treats them as non-matching.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotifyContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+}
+
+/// The event that opened an alert, pinned for runbook templates such as
+/// `{{workflowId}}` (board #172). `raw` is capped at [`MAX_NOTIFY_RAW`] bytes;
+/// a larger payload becomes a truncated string preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotifyEvent {
+    pub fields: serde_json::Map<String, Value>,
+    pub raw: Value,
+}
+
+pub const MAX_NOTIFY_RAW: usize = 16 * 1024;
+
 /// Payload of an outbox row with `kind = 'notify'` (board #27/#35, spec §13).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotifyPayload {
@@ -41,6 +69,11 @@ pub struct NotifyPayload {
     pub route: Vec<RouteSpec>,
     #[serde(with = "rfc3339_ms")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub context: NotifyContext,
+    /// Present on `reason = new` for rules with a runbook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<NotifyEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

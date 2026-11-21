@@ -112,6 +112,41 @@ pub struct AutoResolveSpec {
 pub const MAX_FIELDS: usize = 32;
 pub const MAX_DEDUP_KEY: usize = 8;
 
+/// Compiled `group: {by: [paths], window}` (window: "5m" or seconds).
+#[derive(Debug, Clone)]
+pub struct GroupBy {
+    pub by: Vec<Path>,
+    pub window: Duration,
+}
+
+fn parse_group(v: &Value) -> Result<Option<GroupBy>, String> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let by: Vec<String> = match v.get("by") {
+        None | Some(Value::Null) => vec![],
+        Some(b) => serde_json::from_value(b.clone()).map_err(|_| "group.by must be a list of paths".to_string())?,
+    };
+    let window = match v.get("window") {
+        None | Some(Value::Null) => Duration::ZERO,
+        Some(Value::Number(n)) => Duration::from_secs(n.as_u64().ok_or("group.window must be a positive number of seconds")?),
+        Some(Value::String(s)) => humantime_serde::re::humantime::parse_duration(s).map_err(|e| format!("group.window: {e}"))?,
+        Some(_) => return Err("group.window must be like \"5m\" or a number of seconds".into()),
+    };
+    // A zero window means "no grouping" (the seed YAML style `by: [], window: 0`).
+    if window.is_zero() {
+        return Ok(None);
+    }
+    if window < Duration::from_secs(1) || window > Duration::from_secs(24 * 3600) {
+        return Err("group.window must be between 1s and 24h".into());
+    }
+    if by.len() > MAX_DEDUP_KEY {
+        return Err(format!("group.by takes at most {MAX_DEDUP_KEY} paths"));
+    }
+    let by = by.iter().map(|p| Path::parse(p).map_err(|e| format!("group.by `{p}`: {e}"))).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(GroupBy { by, window }))
+}
+
 pub const COLORS: &[&str] = &["red", "orange", "amber", "yellow", "green", "blue", "purple", "grey"];
 
 #[derive(Debug, thiserror::Error)]
@@ -154,6 +189,8 @@ pub enum RuleError {
     Route { rule: String, to: String },
     #[error("rule id must be non-empty and use [a-z0-9-_.]")]
     BadId,
+    #[error("rule `{rule}`: {message}")]
+    Group { rule: String, message: String },
     #[error("rule `{rule}`: at most {MAX_FIELDS} presented fields and {MAX_DEDUP_KEY} dedup key paths")]
     TooMany { rule: String },
 }
@@ -164,6 +201,8 @@ pub enum RuleError {
 pub struct CompiledRule {
     pub spec: RuleSpec,
     pub revision: i64,
+    /// `group:`: one alert per group tuple per UTC time bucket.
+    pub group: Option<GroupBy>,
     pub when: Condition,
     pub recover_when: Option<Condition>,
     pub dedup_key: Vec<Path>,
@@ -242,9 +281,22 @@ impl CompiledRule {
                 });
             }
         }
+        let group = match spec.group.as_ref() {
+            None => None,
+            Some(g) => parse_group(g).map_err(|message| RuleError::Group { rule: rule.clone(), message })?,
+        };
+        // A digest per window that never closes would pile up open alerts.
+        let resolves = spec.auto_resolve.as_ref().is_some_and(|a| a.quiet_for.is_some() || a.recover_when.is_some());
+        if group.is_some() && !resolves {
+            return Err(RuleError::Group {
+                rule,
+                message: "grouped rules need auto_resolve.quiet_for or auto_resolve.recover_when, so old windows close".into(),
+            });
+        }
         Ok(CompiledRule {
             spec,
             revision,
+            group,
             when,
             recover_when,
             dedup_key,

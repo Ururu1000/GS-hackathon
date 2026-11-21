@@ -11,6 +11,7 @@ beacon-delivery = { path = "../beacon-delivery" }
 beacon-core = { path = "../beacon-core" }
 beacon-ingest = { path = "../beacon-ingest" }
 beacon-engine = { path = "../beacon-engine" }
+beacon-api = { path = "../beacon-api" }
 axum.workspace = true
 tokio.workspace = true
 sqlx.workspace = true

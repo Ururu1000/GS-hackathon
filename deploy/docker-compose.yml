@@ -44,6 +44,9 @@ services:
 
   mailpit:
     image: axllent/mailpit:v1.27
+    environment:
+      # Default is 500; delivery's load test checks that 1,000 messages arrive.
+      MP_MAX_MESSAGES: "20000"
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"
