@@ -11,10 +11,12 @@
 mod common;
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use beacon_delivery::channel::{Channel, Receipt, SendError};
+use beacon_delivery::clock::FixedClock;
 use beacon_delivery::config::{Contact, Directory, Person, Team};
 use beacon_delivery::model::JobStatus;
 use beacon_delivery::router::route_once;
@@ -39,10 +41,11 @@ fn person(id: &str, email: Option<&str>) -> Person {
             phone: None,
         },
         preferences: None,
+        rules: Vec::new(),
     }
 }
 
-/// anna, bob, carol in team `rates`; dave has no email.
+/// anna, bob, carol in team `rates` (default email); dave has no email.
 fn directory() -> Directory {
     Directory::from_parts(
         vec![
@@ -56,6 +59,7 @@ fn directory() -> Directory {
             members: vec!["anna".into(), "bob".into(), "carol".into()],
             lead: Some("bob".into()),
             oncall: Default::default(),
+            default_channels: Some(vec!["email".into()]),
         }],
     )
     .expect("directory")
@@ -188,7 +192,7 @@ async fn router_skips_bad_targets_and_marks_malformed_processed(pool: PgPool) {
     // B: malformed payload.
     let b = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let out_b = insert_outbox_raw(&pool, "notify", b, json!({"not": "a notify payload"})).await;
-    // C: no `channels` -> default (email); unsupported channel and no-address person -> skipped.
+    // C: no `channels` -> team default (email); unsupported channel and no-address person -> skipped.
     let c = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
     let out_c = insert_notify(
         &pool,
@@ -196,7 +200,7 @@ async fn router_skips_bad_targets_and_marks_malformed_processed(pool: PgPool) {
         1,
         json!([
             {"to": "user:bob"},
-            {"to": "user:carol", "channels": ["sms"]},
+            {"to": "user:carol", "channels": ["fax"]},
             {"to": "user:dave", "channels": ["email"]}
         ]),
     )
@@ -224,10 +228,123 @@ async fn router_skips_bad_targets_and_marks_malformed_processed(pool: PgPool) {
     assert_eq!(
         jobs_c.len(),
         1,
-        "carol (sms) and dave (no email) get no job"
+        "carol (unsupported fax) and dave (no email) get no job"
     );
     assert_eq!(jobs_c[0].recipient_id, "bob");
     assert_eq!(jobs_c[0].channel, "email");
+    assert_eq!(
+        jobs_c[0].route_info["decision"]["source"], "team_default",
+        "bob has no preferences; the team default applies: {}",
+        jobs_c[0].route_info["decision"]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 1b. Preferences, time windows and frozen decisions (M4)
+// ---------------------------------------------------------------------------------------------
+
+/// The seed directory from `config/`: real people with preferences and the delivery
+/// fallback chain (`sms -> email`).
+fn seed_directory() -> Directory {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config");
+    Directory::load(&root).expect("seed config")
+}
+
+/// Anna as routed by `config/rules/anna-payments-critical.yaml`: no explicit `channels`,
+/// severity critical, `context.service = payments-api`.
+fn anna_notify(alert: Uuid, notify_seq: i32) -> serde_json::Value {
+    json!({
+        "alert_id": alert,
+        "notify_seq": notify_seq,
+        "rule_id": "anna-payments-critical",
+        "rule_revision": 1,
+        "team": "payments",
+        "severity": "critical",
+        "reason": "new",
+        "route": [{"to": "user:anna"}],
+        "context": {"service": "payments-api"},
+        "created_at": "2026-01-15T09:00:00Z",
+    })
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn router_resolves_annas_preferences_and_freezes_the_decision(pool: PgPool) {
+    let dir = seed_directory();
+    let alert = insert_alert(&pool, "open", &alert_title(&unique_tag())).await;
+    let outbox = insert_outbox_raw(&pool, "notify", alert, anna_notify(alert, 1)).await;
+
+    // 09:00 London in January is 09:00 GMT: inside Anna's [08:00, 20:00) window.
+    let clock = Arc::new(FixedClock::new(
+        "2026-01-15T09:00:00Z".parse().expect("timestamp"),
+    ));
+    let cfg = RouterConfig {
+        clock: clock.clone(),
+        ..RouterConfig::default()
+    };
+    let stats = route_once(&pool, &dir, &cfg).await.expect("route_once");
+    assert_eq!(stats.outbox_rows, 1, "{stats:?}");
+    assert_eq!(stats.jobs_inserted, 1, "{stats:?}");
+    assert_eq!(stats.skipped, 0, "{stats:?}");
+
+    let jobs = job_rows(&pool, alert).await;
+    assert_eq!(jobs.len(), 1, "{stats:?}");
+    let job = &jobs[0];
+    assert_eq!(job.recipient_id, "anna");
+    assert_eq!(job.channel, "sms");
+    assert_eq!(job.address, "+44 7700 900123");
+    assert_eq!(job.status, "pending");
+    assert_eq!(job.route_info["target"], "user:anna");
+    assert_eq!(job.route_info["rule_id"], "anna-payments-critical");
+    assert_eq!(job.route_info["rule_revision"], 1);
+    assert_eq!(job.route_info["reason"], "new");
+    assert_eq!(job.route_info["outbox_id"], json!(outbox));
+    assert_eq!(job.route_info["decided_at"], "2026-01-15T09:00:00.000Z");
+    assert_eq!(
+        job.route_info["decision"],
+        json!({"source": "preference", "index": 0, "window": "in"}),
+        "decision: {}",
+        job.route_info["decision"]
+    );
+    // The seed delivery.yaml falls back from sms to email, and Anna has an email address.
+    assert_eq!(
+        job.route_info["fallback"],
+        json!({"channel": "email", "address": "anna@example.test"}),
+        "fallback: {}",
+        job.route_info["fallback"]
+    );
+    assert!(outbox_processed(&pool, outbox).await);
+
+    // 21:00 London (GMT) is outside the window: her `otherwise` is email, and email has no
+    // fallback, so the key is absent.
+    clock.set("2026-01-15T21:00:00Z".parse().expect("timestamp"));
+    let outbox2 = insert_outbox_raw(&pool, "notify", alert, anna_notify(alert, 2)).await;
+    let again = route_once(&pool, &dir, &cfg)
+        .await
+        .expect("route_once again");
+    assert_eq!(again.outbox_rows, 1, "{again:?}");
+    assert_eq!(again.jobs_inserted, 1, "{again:?}");
+
+    let jobs = job_rows(&pool, alert).await;
+    let email = jobs
+        .iter()
+        .find(|j| j.channel == "email")
+        .expect("email job after re-notify");
+    assert_eq!(email.recipient_id, "anna");
+    assert_eq!(email.address, "anna@example.test");
+    assert_eq!(email.notify_seq, 2);
+    assert_eq!(email.route_info["decided_at"], "2026-01-15T21:00:00.000Z");
+    assert_eq!(
+        email.route_info["decision"],
+        json!({"source": "preference", "index": 0, "window": "out"}),
+        "decision: {}",
+        email.route_info["decision"]
+    );
+    assert!(
+        email.route_info.get("fallback").is_none(),
+        "email has no fallback configured: {}",
+        email.route_info
+    );
+    assert!(outbox_processed(&pool, outbox2).await);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -290,6 +407,7 @@ async fn end_to_end_router_then_worker_then_mailpit(pool: PgPool) {
             members: vec!["anna".into(), "bob".into()],
             lead: None,
             oncall: Default::default(),
+            default_channels: None,
         }],
     )
     .expect("directory");

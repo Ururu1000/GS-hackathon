@@ -1,3 +1,4 @@
 team: rates
 members: [bob, erin]
 lead: bob
+default_channels: [email]   # step 3 of the routing precedence (SPEC §4.4)
