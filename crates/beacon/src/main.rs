@@ -15,11 +15,11 @@
 //! | `SMS_GATEWAY_URL`    | `http://localhost:8070`                   | delivery          |
 //! | `PUBLIC_URL`         | `http://localhost:5173` (SMS short links) | delivery          |
 //! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
-//! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery |
+//! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery, api (simulator mount) |
 //! | `ESCALATE_AFTER_OVERRIDE_MS` | unset (demo: replaces rule `escalate_after`) | router |
-//! | `REPLY_SECRET`       | unset = SMS replies rejected              | gateway, delivery-api |
+//! | `REPLY_SECRET`       | unset = SMS replies rejected              | gateway, api, delivery-api |
 //! | `DELIVERY_API_ADDR`  | `127.0.0.1:8071`                          | delivery-api      |
-//! | `DELIVERY_API_URL`   | `http://127.0.0.1:8071` (reply forward)   | gateway           |
+//! | `DELIVERY_API_URL`   | this process's `API_ADDR` with the api role (and no delivery-api), else `http://127.0.0.1:8071` (reply forward) | gateway |
 //! | `DELIVERY_API_DEMO_ACTOR` | `user:bob` (dev only)                | delivery-api      |
 //! | `DELIVERY_API_DEMO_HEADER` | `0`; `1` honours `X-Beacon-Demo-Actor` (dev only) | delivery-api |
 //! | `SMTP_TLS`           | `none` \| `starttls` \| `tls`            | delivery          |
@@ -235,6 +235,42 @@ async fn main() -> Result<()> {
             .max(1))
     };
 
+    // One GatewayState per process: the gateway role and the simulator routes beacon-api
+    // mounts must share it (outages and the SSE broadcast are in memory).
+    let has = |r: Role| args.roles.contains(&r);
+    let gateway_token = std::env::var("GATEWAY_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if let Some(t) = &gateway_token {
+        beacon_api::bearer_header(t)
+            .context("GATEWAY_TOKEN must be a valid HTTP header value (no control characters)")?;
+    }
+    let gateway_state = if has(Role::Gateway) {
+        // Replies go to whichever process serves /api/replies: the API role mounts delivery's
+        // routes, so in an all-in-one process that is our own API port.
+        let default_reply_url = if has(Role::Api) && !has(Role::DeliveryApi) {
+            local_url(&env_or("API_ADDR", "127.0.0.1:8080"))?
+        } else {
+            "http://127.0.0.1:8071".to_string()
+        };
+        Some(
+            beacon_delivery::gateway::GatewayState::new(pool.clone())
+                .with_token(gateway_token.clone())
+                .with_reply_forward(
+                    Some(env_or("DELIVERY_API_URL", &default_reply_url)),
+                    reply_secret(),
+                )
+                .with_mocks()
+                .with_max_streams(
+                    env_or("GATEWAY_MAX_STREAMS", "64")
+                        .parse()
+                        .context("GATEWAY_MAX_STREAMS")?,
+                ),
+        )
+    } else {
+        None
+    };
+
     for role in &args.roles {
         match role {
             Role::Ingest => {
@@ -380,7 +416,27 @@ async fn main() -> Result<()> {
                         max_inflight,
                     ))
                 };
-                let app = beacon_api::router_with(state, ui_dir.clone(), Some(same_origin_ingest));
+                // Delivery's routes on the same origin, behind the session (Actor/Admin/CSRF).
+                // The simulator is mounted only when this process also runs the gateway, since
+                // it must share the gateway's in-memory state.
+                if gateway_state.is_none() {
+                    info!("no gateway role in this process: /api/simulator/* is not mounted");
+                }
+                let delivery = beacon_api::DeliveryMount {
+                    api: delivery_api_state(&pool, &config_dir)?,
+                    simulator: gateway_state
+                        .clone()
+                        .map(|state| beacon_api::SimulatorMount {
+                            state,
+                            token: gateway_token.clone(),
+                        }),
+                };
+                let app = beacon_api::router_full(
+                    state,
+                    ui_dir.clone(),
+                    Some(same_origin_ingest),
+                    Some(delivery),
+                );
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("binding {addr}"))?;
@@ -466,23 +522,7 @@ async fn main() -> Result<()> {
                 ));
             }
             Role::DeliveryApi => {
-                let dir_path = PathBuf::from(env_or("BEACON_CONFIG_DIR", "config"));
-                let dir = Directory::load(&dir_path)
-                    .with_context(|| format!("loading config from {}", dir_path.display()))?;
-                let registry = beacon_delivery::actions::ActionRegistry::builtin(
-                    beacon_delivery::actions::ActionsConfig {
-                        gateway_url: env_or("SMS_GATEWAY_URL", "http://localhost:8070"),
-                        http_targets: beacon_delivery::actions::load_http_targets(&dir_path)?,
-                        timeout: std::time::Duration::from_secs(5),
-                    },
-                );
-                let state = beacon_delivery::api::ApiState {
-                    pool: pool.clone(),
-                    dir: Arc::new(dir),
-                    registry,
-                    alert_ops: alert_ops(),
-                    reply_secret: reply_secret().map(Arc::new),
-                };
+                let state = delivery_api_state(&pool, &config_dir)?;
                 let addr: std::net::SocketAddr = env_or("DELIVERY_API_ADDR", "127.0.0.1:8071")
                     .parse()
                     .context("DELIVERY_API_ADDR")?;
@@ -589,22 +629,9 @@ async fn main() -> Result<()> {
                 let addr: std::net::SocketAddr = env_or("GATEWAY_ADDR", "127.0.0.1:8070")
                     .parse()
                     .context("GATEWAY_ADDR")?;
-                let state = beacon_delivery::gateway::GatewayState::new(pool.clone())
-                    .with_token(
-                        std::env::var("GATEWAY_TOKEN")
-                            .ok()
-                            .filter(|t| !t.is_empty()),
-                    )
-                    .with_reply_forward(
-                        Some(env_or("DELIVERY_API_URL", "http://127.0.0.1:8071")),
-                        reply_secret(),
-                    )
-                    .with_mocks()
-                    .with_max_streams(
-                        env_or("GATEWAY_MAX_STREAMS", "64")
-                            .parse()
-                            .context("GATEWAY_MAX_STREAMS")?,
-                    );
+                let state = gateway_state
+                    .clone()
+                    .expect("built above for the gateway role");
                 let rx = shutdown_rx.clone();
                 tasks.spawn(async move {
                     if let Err(e) = beacon_delivery::gateway::serve(state, addr, rx, |bound| {
@@ -646,6 +673,45 @@ async fn main() -> Result<()> {
         while tasks.join_next().await.is_some() {}
     }
     Ok(())
+}
+
+/// Delivery's API state (runbooks, approvals, people/teams) for the API mount and the
+/// standalone `delivery-api` role.
+fn delivery_api_state(
+    pool: &sqlx::PgPool,
+    config_dir: &std::path::Path,
+) -> Result<beacon_delivery::api::ApiState> {
+    let dir = Directory::load(config_dir)
+        .with_context(|| format!("loading config from {}", config_dir.display()))?;
+    let registry = beacon_delivery::actions::ActionRegistry::builtin(
+        beacon_delivery::actions::ActionsConfig {
+            gateway_url: env_or("SMS_GATEWAY_URL", "http://localhost:8070"),
+            http_targets: beacon_delivery::actions::load_http_targets(config_dir)?,
+            timeout: std::time::Duration::from_secs(5),
+        },
+    );
+    Ok(beacon_delivery::api::ApiState {
+        pool: pool.clone(),
+        dir: Arc::new(dir),
+        registry,
+        alert_ops: alert_ops(),
+        reply_secret: reply_secret().map(Arc::new),
+    })
+}
+
+/// `http://<host>:<port>` reaching a listener bound to `addr` from this host
+/// (a wildcard bind is reached over loopback).
+fn local_url(addr: &str) -> Result<String> {
+    let addr: std::net::SocketAddr = addr.parse().with_context(|| format!("parsing {addr}"))?;
+    let ip = if addr.ip().is_unspecified() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        addr.ip()
+    };
+    Ok(format!(
+        "http://{}",
+        std::net::SocketAddr::new(ip, addr.port())
+    ))
 }
 
 /// `REPLY_SECRET` as bytes, if set.

@@ -24,6 +24,12 @@ services:
       API_ADDR: 0.0.0.0:8080
       INGEST_ADDR: 0.0.0.0:8090
       BEACON_DEMO_USER: anna
+      # Demo-only secrets (change them for anything shared). GATEWAY_TOKEN guards the
+      # fake SMS/phone gateway; the API injects it for the UI's simulator screen.
+      # REPLY_SECRET signs simulator replies ("Y <code>", "ACK") forwarded to /api/replies.
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-beacon-demo-gateway-token}
+      REPLY_SECRET: ${REPLY_SECRET:-beacon-demo-reply-secret}
+      PUBLIC_URL: http://localhost:8080
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:8090:8090"

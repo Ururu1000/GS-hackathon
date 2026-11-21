@@ -308,11 +308,23 @@ pub async fn detail(State(state): State<ApiState>, Path(id): Path<String>) -> Re
             "updated_at": ts(j.try_get("updated_at")?),
         }));
     }
+    // Delivery's audit trail (runbook steps, approvals, SMS acks, escalations,
+    // digests). An ack/resolve it recorded replaces the one derived from the
+    // alert row, so the timeline shows it once, with its channel.
+    let actor = beacon_delivery::api::Actor(state.session.actor());
+    let delivery = beacon_delivery::api::timeline_entries(&state.pool, id).await?;
+    for kind in ["acked", "resolved"] {
+        if delivery.iter().any(|e| e["kind"] == kind) {
+            timeline.retain(|e| e["kind"] != kind);
+        }
+    }
+    timeline.extend(delivery);
     timeline.sort_by(|x, y| x["at"].as_str().cmp(&y["at"].as_str()));
+    let runbook = beacon_delivery::api::runbook_view(&state.pool, id, &actor).await?;
     let mut v = api_alert(&a);
     let o = v.as_object_mut().expect("alert is an object");
     o.insert("samples".into(), json!([]));
-    o.insert("runbook".into(), Value::Null);
+    o.insert("runbook".into(), runbook.unwrap_or(Value::Null));
     o.insert("deliveries".into(), Value::Array(deliveries));
     o.insert("timeline".into(), Value::Array(timeline));
     Ok(Json(v))

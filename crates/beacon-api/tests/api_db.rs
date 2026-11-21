@@ -651,3 +651,83 @@ async fn proposal_and_mapping_guards(pool: PgPool) {
     let (s, _) = send(&app, "POST", &format!("/api/proposals/{}/accept", p["id"].as_str().unwrap()), &csrf, None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
 }
+
+/// The app with delivery's routes and the simulator mounted (gateway token "gw-token").
+fn delivery_harness(pool: PgPool) -> Harness {
+    let session = Arc::new(Session::demo(&root().join("config"), "anna").unwrap());
+    let (updates, _) = broadcast::channel(64);
+    let (ready_tx, ready) = watch::channel(true);
+    let csrf = session.csrf_token.clone();
+    let state = ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let config = root().join("config");
+    let dir = beacon_delivery::config::Directory::load(&config).unwrap();
+    let registry = beacon_delivery::actions::ActionRegistry::builtin(beacon_delivery::actions::ActionsConfig {
+        gateway_url: "http://127.0.0.1:1".into(),
+        http_targets: beacon_delivery::actions::load_http_targets(&config).unwrap(),
+        timeout: Duration::from_secs(1),
+    });
+    let delivery = beacon_api::DeliveryMount {
+        api: beacon_delivery::api::ApiState {
+            pool: pool.clone(),
+            dir: Arc::new(dir),
+            registry,
+            alert_ops: Arc::new(beacon_delivery::alert_ops::SqlAlertOps),
+            reply_secret: Some(Arc::new(b"reply-secret".to_vec())),
+        },
+        simulator: Some(beacon_api::SimulatorMount {
+            state: beacon_delivery::gateway::GatewayState::new(pool).with_token(Some("gw-token".into())),
+            token: Some("gw-token".into()),
+        }),
+    };
+    Harness { app: beacon_api::router_full(state, None, None, Some(delivery)), updates, ready: ready_tx, csrf }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn delivery_routes_are_mounted_behind_the_session(pool: PgPool) {
+    seed(&pool, &["trade-rejected.json"]).await;
+    let h = delivery_harness(pool);
+
+    // Reads get the session's actor: anna sees her own contact, others are redacted.
+    let (s, v) = get(&h.app, "/api/people").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["items"].as_array().unwrap().iter().any(|p| p["id"] == "anna"));
+    let (s, v) = get(&h.app, "/api/teams").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Admin(session.admin) is passed through: the demo admin may edit every team.
+    assert!(v["items"].as_array().unwrap().iter().all(|t| t["can_edit"] == json!(true)), "{v}");
+    assert_eq!(get(&h.app, "/api/runbooks").await.0, StatusCode::OK);
+
+    // Writes need the CSRF token.
+    let (s, e) = post(&h.app, "/api/approvals/00000000-0000-0000-0000-000000000000/approve", None, json!({})).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("csrf")));
+    let (s, _) = post(&h.app, "/api/approvals/00000000-0000-0000-0000-000000000000/approve", Some(&h.csrf), json!({})).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // /api/replies is the gateway's signed callback: no CSRF, but the signature is checked.
+    let (s, e) = post(&h.app, "/api/replies", None, json!({"from": "+1", "text": "ACK"})).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("unauthorized")));
+
+    // The alert detail carries delivery's runbook view (null when none was frozen).
+    let (_, v) = get(&h.app, "/api/alerts").await;
+    let id = v["items"][0]["id"].as_str().unwrap().to_string();
+    let (s, d) = get(&h.app, &format!("/api/alerts/{id}")).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(d.get("runbook").is_some() && d["timeline"].as_array().is_some_and(|t| !t.is_empty()));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn simulator_is_mounted_with_the_gateway_token_injected(pool: PgPool) {
+    let h = delivery_harness(pool);
+    // The browser never holds GATEWAY_TOKEN: the API adds it.
+    let (s, v) = get(&h.app, "/api/simulator/messages").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["items"].is_array());
+    // A browser-supplied Authorization header is replaced, not trusted or forwarded.
+    let res = h.app.clone().oneshot(Request::get("/api/simulator/outage").header("authorization", "Bearer wrong").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // Outage control is a write: CSRF first.
+    let (s, e) = post(&h.app, "/api/simulator/outage", None, json!({"channel": "sms", "mode": "down", "seconds": 5})).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("csrf")));
+    let (s, v) = post(&h.app, "/api/simulator/outage", Some(&h.csrf), json!({"channel": "sms", "mode": "down", "seconds": 5})).await;
+    assert!(s.is_success(), "{s} {v}");
+}
