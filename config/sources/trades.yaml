@@ -1,0 +1,6 @@
+# Business events in a {meta, payload} envelope from the trade gateway
+# (Appendix A, "Business event (from a message broker, using a different envelope)").
+id: kafka:trades
+type: kafka
+topics: [trade-events]
+start: earliest

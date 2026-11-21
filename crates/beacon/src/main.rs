@@ -205,6 +205,9 @@ async fn main() -> Result<()> {
             Role::Sources => {
                 let specs = beacon_ingest::kafka_source::load_sources(&config_dir.join("sources"))?;
                 info!(sources = specs.len(), "kafka sources starting");
+                // Demo convenience: make sure the source topics exist on our broker.
+                let local: Vec<String> = specs.iter().filter(|s| s.bootstrap.is_none()).flat_map(|s| s.topics.clone()).collect();
+                beacon_ingest::kafka::ensure_named_topics(&kafka, &local, 6).await?;
                 let publisher = beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
                 for spec in specs {
                     let (kafka, publisher, rx) = (kafka.clone(), publisher.clone(), shutdown_rx.clone());

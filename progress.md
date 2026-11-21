@@ -24,7 +24,8 @@ Last updated: 2026-11-21.
 | Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
 | Exact counts under replay and crashes (M1) | Done: scenario e exact | PR #15 |
 | Grouping digests + quiet-for auto-resolve (M3) | Done | PR #16 |
-| Kafka-mode load test | Later | |
+| Second source type: Kafka sources + Kafka-mode load test | Done | PR #17 |
+| Load scenario d (500 dupes/s on one key) | Done: exact | PR #17 |
 
 PR merge order: #5 → #8 → #7 → #9 → #11 → #12 → #13. Each PR is stacked on the previous one.
 
@@ -102,6 +103,17 @@ DATABASE_URL=postgres://beacon:beacon@localhost:5432/beacon \
 - **`auto_resolve.quiet_for`:** a sweeper resolves open or acked alerts with no new match for that long (`resolved_reason = quiet_for`). Pricing digests resolve after 10 quiet minutes.
   - Sweepers claim rows with `SKIP LOCKED`.
   - Postgres re-checks `last_seen` after a row lock, so a fresh match always wins.
+
+## Sources and scenario d
+
+- **Two source types, as the brief asks:**
+  - **HTTP webhook.**
+  - **Kafka sources** declared in `config/sources/`:
+    - `kafka:workflows` reads `workflow-events`.
+    - `kafka:trades` reads `trade-events`.
+- **The compose demo seed** sends the workflow failure and the rejected trade through Kafka and the rest over HTTP.
+- **Scenario d:** 10,000 identical events at 500/s gave 1 alert with count 10,000. The live count update reached the feed with p99 204 ms.
+- **Kafka-source load:** 5,000 events/s from an external topic, first-alert p99 284 ms.
 
 ## Exact counts (M1)
 

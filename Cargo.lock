@@ -337,6 +337,7 @@ dependencies = [
  "beacon-ingest",
  "chrono",
  "clap",
+ "futures",
  "hdrhistogram",
  "rand 0.9.5",
  "rdkafka",

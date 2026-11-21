@@ -82,3 +82,27 @@ These runs used the same laptop as the first table, while another load test was 
 | Exactly-once, 20 ms commits | 4 | 334 ms | 2,894 ms | 3,396 ms (backlog) |
 
 The trade-off: exactly-once costs about 170 ms of p99 at this rate. Here the results are latency from intended send until the alert update, as above.
+
+## Scenario d: 500 duplicates per second on one key
+
+`--event-types workflow --distinct-keys 1 --match-ratio 1 --rate 500 --duration 20`: every event is the same workflow failure.
+
+| Measure | Value |
+|---|---|
+| Events accepted | 10,000 |
+| Alerts for that key | **1** |
+| Alert count | **10,000** (exact) |
+| Count update latency (p50 / p99) | 165.6 ms / 204.3 ms |
+
+## Kafka source (second source type)
+
+`--via kafka --topic workflow-events --event-types workflow --rate 5000 --duration 15`.
+
+Events go to the external `workflow-events` topic, which the `kafka:workflows` source in `config/sources/` consumes. They are not posted to the webhook.
+
+| Measure | Value |
+|---|---|
+| Produced (acked) | 75,000 at 5,005 events/s, 0 failed |
+| First alert, ingest receipt → first update (p50 / p99) | 146.7 ms / 284.4 ms |
+
+This run measured only first-alert latency (server clock), and that clock starts when the Kafka source reads the event, so it leaves out the time an event waits in `workflow-events`. Since `security/pr17-fixes`, loadgen correlates each event by the topic/partition/offset in the broker ack, so later Kafka runs also report "any update" from the intended send time, including that wait. Each report now records its transport, topic and event types.
