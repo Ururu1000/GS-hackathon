@@ -6,12 +6,25 @@
 //! API's PUTs write one override row per id, the first save at revision 2, each later
 //! save `+1` (compare-and-set on `expected_revision`, see `api`). A person row's `body`
 //! is `{"preferences": [...]}`; a team row's `body` is the full effective team after the
-//! save (`{"members", "lead", "oncall", "default_channels"}`).
+//! save (`{"members", "lead", "oncall", "default_channels"}`). The API's POSTs also
+//! CREATE ids the YAML base does not have (`POST /api/people`, `POST /api/teams`,
+//! admin-only): one row at revision 1 whose body says `"created": true` — a created
+//! person's body carries the whole person (`{"name", "contact", "preferences"}`), a
+//! created team's is the full team body plus `"created"` — so the row alone rebuilds
+//! the object. The person PUT preserves those keys when it rewrites the preferences.
+//!
+//! A `runbook` row (runtime import, `POST /api/runbooks`) is one published runbook: its
+//! id the derived preview id, `revision` 1, `body` `{"format", "team", "title",
+//! "content", "steps"}` — [`apply_runbooks`] parses each body back into a
+//! [`crate::runbook::Runbook`] and adds it to the base library, so a published runbook
+//! reaches the router, scheduler, actions worker and API with no restart.
 //!
 //! [`apply`] replaces the overridden fields and rebuilds the whole directory with
 //! `Directory::from_parts`, so a saved edit goes through exactly the parsing and
-//! cross-reference validation a YAML import does (SPEC §4.6: one validator). Overrides
-//! naming ids that are no longer in the base are ignored with a warning.
+//! cross-reference validation a YAML import does (SPEC §4.6: one validator). An override
+//! for an id the base does not have is a runtime creation when its body says
+//! `"created": true` — it becomes a whole new person or team; any other such override
+//! (its id left the YAML) is ignored with a warning.
 //!
 //! [`EffectiveDirectory`] caches the applied view and rebuilds it only when the table's
 //! `(count, sum(revision))` stamp moves — one cheap query per pass, the pattern the
@@ -29,23 +42,36 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{error, warn};
 
-use crate::config::{ConfigError, Directory, Person, Team};
+use crate::config::{ConfigError, Contact, Directory, Person, Team};
 
 /// `directory_overrides.kind` for a person row.
 pub const KIND_PERSON: &str = "person";
 /// `directory_overrides.kind` for a team row.
 pub const KIND_TEAM: &str = "team";
+/// `directory_overrides.kind` for a runbook imported at runtime (`POST /api/runbooks`).
+pub const KIND_RUNBOOK: &str = "runbook";
 
-/// One saved person edit: the raw `{"preferences": [...]}` body plus its revision.
+/// One saved person row: an edit's body is `{"preferences": [...]}`; a row written by
+/// `POST /api/people` (revision 1) is the whole person, `{"created": true, "name",
+/// "contact", "preferences"}`.
 #[derive(Debug, Clone)]
 pub struct PersonOverride {
     pub body: Value,
     pub revision: i64,
 }
 
-/// One saved team edit: the full effective team body plus its revision.
+/// One saved team row: the full effective team body an edit writes, plus `"created":
+/// true` on a row `POST /api/teams` wrote.
 #[derive(Debug, Clone)]
 pub struct TeamOverride {
+    pub body: Value,
+    pub revision: i64,
+}
+
+/// One runbook imported at runtime: the stored body plus its revision. The body shape and
+/// how it becomes a [`crate::runbook::Runbook`] are owned by [`apply_runbooks`].
+#[derive(Debug, Clone)]
+pub struct RunbookOverride {
     pub body: Value,
     pub revision: i64,
 }
@@ -56,6 +82,7 @@ pub struct TeamOverride {
 pub struct Overrides {
     pub people: HashMap<String, PersonOverride>,
     pub teams: HashMap<String, TeamOverride>,
+    pub runbooks: HashMap<String, RunbookOverride>,
 }
 
 /// Every override row.
@@ -73,6 +100,9 @@ pub async fn load(pool: &PgPool) -> Result<Overrides, sqlx::Error> {
             KIND_TEAM => {
                 ov.teams.insert(id, TeamOverride { body, revision });
             }
+            KIND_RUNBOOK => {
+                ov.runbooks.insert(id, RunbookOverride { body, revision });
+            }
             other => warn!(kind = other, "unknown directory_overrides kind, ignoring"),
         }
     }
@@ -84,6 +114,7 @@ pub fn revision_of(ov: &Overrides, kind: &str, id: &str) -> i64 {
     match kind {
         KIND_PERSON => ov.people.get(id).map_or(1, |o| o.revision),
         KIND_TEAM => ov.teams.get(id).map_or(1, |o| o.revision),
+        KIND_RUNBOOK => ov.runbooks.get(id).map_or(1, |o| o.revision),
         _ => 1,
     }
 }
@@ -91,21 +122,14 @@ pub fn revision_of(ov: &Overrides, kind: &str, id: &str) -> i64 {
 /// The base directory with every override applied: a person's raw `preferences` and a
 /// team's members / lead / on-call / default channels are replaced from the override
 /// bodies, then the whole directory is rebuilt with `Directory::from_parts` — the same
-/// parsing and validation a YAML import goes through. `delivery`, `rules` and `runbooks`
-/// are carried over from the base unchanged. Overrides for ids missing from the base
-/// (removed from the YAML) are ignored with a warning.
+/// parsing and validation a YAML import goes through. An override with `"created": true`
+/// in its body for an id the base does not have is a person/team CREATED at runtime
+/// (`POST /api/people`, `POST /api/teams`): it is built from the body and joined to the
+/// lists, people before teams so a created team may name a created person. Other
+/// overrides for ids missing from the base (removed from the YAML) are ignored with a
+/// warning. `delivery` and `rules` are carried over from the base unchanged; `runbooks`
+/// is carried over and then extended with the imported ones ([`apply_runbooks`]).
 pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError> {
-    for id in ov.people.keys() {
-        if !base.people.contains_key(id) {
-            warn!(person = %id, "override for a person not in the base directory, ignoring");
-        }
-    }
-    for id in ov.teams.keys() {
-        if !base.teams.contains_key(id) {
-            warn!(team = %id, "override for a team not in the base directory, ignoring");
-        }
-    }
-
     let mut people: Vec<Person> = base.people.values().cloned().collect();
     for p in &mut people {
         let Some(o) = ov.people.get(&p.id) else {
@@ -116,6 +140,19 @@ pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError>
             p.preferences = Some(preferences.clone());
         }
     }
+    // People created at runtime: the body IS the person (name, contact, preferences).
+    // They join before the teams below, so a created team may name one of them; any
+    // other override for an unknown id is a save whose person left the YAML: ignored.
+    for (id, o) in &ov.people {
+        if base.people.contains_key(id) {
+            continue;
+        }
+        if is_created(&o.body) {
+            people.push(created_person(id, &o.body));
+        } else {
+            warn!(person = %id, "override for a person not in the base directory, ignoring");
+        }
+    }
 
     let mut teams: Vec<Team> = base.teams.values().cloned().collect();
     for t in &mut teams {
@@ -124,12 +161,52 @@ pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError>
         };
         apply_team_body(t, &o.body);
     }
+    // Teams created at runtime, same rule as the people above.
+    for (id, o) in &ov.teams {
+        if base.teams.contains_key(id) {
+            continue;
+        }
+        if is_created(&o.body) {
+            teams.push(created_team(id, &o.body));
+        } else {
+            warn!(team = %id, "override for a team not in the base directory, ignoring");
+        }
+    }
 
     let mut dir = Directory::from_parts(people, teams)?;
     dir.delivery = base.delivery.clone();
     dir.rules = base.rules.clone();
     dir.runbooks = base.runbooks.clone();
+    apply_runbooks(&mut dir, &ov.runbooks)?;
     Ok(dir)
+}
+
+/// Add the runbooks imported at runtime (`POST /api/runbooks`, rows of
+/// [`KIND_RUNBOOK`]) to `dir.runbooks`, sorted by id. Each stored body —
+/// `{"format", "team", "title", "content", "steps"}` — is rebuilt through the same
+/// adapter and step validation a publish used
+/// (`crate::runbook::runbook_from_override`), with the row's id and revision. An id
+/// that already exists in the YAML base is a `ConfigError`, as is a body that no
+/// longer validates (say an action no registry knows any more); `apply_lenient` drops
+/// only the offending row.
+pub fn apply_runbooks(
+    dir: &mut Directory,
+    runbooks: &HashMap<String, RunbookOverride>,
+) -> Result<(), ConfigError> {
+    let mut rows: Vec<(&String, &RunbookOverride)> = runbooks.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, o) in rows {
+        if dir.runbooks.get(id).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "runbook {id:?} already exists in config/runbooks"
+            )));
+        }
+        let revision = i32::try_from(o.revision).unwrap_or(i32::MAX);
+        let rb = crate::runbook::runbook_from_override(id, &o.body, revision)
+            .map_err(|e| ConfigError::Invalid(format!("runbook {id:?}: {e}")))?;
+        dir.runbooks.runbooks.push(rb);
+    }
+    Ok(())
 }
 
 /// Replace a team's fields from a saved body. Bodies the API writes carry every key; a
@@ -175,11 +252,56 @@ fn apply_team_body(t: &mut Team, body: &Value) {
     }
 }
 
+/// Whether an override body is a runtime creation (`POST /api/people`, `POST /api/teams`)
+/// rather than an edit of an id the YAML base already has.
+fn is_created(body: &Value) -> bool {
+    body.get("created").and_then(Value::as_bool) == Some(true)
+}
+
+/// The [`Person`] a created row's body builds: `{"created": true, "name", "contact":
+/// {"email","phone"}, "preferences"}`. Missing keys mean `None`; `from_parts` parses the
+/// preferences into rules exactly like a YAML import.
+fn created_person(id: &str, body: &Value) -> Person {
+    let contact = body.get("contact");
+    Person {
+        id: id.to_string(),
+        name: body.get("name").and_then(Value::as_str).map(str::to_string),
+        contact: Contact {
+            email: contact
+                .and_then(|c| c.get("email"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            phone: contact
+                .and_then(|c| c.get("phone"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+        preferences: body.get("preferences").cloned(),
+        rules: Vec::new(),
+    }
+}
+
+/// The [`Team`] a created row's body builds — the same body shape a team save stores,
+/// plus `"created": true` — so both paths read one shape through [`apply_team_body`].
+fn created_team(id: &str, body: &Value) -> Team {
+    let mut t = Team {
+        id: id.to_string(),
+        members: Vec::new(),
+        lead: None,
+        oncall: HashMap::new(),
+        default_channels: None,
+    };
+    apply_team_body(&mut t, body);
+    t
+}
+
 /// [`apply`], but one override that no longer validates (say a team naming a person since
-/// removed from the YAML) drops only itself, with a warning, instead of the whole set.
-/// Returns the directory and the overrides that were applied. If the whole set applies
-/// this is exactly [`apply`]; otherwise overrides are tried one at a time in a fixed
-/// order (people, then teams, each by id) and kept only if the set so far still applies.
+/// removed from the YAML, a created row whose stored body went bad, or a runbook row
+/// whose body a newer validator rejects) drops only itself, with a warning, instead of
+/// the whole set. Returns the directory and the overrides that were applied. If the whole
+/// set applies this is exactly [`apply`]; otherwise overrides are tried one at a time in a
+/// fixed order (people, then teams, then runbooks, each by id — created rows included) and
+/// kept only if the set so far still applies.
 pub fn apply_lenient(base: &Directory, ov: &Overrides) -> (Directory, Overrides) {
     if let Ok(dir) = apply(base, ov) {
         return (dir, ov.clone());
@@ -205,6 +327,18 @@ pub fn apply_lenient(base: &Directory, ov: &Overrides) -> (Directory, Overrides)
         match apply(base, &trial) {
             Ok(_) => kept = trial,
             Err(err) => warn!(team = %id, %err, "saved team no longer validates, ignoring it"),
+        }
+    }
+    let mut runbooks: Vec<_> = ov.runbooks.iter().collect();
+    runbooks.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, o) in runbooks {
+        let mut trial = kept.clone();
+        trial.runbooks.insert(id.clone(), o.clone());
+        match apply(base, &trial) {
+            Ok(_) => kept = trial,
+            Err(err) => {
+                warn!(runbook = %id, %err, "saved runbook no longer validates, ignoring it")
+            }
         }
     }
     match apply(base, &kept) {
@@ -473,6 +607,119 @@ mod tests {
     }
 
     #[test]
+    fn created_overrides_become_people_and_teams() {
+        let mut ov = Overrides::default();
+        ov.people.insert(
+            "newbie".into(),
+            PersonOverride {
+                body: json!({
+                    "created": true,
+                    "name": "New Bee",
+                    "contact": { "email": "newbie@example.test", "phone": "+44 7700 900777" },
+                    "preferences": [{ "default": ["sms"] }],
+                }),
+                revision: 1,
+            },
+        );
+        // A created team may name the created person as member, lead and on-call.
+        ov.teams.insert(
+            "newteam".into(),
+            TeamOverride {
+                body: json!({
+                    "created": true,
+                    "members": ["newbie", "bob"],
+                    "lead": "newbie",
+                    "oncall": { "newteam-primary": ["newbie"] },
+                    "default_channels": ["email"],
+                }),
+                revision: 1,
+            },
+        );
+        let d = apply(&base(), &ov).expect("created rows apply");
+        let newbie = d.person("newbie").expect("newbie is in the directory");
+        assert_eq!(newbie.name.as_deref(), Some("New Bee"));
+        assert_eq!(newbie.contact.email.as_deref(), Some("newbie@example.test"));
+        assert_eq!(newbie.contact.phone.as_deref(), Some("+44 7700 900777"));
+        assert_eq!(
+            newbie.rules.len(),
+            1,
+            "preferences parsed like a YAML import"
+        );
+        let newteam = &d.teams["newteam"];
+        assert_eq!(newteam.members, ["newbie", "bob"]);
+        assert_eq!(newteam.lead.as_deref(), Some("newbie"));
+        assert_eq!(newteam.default_channels, Some(vec!["email".to_string()]));
+        assert_eq!(d.expand("oncall:newteam-primary").unwrap().len(), 1);
+        // The base is untouched.
+        assert_eq!(d.people.len(), 4);
+        assert_eq!(d.teams.len(), 3);
+    }
+
+    #[test]
+    fn a_created_team_naming_an_unknown_person_fails_validation() {
+        let mut ov = Overrides::default();
+        ov.teams.insert(
+            "newteam".into(),
+            TeamOverride {
+                body: json!({
+                    "created": true,
+                    "members": ["ghost"],
+                    "lead": null,
+                    "oncall": {},
+                    "default_channels": ["email"],
+                }),
+                revision: 1,
+            },
+        );
+        let err = apply(&base(), &ov).expect_err("unknown member must not apply");
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn a_created_row_that_goes_bad_drops_alone_in_lenient_apply() {
+        let mut ov = Overrides::default();
+        // newbie was created, but her stored preferences have since gone bad.
+        ov.people.insert(
+            "newbie".into(),
+            PersonOverride {
+                body: json!({
+                    "created": true,
+                    "name": null,
+                    "contact": { "email": "newbie@example.test" },
+                    "preferences": [{ "default": ["fax"] }],
+                }),
+                revision: 2,
+            },
+        );
+        // A valid save for a base person, and a created team naming only base people.
+        insert_person(&mut ov, "bob", json!([{ "default": ["sms"] }]));
+        ov.teams.insert(
+            "newteam".into(),
+            TeamOverride {
+                body: json!({
+                    "created": true,
+                    "members": ["bob"],
+                    "lead": "bob",
+                    "oncall": {},
+                    "default_channels": ["email"],
+                }),
+                revision: 1,
+            },
+        );
+        assert!(
+            apply(&base(), &ov).is_err(),
+            "the strict validator rejects the set"
+        );
+        let (dir, applied) = apply_lenient(&base(), &ov);
+        assert!(!dir.people.contains_key("newbie"), "the bad row drops");
+        assert!(!applied.people.contains_key("newbie"));
+        assert!(applied.people.contains_key("bob"));
+        assert!(applied.teams.contains_key("newteam"));
+        assert!(dir.teams.contains_key("newteam"));
+        assert!(dir.person("bob").unwrap().preferences.is_some());
+    }
+
+    #[test]
     fn invalid_override_bodies_fail_validation_like_yaml() {
         // Unknown channel: the same rejection the YAML loader gives.
         let mut ov = Overrides::default();
@@ -541,5 +788,126 @@ mod tests {
         assert_eq!(revision_of(&ov, KIND_TEAM, "rates"), 5);
         assert_eq!(revision_of(&ov, KIND_TEAM, "payments"), 1);
         assert_eq!(revision_of(&ov, "nonsense", "bob"), 1);
+    }
+
+    // --- runtime-imported runbooks ------------------------------------------------------------
+
+    fn runbook_override(body: Value, revision: i64) -> (String, RunbookOverride) {
+        (
+            body.get("title")
+                .and_then(Value::as_str)
+                .map(crate::runbook::import_id)
+                .unwrap_or_default(),
+            RunbookOverride { body, revision },
+        )
+    }
+
+    fn import_body(title: &str, content: &str) -> Value {
+        json!({
+            "format": "yaml",
+            "team": "rates",
+            "title": title,
+            "content": content,
+            "steps": [
+                { "id": "s1", "kind": "manual", "text": "Check by hand" },
+                {
+                    "id": "s2", "kind": "action", "text": "Retry the workflow",
+                    "action": { "name": "retry_workflow", "params": { "workflowId": "{{workflowId}}" } },
+                    "resolves": true
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn apply_runbooks_adds_each_body_to_the_library() {
+        let mut ov = Overrides::default();
+        let (id, o) = runbook_override(import_body("Imported book", "steps: []"), 1);
+        assert_eq!(id, "imported-book");
+        ov.runbooks.insert(id.clone(), o);
+
+        let mut dir = base();
+        apply_runbooks(&mut dir, &ov.runbooks).expect("the runbook applies");
+        let rb = dir
+            .runbooks
+            .get(&id)
+            .expect("the imported runbook is in the library");
+        assert_eq!(rb.revision, 1, "the revision comes from the row");
+        assert_eq!(rb.team.as_deref(), Some("rates"));
+        assert_eq!(rb.steps.len(), 2);
+        assert_eq!(rb.steps[1].action.as_deref(), Some("retry_workflow"));
+        assert!(rb.steps[1].resolves);
+    }
+
+    #[test]
+    fn apply_runbooks_rejects_base_ids_and_bad_bodies() {
+        // An id that exists in the YAML base (here: as a file-loaded runbook).
+        let mut dir = base();
+        dir.runbooks.runbooks.push(crate::runbook::Runbook {
+            id: "existing".into(),
+            revision: 9,
+            title: "Existing".into(),
+            format: crate::runbook::Format::Yaml,
+            team: None,
+            priority: 0,
+            matches: Default::default(),
+            url: None,
+            text: None,
+            steps: Vec::new(),
+        });
+        let mut runbooks = HashMap::new();
+        let (_, o) = runbook_override(import_body("Existing", "steps: []"), 1);
+        runbooks.insert("existing".to_string(), o);
+        let err = apply_runbooks(&mut dir, &runbooks).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        // A body that no longer validates (an action no registry knows).
+        let mut runbooks = HashMap::new();
+        runbooks.insert(
+            "broken".to_string(),
+            RunbookOverride {
+                body: json!({
+                    "format": "yaml", "team": "rates", "title": "Broken", "content": "steps: []",
+                    "steps": [{
+                        "id": "s1", "kind": "action", "text": "Boom",
+                        "action": { "name": "detonate", "params": {} }
+                    }],
+                }),
+                revision: 1,
+            },
+        );
+        let err = apply_runbooks(&mut dir, &runbooks).unwrap_err();
+        assert!(err.to_string().contains("detonate"), "{err}");
+    }
+
+    #[test]
+    fn lenient_apply_drops_only_the_bad_runbook_row() {
+        let mut ov = Overrides::default();
+        insert_person(&mut ov, "bob", json!([{ "default": ["sms"] }]));
+        let (good, o) = runbook_override(import_body("Good book", "steps: []"), 1);
+        ov.runbooks.insert(good.clone(), o);
+        ov.runbooks.insert(
+            "broken-book".into(),
+            RunbookOverride {
+                body: json!({
+                    "format": "yaml", "team": "rates", "title": "Broken book",
+                    "content": "steps: [::",
+                    "steps": [{ "id": "s1", "kind": "manual", "text": "x" }],
+                }),
+                revision: 1,
+            },
+        );
+        assert!(
+            apply(&base(), &ov).is_err(),
+            "the strict validator rejects the set"
+        );
+        let (dir, applied) = apply_lenient(&base(), &ov);
+        // The bad row drops alone: the person and the good runbook still apply.
+        assert!(applied.people.contains_key("bob"));
+        assert!(applied.runbooks.contains_key(&good));
+        assert!(!applied.runbooks.contains_key("broken-book"));
+        assert!(dir.runbooks.get(&good).is_some());
+        assert!(dir.runbooks.get("broken-book").is_none());
+        assert!(dir.person("bob").unwrap().preferences.is_some());
     }
 }
