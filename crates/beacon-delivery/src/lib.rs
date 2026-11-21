@@ -35,6 +35,7 @@ pub mod router;
 pub mod rules;
 pub mod runbook;
 pub mod throttle;
+pub mod wake;
 pub mod worker;
 
 use std::sync::Arc;
@@ -57,6 +58,9 @@ pub struct RouterConfig {
     /// Run the throttle digest pass before each batch. With several router tasks
     /// (`ROUTER_TASKS`) only one needs it; the others would only repeat empty queries.
     pub digest: bool,
+    /// Woken early by `NOTIFY beacon_outbox` ([`wake::OUTBOX_CHANNEL`]); `Wake::never()`
+    /// (the default) only polls.
+    pub wake: wake::Wake,
 }
 
 impl Default for RouterConfig {
@@ -67,6 +71,7 @@ impl Default for RouterConfig {
             clock: Arc::new(clock::SystemClock),
             escalate_after_override: None,
             digest: true,
+            wake: wake::Wake::never(),
         }
     }
 }
@@ -102,6 +107,9 @@ pub struct WorkerConfig {
     pub concurrency: usize,
     pub backoff: BackoffPolicy,
     pub breaker: breaker::BreakerPolicy,
+    /// Woken early by `NOTIFY beacon_delivery_jobs` ([`wake::JOBS_CHANNEL`]);
+    /// `Wake::never()` (the default) only polls.
+    pub wake: wake::Wake,
 }
 
 impl Default for WorkerConfig {
@@ -114,6 +122,7 @@ impl Default for WorkerConfig {
             concurrency: 16,
             backoff: BackoffPolicy::default(),
             breaker: breaker::BreakerPolicy::default(),
+            wake: wake::Wake::never(),
         }
     }
 }
