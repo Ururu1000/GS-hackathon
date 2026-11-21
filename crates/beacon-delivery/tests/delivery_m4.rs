@@ -917,6 +917,7 @@ async fn run_outage_scenario(pool: PgPool, mode: OutageMode, secs: u64) {
 
     let cfg = WorkerConfig {
         worker_id: "w-outage".into(),
+        wake: beacon_delivery::wake::Wake::never(),
         poll_interval: Duration::from_millis(50),
         batch_size: 50,
         lease: Duration::from_secs(5),

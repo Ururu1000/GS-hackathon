@@ -553,6 +553,13 @@ async fn main() -> Result<()> {
                 // first runs the throttle digest pass.
                 let router_tasks = workers("ROUTER_TASKS", "4")?;
                 let dir = Arc::new(dir);
+                // One LISTEN connection for all router tasks; each outbox write wakes one.
+                let wake = beacon_delivery::wake::Wakes::listen(
+                    &pool,
+                    beacon_delivery::wake::OUTBOX_CHANNEL,
+                    shutdown_rx.clone(),
+                )
+                .get(beacon_delivery::wake::OUTBOX_KEY);
                 for i in 0..router_tasks {
                     tasks.spawn(beacon_delivery::router::run_router(
                         pool.clone(),
@@ -560,6 +567,7 @@ async fn main() -> Result<()> {
                         RouterConfig {
                             escalate_after_override,
                             digest: i == 0,
+                            wake: wake.clone(),
                             ..RouterConfig::default()
                         },
                         shutdown_rx.clone(),
@@ -633,6 +641,13 @@ async fn main() -> Result<()> {
                         .filter(|t| !t.is_empty()),
                     ..GatewayClientConfig::default()
                 };
+                // One LISTEN connection for every worker; a delivery_jobs insert wakes one
+                // worker of each channel it inserted.
+                let jobs_wakes = beacon_delivery::wake::Wakes::listen(
+                    &pool,
+                    beacon_delivery::wake::JOBS_CHANNEL,
+                    shutdown_rx.clone(),
+                );
                 for name in env_or("DELIVERY_CHANNELS", "email,sms,phone")
                     .split(',')
                     .map(str::trim)
@@ -685,6 +700,7 @@ async fn main() -> Result<()> {
                     // set (M7); without it they say "Decide in Beacon" and carry no link.
                     let worker_cfg = WorkerConfig {
                         email_link: email_link_config(),
+                        wake: jobs_wakes.get(name),
                         ..WorkerConfig::default()
                     };
                     for _ in 0..workers.max(1) {
