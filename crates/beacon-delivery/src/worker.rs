@@ -638,6 +638,8 @@ async fn process_job(
         // The covered alerts' CURRENT state: some may have resolved while they were held.
         let lines = crate::offhours::digest_lines(pool, &job.route_info).await?;
         let (title, body) = crate::offhours::render(&lines);
+        // The subject's severity is the most severe covered alert, not the filing alert's.
+        let severity = crate::offhours::highest_severity(&lines).unwrap_or(severity);
         AlertView {
             id: job.alert_id,
             status,

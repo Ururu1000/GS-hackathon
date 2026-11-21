@@ -24,6 +24,10 @@ fn utc(s: &str) -> DateTime<Utc> {
 /// anna: warnings by email 08:00-20:00 London, otherwise held for the digest.
 /// frank: no preferences, the team default (email) at any hour.
 fn directory() -> Directory {
+    directory_with_lead("frank")
+}
+
+fn directory_with_lead(lead: &str) -> Directory {
     let person = |id: &str, prefs: Option<Value>| Person {
         id: id.into(),
         name: None,
@@ -52,7 +56,7 @@ fn directory() -> Directory {
         vec![Team {
             id: "payments".into(),
             members: vec!["anna".into(), "frank".into()],
-            lead: Some("frank".into()),
+            lead: Some(lead.into()),
             oncall: Default::default(),
             default_channels: Some(vec!["email".into()]),
         }],
@@ -68,6 +72,10 @@ fn router_cfg(clock: Arc<FixedClock>) -> RouterConfig {
 }
 
 async fn notify(pool: &PgPool, alert_id: Uuid, severity: &str) {
+    notify_route(pool, alert_id, severity, json!([{ "to": "team:payments" }])).await;
+}
+
+async fn notify_route(pool: &PgPool, alert_id: Uuid, severity: &str, route: Value) {
     let payload = json!({
         "alert_id": alert_id,
         "notify_seq": 1,
@@ -76,7 +84,7 @@ async fn notify(pool: &PgPool, alert_id: Uuid, severity: &str) {
         "team": "payments",
         "severity": severity,
         "reason": "new",
-        "route": [{ "to": "team:payments" }],
+        "route": route,
         "created_at": Utc::now(),
     });
     insert_outbox_raw(pool, "notify", alert_id, payload).await;
@@ -177,6 +185,17 @@ async fn night_warnings_are_held_and_sent_as_one_morning_email(pool: PgPool) {
         .await
         .expect("release");
     assert_eq!(r.digests, 0);
+
+    // Until the email actually goes out, the timeline says "queued", not "sent" (#767 E).
+    let before = beacon_delivery::audit::timeline_entries(&pool, a1)
+        .await
+        .expect("timeline");
+    assert!(
+        before.iter().any(|e| e["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("queued in anna's off-hours digest"))),
+        "{before:?}"
+    );
 
     // The worker sends it with the alerts' CURRENT state, even though one is resolved.
     let rec = Arc::new(Recording::default());
@@ -324,4 +343,80 @@ async fn a_failed_release_keeps_rows_held_and_a_rerun_sends_once(pool: PgPool) {
     let jobs = jobs_for(&pool, "anna").await;
     assert_eq!(jobs.len(), 1, "{jobs:?}");
     assert_eq!(held_pending(&pool).await, 0);
+}
+
+/// #767 A: a held person counts as notified, so the escalation chain does not page them
+/// overnight for the alert their digest will carry.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_held_lead_is_not_escalated_to_overnight(pool: PgPool) {
+    let dir = directory_with_lead("anna");
+    let cfg = RouterConfig {
+        escalate_after_override: Some(std::time::Duration::from_secs(600)),
+        ..router_cfg(Arc::new(FixedClock::new(utc("2026-01-15T03:00:00Z"))))
+    };
+    let a = insert_alert(&pool, "open", "HighLatency on payments-api").await;
+    notify(&pool, a, "warning").await;
+    let stats = route_once(&pool, &dir, &cfg).await.expect("route");
+    assert_eq!(stats.held, 1, "{stats:?}");
+
+    // The team route's chain is just the lead, anna, who is held: nothing left to escalate to.
+    let chains: Vec<Value> =
+        sqlx::query_scalar("SELECT chain FROM escalation_timers WHERE alert_id = $1")
+            .bind(a)
+            .fetch_all(&pool)
+            .await
+            .expect("timers");
+    assert!(
+        chains.iter().all(|c| !c.to_string().contains("anna")),
+        "anna must not be an escalation step: {chains:?}"
+    );
+}
+
+/// #767 C: reached now by one route entry and held by another -> sent now, not held too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_person_notified_now_is_not_also_held(pool: PgPool) {
+    let dir = directory();
+    let cfg = router_cfg(Arc::new(FixedClock::new(utc("2026-01-15T03:00:00Z"))));
+    let a = insert_alert(&pool, "open", "HighLatency on payments-api").await;
+    notify_route(
+        &pool,
+        a,
+        "warning",
+        json!([{ "to": "user:anna", "channels": ["email"] }, { "to": "team:payments" }]),
+    )
+    .await;
+    let stats = route_once(&pool, &dir, &cfg).await.expect("route");
+    assert_eq!(stats.held, 0, "{stats:?}");
+    assert_eq!(held_pending(&pool).await, 0);
+    let jobs = jobs_for(&pool, "anna").await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!((jobs[0].1.as_str(), jobs[0].2), ("email", 0));
+}
+
+/// #767 B: a person's release is exclusive across scheduler replicas (advisory lock).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_release_in_progress_elsewhere_is_skipped(pool: PgPool) {
+    let dir = directory();
+    let cfg = router_cfg(Arc::new(FixedClock::new(utc("2026-01-15T03:00:00Z"))));
+    let a = insert_alert(&pool, "open", "HighLatency on payments-api").await;
+    notify(&pool, a, "warning").await;
+    route_once(&pool, &dir, &cfg).await.expect("route");
+
+    // Another replica is releasing anna right now.
+    let mut other = pool.begin().await.expect("tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('offhours-digest:' || 'anna'))")
+        .execute(&mut *other)
+        .await
+        .expect("lock");
+    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:00Z"), 100)
+        .await
+        .expect("release");
+    assert_eq!(r.digests, 0);
+    other.rollback().await.expect("rollback");
+
+    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:01Z"), 100)
+        .await
+        .expect("release");
+    assert_eq!(r.digests, 1);
+    assert_eq!(jobs_for(&pool, "anna").await.len(), 1);
 }

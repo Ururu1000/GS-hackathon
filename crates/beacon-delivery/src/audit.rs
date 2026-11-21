@@ -140,15 +140,28 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
 
     // Derived: off-hours holds (`crate::offhours`): held outside someone's working hours,
     // then sent in their digest email when the hours started.
-    type HeldRow = (String, DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>);
+    // `sent_at` of the digest job that carried the row (it is filed under `digest_alert`),
+    // so the timeline says "sent" only once the email actually went out (#767 E).
+    type HeldRow = (
+        String,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    );
     let held: Vec<HeldRow> = sqlx::query_as(
-        "SELECT recipient_id, created_at, release_at, released_at FROM offhours_held \
-         WHERE alert_id = $1 ORDER BY id",
+        "SELECT h.recipient_id, h.created_at, h.release_at, h.released_at, \
+                (SELECT j.sent_at FROM delivery_jobs j \
+                  WHERE j.alert_id = h.digest_alert AND j.recipient_id = h.recipient_id \
+                    AND j.escalation_step = $2 AND j.sent_at IS NOT NULL \
+                  ORDER BY j.sent_at LIMIT 1) \
+         FROM offhours_held h WHERE h.alert_id = $1 ORDER BY h.id",
     )
     .bind(alert_id)
+    .bind(crate::offhours::OFFHOURS_DIGEST_STEP)
     .fetch_all(pool)
     .await?;
-    for (recipient, at, release_at, released_at) in held {
+    for (recipient, at, release_at, released_at, sent_at) in held {
         entries.push(Entry {
             at,
             actor: "system".to_string(),
@@ -158,13 +171,20 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
                 release_at.to_rfc3339_opts(SecondsFormat::Secs, true)
             ),
         });
-        if let Some(released) = released_at {
-            entries.push(Entry {
-                at: released,
+        match (released_at, sent_at) {
+            (_, Some(sent)) => entries.push(Entry {
+                at: sent,
                 actor: "system".to_string(),
                 kind: "digest".to_string(),
                 message: format!("sent to {recipient} in their off-hours digest"),
-            });
+            }),
+            (Some(released), None) => entries.push(Entry {
+                at: released,
+                actor: "system".to_string(),
+                kind: "digest".to_string(),
+                message: format!("queued in {recipient}'s off-hours digest"),
+            }),
+            (None, None) => {}
         }
     }
 

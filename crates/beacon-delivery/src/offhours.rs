@@ -9,7 +9,7 @@
 //!   Escalation steps and runbook actions resolve `digest` to email too
 //!   (`prefs::resolve_channels`), so nothing urgent waits for the morning.
 //! - **Release.** [`release_once`], run by the scheduler role each pass, picks people with due rows. Per person, in one transaction,
-//!   it locks their due rows (`FOR UPDATE SKIP LOCKED`, so router replicas never double-send),
+//!   it takes a per-person advisory lock (skipped if another pass holds it) and locks their due rows,
 //!   files ONE email job under the latest held row's `(alert_id, notify_seq)` with
 //!   `escalation_step = -1` ([`OFFHOURS_DIGEST_STEP`], so it never collides with that
 //!   notification's own jobs), and marks the rows released. The job's `route_info` carries `"target": "offhours"`
@@ -107,6 +107,17 @@ async fn release_person(
     now: DateTime<Utc>,
 ) -> Result<Option<u64>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // One release per person at a time (#767 B): row locks alone would let two scheduler
+    // replicas with slightly different `now` split one person's rows into two digests.
+    let (granted,): (bool,) =
+        sqlx::query_as("SELECT pg_try_advisory_xact_lock(hashtext('offhours-digest:' || $1))")
+            .bind(recipient_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !granted {
+        tx.rollback().await?;
+        return Ok(None);
+    }
     #[allow(clippy::type_complexity)]
     let rows: Vec<(i64, Uuid, i32, String, Value, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT id, alert_id, notify_seq, address, route_info, created_at, release_at \
@@ -231,6 +242,22 @@ pub fn render(lines: &[DigestLine]) -> (String, String) {
     (title, body)
 }
 
+/// The most severe status among the covered alerts (`critical > error > warning > info`), for
+/// the digest email's subject. Unknown severities rank lowest.
+pub fn highest_severity(lines: &[DigestLine]) -> Option<String> {
+    let rank = |s: &str| match s {
+        "critical" => 4,
+        "error" => 3,
+        "warning" => 2,
+        "info" => 1,
+        _ => 0,
+    };
+    lines
+        .iter()
+        .max_by_key(|l| rank(&l.severity))
+        .map(|l| l.severity.clone())
+}
+
 /// The covered alerts of a digest job, read now (status can have changed since they were held).
 pub async fn digest_lines(
     pool: &PgPool,
@@ -293,6 +320,17 @@ mod tests {
         assert!(body.contains("- [open] warning: Disk 91% on db-2 (x4)\n"));
         assert!(body.contains("- [resolved] warning: Queue lag 12 s\n"));
         assert!(body.ends_with("Open the Beacon feed for details."));
+    }
+
+    #[test]
+    fn highest_severity_ranks_known_levels() {
+        let lines = [
+            line("open", "info", "a", 1),
+            line("open", "error", "b", 1),
+            line("open", "warning", "c", 1),
+        ];
+        assert_eq!(highest_severity(&lines).as_deref(), Some("error"));
+        assert_eq!(highest_severity(&[]), None);
     }
 
     #[test]

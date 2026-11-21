@@ -246,6 +246,9 @@ pub async fn route_once(
             }
         }
 
+        // A person this notification already reaches now (another route entry planned jobs for
+        // them) is not also held for the morning digest (#767 C).
+        held.retain(|(recipient_id, _, _)| !planned_by_person.contains_key(recipient_id));
         for (recipient_id, job, release_at) in &held {
             if offhours::hold(
                 &mut tx,
@@ -315,7 +318,13 @@ pub async fn route_once(
         if payload.reason == NotifyReason::New
             && let Some(interval) = interval
         {
-            let notified: HashSet<String> = planned_by_person.keys().cloned().collect();
+            // Held people count as notified, like throttle-suppressed ones: an escalation
+            // chain must not page them overnight for the alert their digest will carry (#767 A).
+            let notified: HashSet<String> = planned_by_person
+                .keys()
+                .chain(held.iter().map(|(recipient_id, _, _)| recipient_id))
+                .cloned()
+                .collect();
             let chain = escalation::plan_chain(dir, &payload.route, &payload.team, &notified);
             // The channels this notification planned, frozen onto the timer (S11-8):
             // parked rows count too, so later jobs (fallback jobs, digests, prompts) cannot
@@ -329,6 +338,10 @@ pub async fn route_once(
                             out.push(job.channel.clone());
                         }
                     }
+                }
+                // A held notification is an email in the end (#767 A).
+                if !held.is_empty() && seen.insert("email".to_string()) {
+                    out.push("email".to_string());
                 }
                 out
             };

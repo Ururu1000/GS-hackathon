@@ -24,6 +24,17 @@ describe('resolveChannels', () => {
     expect(resolveChannels(anna, crit, new Date('2026-07-15T07:30:00Z')).channels).toEqual(['sms'])
   })
 
+  it('holds non-critical alerts for the digest outside hours, but sends critical by email', () => {
+    const prefs: Preference[] = [
+      { match: {}, channels: ['sms'], when: { between: '08:00-20:00', tz: 'Europe/London' }, otherwise: ['digest'] },
+    ]
+    const night = new Date('2026-01-15T03:00:00Z')
+    expect(resolveChannels(prefs, { severity: 'warning' }, night).channels).toEqual(['digest'])
+    expect(resolveChannels(prefs, crit, night).channels).toEqual(['email'])
+    const both: Preference[] = [{ ...prefs[0], otherwise: ['email', 'digest'] } as Preference]
+    expect(resolveChannels(both, crit, night).channels).toEqual(['email'])
+  })
+
   it('falls through lines, then the default, then the team, then in-app', () => {
     expect(resolveChannels(anna, { severity: 'warning' }, new Date())).toMatchObject({ channels: ['email'], line: 1 })
     expect(resolveChannels(anna, { severity: 'info' }, new Date())).toMatchObject({ channels: ['ui'], via: 'default' })

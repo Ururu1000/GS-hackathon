@@ -304,6 +304,17 @@ impl Directory {
                 None => Vec::new(),
                 Some(raw) => parse_preferences(id, raw, KNOWN_CHANNELS)?,
             };
+            // The off-hours digest is an email: without an address it would silently send
+            // nothing (#767 D).
+            let wants_digest = rules.iter().any(|r| {
+                matches!(r, PreferenceRule::Match { otherwise: Some(o), .. }
+                    if o.iter().any(|c| c == crate::prefs::DIGEST))
+            });
+            if wants_digest && p.contact.email.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "person {id}: `digest` needs an email address (contact.email)"
+                )));
+            }
             p.rules = rules;
         }
 
@@ -623,6 +634,25 @@ mod tests {
         );
         let d = Directory::from_parts(vec![p], vec![]).unwrap();
         assert_eq!(d.person("a").unwrap().rules.len(), 2);
+    }
+
+    #[test]
+    fn digest_preference_needs_an_email_address() {
+        let prefs = serde_json::json!([{ "match": {}, "channels": ["sms"],
+            "when": { "between": "08:00-20:00", "tz": "UTC" }, "otherwise": ["digest"] }]);
+        let mut no_email = person("a");
+        no_email.contact.email = None;
+        no_email.contact.phone = Some("+44 7700 900777".into());
+        no_email.preferences = Some(prefs.clone());
+        let err = Directory::from_parts(vec![no_email], vec![]).unwrap_err();
+        assert!(
+            err.to_string().contains("`digest` needs an email address"),
+            "{err}"
+        );
+
+        let mut with_email = person("a");
+        with_email.preferences = Some(prefs);
+        assert!(Directory::from_parts(vec![with_email], vec![]).is_ok());
     }
 
     #[test]
