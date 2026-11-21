@@ -1299,3 +1299,62 @@ async fn sustained_outage_exhausts_attempts_and_creates_one_fallback(pool: PgPoo
     assert_eq!(fallbacks[0].address, "bob-fallback@example.test");
     assert_eq!(fallbacks[0].status, "pending");
 }
+
+/// Round-2 review (board #439): with the breaker open, the failure before a job's FINAL attempt
+/// waits at least `max(cooldown, backoff cap)`, independent of jitter, so one job cannot burn
+/// every attempt inside a 60 s outage. Earlier failures keep the normal floor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn penultimate_failure_while_open_waits_at_least_the_backoff_cap(pool: PgPool) {
+    let policy = BackoffPolicy::default(); // base 1 s, cap 60 s
+    let cooldown = BreakerPolicy::default().cooldown; // 5 s
+    let cfg = WorkerConfig {
+        worker_id: "w-floor".into(),
+        ..WorkerConfig::default()
+    };
+    let alert = insert_alert(&pool, "open", &format!("floor m4 {}", unique_tag())).await;
+    let err = SendError::Transient("sms provider 503".into());
+
+    // (attempts before the claim, expected minimum delay, expected maximum delay)
+    for (before_claim, min_s, max_s) in [(6, 60.0, 61.0), (2, 5.0, 8.5)] {
+        let id = insert_sms_job(
+            &pool,
+            alert,
+            &format!("p{before_claim}"),
+            "+44111",
+            json!({}),
+        )
+        .await;
+        sqlx::query("UPDATE delivery_jobs SET attempts = $2, max_attempts = 8 WHERE id = $1")
+            .bind(id)
+            .bind(before_claim)
+            .execute(&pool)
+            .await
+            .expect("set attempts");
+        let claimed = claim_batch(&pool, "sms", &cfg).await.expect("claim");
+        let job = claimed
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .expect("claimed")
+            .clone();
+        assert_eq!(job.attempts, before_claim + 1);
+        let token = job.lease_token.expect("lease token");
+        let status =
+            worker::finalize_failed_while_open(&pool, &job, token, &err, &policy, cooldown)
+                .await
+                .expect("finalize");
+        assert_eq!(status, Some(beacon_delivery::model::JobStatus::Pending));
+        let secs: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch from due_at - updated_at)::float8 FROM delivery_jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("due_at");
+        assert!(
+            secs >= min_s - 0.01 && secs <= max_s,
+            "attempt {} of 8: due_at - updated_at = {secs:.2}s, want [{min_s}, {max_s}]",
+            job.attempts
+        );
+    }
+}

@@ -260,7 +260,9 @@ pub async fn finalize_failed(
 /// `50 * 8 * 0.3 = 120 s > 60 s`, and production defaults (`N = 50`, `max_attempts = 8`,
 /// cooldown `5 s`) give `2000 s`. A single job's *expected* horizon with production defaults
 /// (backoff base `1 s`, cap `60 s`: per-attempt uppers `1,2,4,8,16,32,60 s`, mean `upper/2`,
-/// floored by the `5 s` cooldown) is `5+5+5+5+8+16+30 = 74 s > 60 s`. `retry_horizon_stays_above_sixty_seconds`
+/// floored by the `5 s` cooldown) is `5+5+5+5+8+16+30 = 74 s > 60 s`; independent of jitter,
+/// the failure before the final attempt waits at least `max(cooldown, backoff cap)` (60 s by
+/// default), so even the worst case is `6 * 5 s + 60 s = 90 s > 60 s`. `retry_horizon_stays_above_sixty_seconds`
 /// in `tests/delivery_m4.rs` pins this arithmetic; the sustained-outage test there pins the
 /// other end (a horizon-long outage does reach `dead` with exactly one fallback).
 pub async fn finalize_failed_while_open(
@@ -317,9 +319,17 @@ async fn finalize_failed_inner(
         // depth for every other channel). `cooldown_floor` is the breaker's cooldown, nonzero
         // only for a real attempt that failed while the breaker is open: the job must wait
         // out the cooldown as well as its own backoff before it can be probed again.
-        let delay = backoff_delay(policy, job.attempts)
+        let mut delay = backoff_delay(policy, job.attempts)
             .max(cooldown_floor)
             .max(err.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
+        // Deterministic floor before the FINAL attempt while the breaker is open: jitter alone
+        // could let one job burn every attempt inside a short outage (worst case
+        // `(max_attempts - 2) * cooldown`). Waiting at least `max(cooldown, backoff cap)` here
+        // makes the single-job worst-case horizon `6 * 5 s + 60 s = 90 s > 60 s` with the
+        // defaults, while short test policies (small cap) stay fast.
+        if !cooldown_floor.is_zero() && job.attempts == job.max_attempts - 1 {
+            delay = delay.max(cooldown_floor.max(policy.cap));
+        }
         sqlx::query(
             "UPDATE delivery_jobs \
              SET status = 'pending', last_error = $3, last_error_class = $4, \
