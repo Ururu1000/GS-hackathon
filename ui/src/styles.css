@@ -481,11 +481,9 @@ code, pre { font-family: var(--mono); font-size: var(--text-xs); }
 }
 @media (max-width: 1240px) {
   .topbar { flex-wrap: wrap; }
-  .filter-chips { order: 1; flex-basis: 100%; }
 }
 @media (max-width: 600px) {
   .filter-chips .chip { padding: 0 7px; gap: 4px; }
-  [class*='chip-sev-'] .chip-n { display: none; }
 }
 @media (max-width: 900px) {
   .detail-pane { position: fixed; inset: 0; width: auto; z-index: 5; border-left: 0; }
@@ -502,7 +500,14 @@ code, pre { font-family: var(--mono); font-size: var(--text-xs); }
   background: var(--background);
   flex: none;
 }
-.filter-chips { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; min-width: 0; flex: 0 1 auto; }
+/* Feed filters get their own row under the top bar, with words, not icons. */
+.filter-row {
+  flex: none;
+  padding: 8px 14px;
+  background: var(--toolbar-background);
+  border-bottom: 1px solid var(--border);
+}
+.filter-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 .chip-group { border: 0; margin: 0; padding: 0; min-width: 0; }
 .chips {
   background: var(--chip-group-bg);
@@ -543,7 +548,6 @@ code, pre { font-family: var(--mono); font-size: var(--text-xs); }
 .chip:focus-visible { position: relative; z-index: 1; box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--ring) 70%, transparent); }
 .chip[aria-pressed='false'] .sev-icon { opacity: .35; filter: saturate(.35); }
 .chip { flex: none; }
-.chip-status-icon { display: none; flex: none; }
 .chip-n { font: 500 var(--text-xs)/1 var(--font-sans); display: inline-block; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
 
 .field { display: block; }
@@ -1021,13 +1025,7 @@ code, pre { font-family: var(--mono); font-size: var(--text-xs); }
 .select-rule { width: 168px; }
 .topbar > label .select { width: 120px; }
 
-/* Not enough room for labels: chips collapse to icon + count (names stay in
-   the tooltip and accessible name) so nothing clips or overlaps. */
 @container topbar (max-width: 1720px) {
-  .chip-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-  .chip-status-icon { display: block; }
-  .chip { padding: 0 9px; gap: 6px; }
-  .select-rule { width: 130px; }
   .topbar > label .select { width: 112px; }
 }
 

@@ -2,7 +2,7 @@ import { forwardRef } from 'react'
 import { SEVERITIES, STATUSES, type AlertStatus, type Severity } from '../api/types'
 import { SEVERITY_LABEL, SeverityIcon, STATUS_LABEL } from '../alert/badges'
 import { isDefault, type Filters } from './filters'
-import { SearchIcon, StatusIcon } from '../lib/icons'
+import { SearchIcon } from '../lib/icons'
 
 interface Props {
   filters: Filters
@@ -22,7 +22,7 @@ function toggle<T>(set: ReadonlySet<T>, v: T): Set<T> {
   return next
 }
 
-/** Status, severity and rule filters, shown in the top bar. */
+/** Status, severity and rule filters, on their own row under the top bar. */
 export function FilterChips({ filters, counts, onChange }: Omit<Props, 'onReset'>) {
   return (
     <div className="filter-chips" role="toolbar" aria-label="Filters">
@@ -37,7 +37,6 @@ export function FilterChips({ filters, counts, onChange }: Omit<Props, 'onReset'
               title={STATUS_LABEL[s]}
               onClick={() => onChange({ ...filters, status: toggle(filters.status, s) })}
             >
-              <StatusIcon status={s} size={13} className="chip-status-icon" />
               <span className="chip-label">{STATUS_LABEL[s]}</span> <span className="chip-n">{counts.status[s]}</span>
             </button>
           ))}

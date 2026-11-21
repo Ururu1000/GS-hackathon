@@ -796,7 +796,7 @@ components:
       properties:
         id: { type: string }
         type: { type: string }
-        kind: { type: string, enum: [http, kafka, file] }
+        kind: { type: string, enum: [http, kafka, file, poll] }
         topics: { type: array, items: { type: string } }
         last_seen: { type: [string, 'null'], format: date-time }
         events_24h: { type: integer, minimum: 0 }

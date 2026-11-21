@@ -82,29 +82,6 @@ export const MoonIcon = (p: IconProps) => (
   </Svg>
 )
 
-export const StatusIcon = ({ status, ...p }: IconProps & { status: 'open' | 'acked' | 'resolved' }) => (
-  <Svg {...p}>
-    {status === 'open' && (
-      <>
-        <circle cx="12" cy="12" r="8.25" />
-        <circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />
-      </>
-    )}
-    {status === 'acked' && (
-      <>
-        <path d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
-        <circle cx="12" cy="12" r="2.75" />
-      </>
-    )}
-    {status === 'resolved' && (
-      <>
-        <circle cx="12" cy="12" r="8.25" />
-        <path d="m8.5 12.25 2.5 2.5 4.75-5" />
-      </>
-    )}
-  </Svg>
-)
-
 export const BeaconLogo = ({ size = 26, className }: IconProps) => (
   <img
     className={className}
