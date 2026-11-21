@@ -535,11 +535,13 @@ pub async fn sources(State(state): State<ApiState>) -> Result<Json<Value>, ApiEr
         items.push(json!({"id": id, "kind": kind, "type": kind, "topics": [],
             "last_seen": ts(r.try_get("last_seen")?), "events_24h": r.try_get::<i64, _>("samples_24h")?}));
     }
-    // Configured Kafka sources that haven't produced a sample yet.
+    // Configured sources (kafka, file, poll), also those without a sample yet.
     for s in state.sources.iter() {
         if !items.iter().any(|i| i["id"] == json!(s.id)) {
-            items.push(json!({"id": s.id, "kind": "kafka", "type": "kafka", "topics": s.topics, "last_seen": null, "events_24h": 0}));
+            items.push(json!({"id": s.id, "kind": s.kind, "type": s.kind, "topics": s.topics, "last_seen": null, "events_24h": 0}));
         } else if let Some(i) = items.iter_mut().find(|i| i["id"] == json!(s.id)) {
+            i["kind"] = json!(s.kind);
+            i["type"] = json!(s.kind);
             i["topics"] = json!(s.topics);
         }
     }

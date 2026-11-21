@@ -6,11 +6,15 @@
 //! - [`kafka_source`]: consumes external Kafka topics described by
 //!   `config/sources/*.yaml` and commits upstream offsets only after a durable
 //!   publish.
+//! - [`file_source`]: tails a JSON-lines file (`type: file`).
+//! - [`poll_source`]: polls an HTTP API (`type: poll`).
 //! - [`kafka`]: shared Kafka helpers (topic names, client config, topic setup).
 
+pub mod file_source;
 pub mod http;
 pub mod kafka;
 pub mod kafka_source;
+pub mod poll_source;
 pub mod publisher;
 
 pub use publisher::{EventPublisher, PublishError};

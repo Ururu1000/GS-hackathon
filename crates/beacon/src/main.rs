@@ -328,14 +328,30 @@ async fn main() -> Result<()> {
                 for spec in specs {
                     let (kafka, publisher, rx) =
                         (kafka.clone(), publisher.clone(), shutdown_rx.clone());
-                    tasks.spawn(supervise("sources", rx.clone(), move || {
-                        beacon_ingest::kafka_source::run_kafka_source(
-                            spec.clone(),
-                            kafka.clone(),
-                            publisher.clone(),
-                            rx.clone(),
-                        )
-                    }));
+                    match spec.kind.as_str() {
+                        "file" => tasks.spawn(supervise("file-source", rx.clone(), move || {
+                            beacon_ingest::file_source::run_file_source(
+                                spec.clone(),
+                                publisher.clone(),
+                                rx.clone(),
+                            )
+                        })),
+                        "poll" => tasks.spawn(supervise("poll-source", rx.clone(), move || {
+                            beacon_ingest::poll_source::run_poll_source(
+                                spec.clone(),
+                                publisher.clone(),
+                                rx.clone(),
+                            )
+                        })),
+                        _ => tasks.spawn(supervise("sources", rx.clone(), move || {
+                            beacon_ingest::kafka_source::run_kafka_source(
+                                spec.clone(),
+                                kafka.clone(),
+                                publisher.clone(),
+                                rx.clone(),
+                            )
+                        })),
+                    };
                 }
             }
             Role::Matcher => {

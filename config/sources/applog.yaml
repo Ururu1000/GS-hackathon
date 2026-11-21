@@ -1,0 +1,8 @@
+# Third source type (brief: "tailed log"): JSON lines appended to a file.
+# Demo: append a line and the pricing rule fires, e.g.
+#   docker compose exec beacon sh -c 'mkdir -p /tmp/beacon && tr -d "\n" < /app/samples/events/pricing-log-warn.json >> /tmp/beacon/app.jsonl && echo >> /tmp/beacon/app.jsonl'
+# The file need not exist at start; it is read from its first line when it appears.
+id: file:applog
+type: file
+path: /tmp/beacon/app.jsonl
+start: latest
