@@ -337,7 +337,8 @@ type AlertRow = (Uuid, String, DateTime<Utc>);
 
 /// The run's alerts: `title`, `body` or `fields::text` containing the run id
 /// (`LIKE '%' || $1 || '%'`, parameterised), bounded by the optional window. A
-/// NULL bound disables its filter, so this stays one static statement.
+/// NULL bound disables its filter, so this stays one static statement. Loadgen's
+/// warm-up probe (`WF-WARMUP-<run>`, sent before its clock starts) is excluded.
 async fn select_alerts(
     pool: &sqlx::PgPool,
     run_id: Option<&str>,
@@ -351,7 +352,10 @@ async fn select_alerts(
                body LIKE '%' || $1 || '%' OR \
                fields::text LIKE '%' || $1 || '%') \
           AND ($2::timestamptz IS NULL OR first_seen >= $2) \
-          AND ($3::timestamptz IS NULL OR first_seen <= $3)";
+          AND ($3::timestamptz IS NULL OR first_seen <= $3) \
+          AND ($1::text IS NULL OR NOT ( \
+               title LIKE '%WARMUP-' || $1 || '%' OR \
+               fields::text LIKE '%WARMUP-' || $1 || '%'))";
     sqlx::query_as(sql)
         .bind(run_id)
         .bind(since)
