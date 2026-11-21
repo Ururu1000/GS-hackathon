@@ -30,6 +30,7 @@ pub mod email_link;
 pub mod escalation;
 pub mod gateway;
 pub mod model;
+pub mod offhours;
 pub mod overrides;
 pub mod prefs;
 pub mod router;

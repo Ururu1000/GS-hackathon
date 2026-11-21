@@ -8,4 +8,6 @@ preferences:                                # first match wins
     otherwise: [email]
   - match: { severity: warning }
     channels: [email]
+    when: { between: "08:00-20:00", tz: Europe/London }
+    otherwise: [digest]     # held, then ONE morning email at 08:00 (never for critical)
   - default: [ui]

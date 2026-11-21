@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::config::{Directory, Person, Team, address_for};
 use crate::escalation;
 use crate::model::{NotifyPayload, NotifyReason};
+use crate::offhours;
 use crate::prefs::{self, Decision, RoutingContext};
 use crate::runbook;
 use crate::throttle::{self, PlannedJob};
@@ -42,6 +43,8 @@ pub struct RouteStats {
     pub timers: u64,
     /// Runbooks frozen onto alerts (M5b).
     pub runbooks: u64,
+    /// Recipient notifications held for an off-hours digest (`crate::offhours`).
+    pub held: u64,
 }
 
 /// Claim up to `cfg.batch_size` unprocessed notify rows with `FOR UPDATE SKIP LOCKED`, insert
@@ -115,6 +118,8 @@ pub async fn route_once(
         // Planned jobs per person (ordered for deterministic inserts); written after the
         // throttle decision below (M5a: one token per recipient notification).
         let mut planned_by_person: BTreeMap<String, Vec<PlannedJob>> = BTreeMap::new();
+        // Notifications held for a person's off-hours digest: (person, job, release_at).
+        let mut held: Vec<(String, PlannedJob, chrono::DateTime<chrono::Utc>)> = Vec::new();
 
         for entry in &payload.route {
             let people = match dir.expand(&entry.to) {
@@ -128,22 +133,72 @@ pub async fn route_once(
 
             for person in people {
                 // Step 1 or steps 2-4 of the §4.4 precedence for this (entry, person).
-                let planned: Vec<(String, Decision)> = match &entry.channels {
-                    Some(explicit) => explicit
-                        .iter()
-                        .map(|c| (c.clone(), Decision::Explicit))
-                        .collect(),
+                // `hold_until` is set when the preference holds this notification for the
+                // person's off-hours digest (`otherwise: [digest]`, see `crate::offhours`).
+                let (planned, hold_until): (Vec<(String, Decision)>, _) = match &entry.channels {
+                    Some(explicit) => (
+                        explicit
+                            .iter()
+                            .map(|c| (c.clone(), Decision::Explicit))
+                            .collect(),
+                        None,
+                    ),
                     None => {
                         let team = team_for_target(dir, &entry.to, person, &payload.team);
-                        let r = prefs::resolve_channels(person, team, &ctx, now);
-                        r.channels
-                            .into_iter()
-                            .map(|c| (c, r.decision.clone()))
-                            .collect()
+                        let r = prefs::resolve_with_hold(person, team, &ctx, now);
+                        let decision = r.decision.clone();
+                        (
+                            r.channels
+                                .into_iter()
+                                .map(|c| (c, decision.clone()))
+                                .collect(),
+                            r.hold_until,
+                        )
                     }
                 };
 
                 for (channel, decision) in planned {
+                    // The digest pseudo-channel: hold for the morning email. A critical alert
+                    // is never held — it goes out as email right away.
+                    let critical = ctx.severity == "critical";
+                    let channel = if channel == prefs::DIGEST && critical {
+                        "email".to_string()
+                    } else {
+                        channel
+                    };
+                    if channel == prefs::DIGEST {
+                        let Some(release_at) = hold_until else {
+                            continue; // only `otherwise` can name digest, so always set
+                        };
+                        if !seen.insert((person.id.clone(), channel.clone())) {
+                            continue;
+                        }
+                        let Some(address) = address_for(person, "email") else {
+                            warn!(outbox_id, %alert_id, recipient = %person.id, "no email address for the off-hours digest, skipping");
+                            stats.skipped += 1;
+                            continue;
+                        };
+                        let route_info = json!({
+                            "target": entry.to,
+                            "rule_id": payload.rule_id,
+                            "rule_revision": payload.rule_revision,
+                            "reason": payload.reason,
+                            "outbox_id": outbox_id,
+                            "decision": decision,
+                            "decided_at": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                            "held_until": release_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                        });
+                        held.push((
+                            person.id.clone(),
+                            PlannedJob {
+                                channel: "email".into(),
+                                address: address.to_string(),
+                                route_info,
+                            },
+                            release_at,
+                        ));
+                        continue;
+                    }
                     // `ui` is delivered by the alert feed itself: no job, not counted.
                     if channel == "ui" {
                         continue;
@@ -188,6 +243,25 @@ pub async fn route_once(
                             route_info,
                         });
                 }
+            }
+        }
+
+        // A person this notification already reaches now (another route entry planned jobs for
+        // them) is not also held for the morning digest (#767 C).
+        held.retain(|(recipient_id, _, _)| !planned_by_person.contains_key(recipient_id));
+        for (recipient_id, job, release_at) in &held {
+            if offhours::hold(
+                &mut tx,
+                recipient_id,
+                *alert_id,
+                payload.notify_seq,
+                &payload.rule_id,
+                &job.route_info,
+                *release_at,
+            )
+            .await?
+            {
+                stats.held += 1;
             }
         }
 
@@ -243,7 +317,13 @@ pub async fn route_once(
         if payload.reason == NotifyReason::New
             && let Some(interval) = interval
         {
-            let notified: HashSet<String> = planned_by_person.keys().cloned().collect();
+            // Held people count as notified, like throttle-suppressed ones: an escalation
+            // chain must not page them overnight for the alert their digest will carry (#767 A).
+            let notified: HashSet<String> = planned_by_person
+                .keys()
+                .chain(held.iter().map(|(recipient_id, _, _)| recipient_id))
+                .cloned()
+                .collect();
             let chain = escalation::plan_chain(dir, &payload.route, &payload.team, &notified);
             // The channels this notification planned, frozen onto the timer (S11-8):
             // parked rows count too, so later jobs (fallback jobs, digests, prompts) cannot
@@ -257,6 +337,10 @@ pub async fn route_once(
                             out.push(job.channel.clone());
                         }
                     }
+                }
+                // A held notification is an email in the end (#767 A).
+                if !held.is_empty() && seen.insert("email".to_string()) {
+                    out.push("email".to_string());
                 }
                 out
             };

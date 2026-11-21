@@ -138,6 +138,62 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
         });
     }
 
+    // Derived: off-hours holds (`crate::offhours`): held outside someone's working hours,
+    // then sent in their digest email when the hours started.
+    // `sent_at` of the digest job that carried the row (`digest_job`),
+    // so the timeline says "sent" only once the email actually went out (#767 E).
+    type HeldRow = (
+        String,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        bool,
+    );
+    let held: Vec<HeldRow> = sqlx::query_as(
+        "SELECT h.recipient_id, h.created_at, h.release_at, h.released_at, \
+                (SELECT j.sent_at FROM delivery_jobs j WHERE j.id = h.digest_job), \
+                h.digest_job IS NOT NULL \
+         FROM offhours_held h WHERE h.alert_id = $1 ORDER BY h.id",
+    )
+    .bind(alert_id)
+    .fetch_all(pool)
+    .await?;
+    for (recipient, at, _release_at, released_at, sent_at, has_job) in held {
+        entries.push(Entry {
+            at,
+            actor: "system".to_string(),
+            kind: "held".to_string(),
+            // No release time: it would reveal the person's working hours to everyone on the
+            // alert's team, while /api/people hides other people's preferences.
+            message: format!("held for {recipient}'s off-hours digest"),
+        });
+        match (released_at, sent_at) {
+            (_, Some(sent)) => entries.push(Entry {
+                at: sent,
+                actor: "system".to_string(),
+                kind: "digest".to_string(),
+                message: format!("sent to {recipient} in their off-hours digest"),
+            }),
+            (Some(released), None) if has_job => entries.push(Entry {
+                at: released,
+                actor: "system".to_string(),
+                kind: "digest".to_string(),
+                message: format!("queued in {recipient}'s off-hours digest"),
+            }),
+            // Released without a job: the person or their email left the directory overnight.
+            (Some(released), None) => entries.push(Entry {
+                at: released,
+                actor: "system".to_string(),
+                kind: "digest".to_string(),
+                message: format!(
+                    "not sent: {recipient} has no email address in the directory any more"
+                ),
+            }),
+            (None, None) => {}
+        }
+    }
+
     entries.sort_by_key(|e| e.at);
     Ok(entries.iter().map(Entry::to_json).collect())
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Preference } from '../api/types'
-import { inWindow, resolveChannels } from './resolve'
+import { digestExclusive, inWindow, resolveChannels } from './resolve'
 
 // Anna from Appendix A / config/people/anna.yaml.
 const anna: Preference[] = [
@@ -22,6 +22,23 @@ describe('resolveChannels', () => {
     // 07:30 UTC is 07:30 GMT in January (outside) but 08:30 BST in July (inside).
     expect(resolveChannels(anna, crit, new Date('2026-01-15T07:30:00Z')).channels).toEqual(['email'])
     expect(resolveChannels(anna, crit, new Date('2026-07-15T07:30:00Z')).channels).toEqual(['sms'])
+  })
+
+  it('holds non-critical alerts for the digest outside hours, but sends critical by email', () => {
+    const prefs: Preference[] = [
+      { match: {}, channels: ['sms'], when: { between: '08:00-20:00', tz: 'Europe/London' }, otherwise: ['digest'] },
+    ]
+    const night = new Date('2026-01-15T03:00:00Z')
+    expect(resolveChannels(prefs, { severity: 'warning' }, night).channels).toEqual(['digest'])
+    expect(resolveChannels(prefs, crit, night).channels).toEqual(['email'])
+    const both: Preference[] = [{ ...prefs[0], otherwise: ['email', 'digest'] } as Preference]
+    expect(resolveChannels(both, crit, night).channels).toEqual(['email'])
+  })
+
+  it('keeps the digest exclusive (only In-app beside it) in the picker', () => {
+    expect(digestExclusive(['sms', 'ui'], ['sms', 'ui', 'digest'])).toEqual(['ui', 'digest'])
+    expect(digestExclusive(['digest'], ['email', 'digest'])).toEqual(['email'])
+    expect(digestExclusive(['digest'], ['ui', 'digest'])).toEqual(['ui', 'digest'])
   })
 
   it('falls through lines, then the default, then the team, then in-app', () => {

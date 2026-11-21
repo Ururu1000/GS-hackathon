@@ -277,11 +277,11 @@ async fn send(app: &Router, method: &str, uri: &str, csrf: &str, body: Option<Va
 #[sqlx::test(migrations = "../../migrations")]
 async fn rules_crud_with_revisions(pool: PgPool) {
     let seeded = beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
-    assert_eq!(seeded, 4);
+    assert_eq!(seeded, 5);
     let h = harness(pool.clone());
     let (s, v) = get(&h.app, "/api/rules").await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["items"].as_array().unwrap().len(), 4);
+    assert_eq!(v["items"].as_array().unwrap().len(), 5);
     assert_eq!(v["items"][0]["stats"]["hourly"].as_array().unwrap().len(), 24);
     assert_eq!(v["items"][0]["updated_by"], json!("config"));
 
@@ -320,7 +320,7 @@ async fn rules_crud_with_revisions(pool: PgPool) {
     assert_eq!(send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": foreign}))).await.0, StatusCode::FORBIDDEN);
 
     let rev: i64 = sqlx::query_scalar("SELECT revision FROM config_state WHERE key = 'rules'").fetch_one(&pool).await.unwrap();
-    assert_eq!(rev, 4 + 4 + 4, "4 schema seeds + 4 rule seeds + create, update, delete, recreate");
+    assert_eq!(rev, 4 + 5 + 4, "4 schema seeds + 5 rule seeds + create, update, delete, recreate");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -13,7 +13,7 @@ export interface EditorEnv {
   problems: { path: string; message: string }[]
 }
 
-export const CHANNEL_NAME: Record<string, string> = { phone: 'Call', sms: 'SMS', email: 'Email', ui: 'In-app' }
+export const CHANNEL_NAME: Record<string, string> = { phone: 'Call', sms: 'SMS', email: 'Email', ui: 'In-app', digest: 'Morning digest' }
 
 export function Problems({ list }: { list: string[] }) {
   if (!list.length) return null
@@ -30,11 +30,11 @@ export function problemsAt(env: EditorEnv, prefix: string): string[] {
   return env.problems.filter((p) => p.path === prefix || p.path.startsWith(`${prefix}.`)).map((p) => p.message)
 }
 
-/** Toggle buttons for a channel set. */
-export function ChannelPicker({ value, onChange, label }: { value: string[]; onChange: (v: string[]) => void; label: string }) {
+/** Toggle buttons for a channel set. `options` defaults to the real channels. */
+export function ChannelPicker({ value, onChange, label, options = CHANNELS }: { value: string[]; onChange: (v: string[]) => void; label: string; options?: readonly string[] }) {
   return (
     <div className="chips channel-picker" role="group" aria-label={label}>
-      {CHANNELS.map((c) => {
+      {options.map((c) => {
         const on = value.includes(c)
         return (
           <button
@@ -42,7 +42,7 @@ export function ChannelPicker({ value, onChange, label }: { value: string[]; onC
             type="button"
             className="chip"
             aria-pressed={on}
-            onClick={() => onChange(on ? value.filter((x) => x !== c) : CHANNELS.filter((x) => x === c || value.includes(x)))}
+            onClick={() => onChange(on ? value.filter((x) => x !== c) : options.filter((x) => x === c || value.includes(x)))}
           >
             {CHANNEL_NAME[c]}
           </button>

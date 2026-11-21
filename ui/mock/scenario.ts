@@ -166,7 +166,7 @@ const person = (id: string, name: string, phone: string, preferences: PersonView
 export const PEOPLE: PersonView[] = [
   person('anna', 'Anna Example', '+44 7700 900123', [
     { match: { severity: 'critical', service: 'payments-api' }, channels: ['sms'], when: { between: '08:00-20:00', tz: 'Europe/London' }, otherwise: ['email'] },
-    { match: { severity: 'warning' }, channels: ['email'] },
+    { match: { severity: 'warning' }, channels: ['email'], when: { between: '08:00-20:00', tz: 'Europe/London' }, otherwise: ['digest'] },
     { default: ['ui'] },
   ]),
   person('bob', 'Bob Example', '+44 7700 900124'),

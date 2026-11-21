@@ -3,12 +3,12 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { errorText, HttpError, isConflict, listPeople, listTeams, savePreferences, saveTeam } from '../api/client'
-import { SEVERITIES, type PersonView, type Preference, type Severity, type TeamView } from '../api/types'
+import { CHANNELS, SEVERITIES, type PersonView, type Preference, type Severity, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
 import { ChevronDownIcon, ChevronUpIcon, CloseIcon } from '../lib/icons'
 import { maskAddress } from '../lib/redact'
 import { ChannelPicker, CHANNEL_NAME } from '../rules/sections'
-import { parseWindow, resolveChannels } from './resolve'
+import { digestExclusive, parseWindow, resolveChannels } from './resolve'
 
 interface Props {
   kind: 'person' | 'team' | null
@@ -19,6 +19,8 @@ interface Props {
 }
 
 const ZONES = ['Europe/London', 'Europe/Paris', 'Europe/Kyiv', 'America/New_York', 'Asia/Singapore', 'UTC']
+// Outside a time window, alerts can also wait for one morning digest email (backend: `otherwise: [digest]`).
+const OUTSIDE_HOURS = [...CHANNELS, 'digest'] as const
 const channelsText = (c: string[]) => (c.length ? c.map((x) => CHANNEL_NAME[x] ?? x).join(' + ') : 'nothing')
 
 export function PreferencesScreen({ kind, id, me, onNavigate, onToast }: Props) {
@@ -177,8 +179,9 @@ function PrefLine({ line, index, count, hit, teams, onChange, onMove, onRemove }
             {badWindow && <p className="problems-inline">Use times like 08:00 and 20:00.</p>}
             <div className="inline wrap">
               <span className="small">otherwise send by</span>
-              <ChannelPicker label="Outside those hours" value={line.otherwise ?? []} onChange={(otherwise) => onChange({ ...line, otherwise })} />
+              <ChannelPicker label="Outside those hours" options={OUTSIDE_HOURS} value={line.otherwise ?? []} onChange={(otherwise) => onChange({ ...line, otherwise: digestExclusive(line.otherwise ?? [], otherwise) })} />
               {!line.otherwise?.length && <span className="muted small">(skip this line outside those hours)</span>}
+              {line.otherwise?.includes('digest') && <span className="muted small">(held and sent as one email when your hours start; critical alerts are never held)</span>}
             </div>
           </div>
         )}
