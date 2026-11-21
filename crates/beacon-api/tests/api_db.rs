@@ -498,7 +498,7 @@ async fn schema_preview_and_publish(pool: PgPool) {
     assert_eq!((s, created["revision"].as_i64()), (StatusCode::CREATED, Some(1)));
     let (s, _) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec}))).await;
     assert_eq!(s, StatusCode::CONFLICT, "exists without expected_revision");
-    let (s, upd) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec, "expected_revision": 1}))).await;
+    let (s, upd) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec, "expected_revision": 1, "schema": "infra.disk"}))).await;
     assert_eq!((s, upd["revision"].as_i64()), (StatusCode::OK, Some(2)));
     // The rule test panel now sees the published mapping.
     let rule = json!({"id": "disk", "team": "settlements", "when": {"path": "fields.service", "op": "eq", "value": "batch-07"},
@@ -587,4 +587,48 @@ async fn proposal_decisions_are_atomic_and_routes_checked(pool: PgPool) {
     sneaky["route"] = json!([{"to": "team:settlements"}]);
     let (s, _) = send(&app, "POST", "/api/proposals", &csrf, Some(json!({"rule_id": "pricing-engine-warnings", "base_revision": pr["revision"], "kind": "reroute", "summary": "s", "proposed_rule": sneaky}))).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "a proposal can't page a team the author can't see");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn proposal_and_mapping_guards(pool: PgPool) {
+    beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
+    let h = harness(pool.clone());
+
+    // A proposal can't move the rule to another team (direct edits can't either).
+    let (_, r) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+    let mut moved = r["rule"].clone();
+    moved["team"] = json!("settlements");
+    let (s, e) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(json!({"rule_id": "rates-rejected-trades", "base_revision": r["revision"], "kind": "reroute", "summary": "s", "proposed_rule": moved}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("proposed_rule.team")));
+
+    // Mappings: no renaming through an edit, no secret source paths, bounded field count.
+    let spec = json!({"schema": "guard.a", "detect": {"path": "kind", "op": "exists"}, "fields": {"type": {"path": "kind"}}});
+    assert_eq!(send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec}))).await.0, StatusCode::CREATED);
+    let mut renamed = spec.clone();
+    renamed["schema"] = json!("guard.b");
+    let (s, e) = send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": renamed, "expected_revision": 1, "schema": "guard.a"}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("schema")));
+    assert_eq!(send(&h.app, "POST", "/api/schemas", &h.csrf, Some(json!({"spec": spec, "expected_revision": 1}))).await.0, StatusCode::BAD_REQUEST);
+    let secret = json!({"schema": "guard.c", "detect": {"path": "kind", "op": "exists"}, "fields": {"note": {"path": "auth.password"}}});
+    let (s, e) = send(&h.app, "POST", "/api/schemas/preview", &h.csrf, Some(json!({"spec": secret, "event": {"kind": 1, "auth": {"password": "hunter2"}}}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("fields.note")));
+    let fields: serde_json::Map<String, Value> = (0..65).map(|i| (format!("f{i}"), json!({"path": "kind"}))).collect();
+    let wide = json!({"schema": "guard.d", "detect": {"path": "kind", "op": "exists"}, "fields": fields});
+    let (s, e) = send(&h.app, "POST", "/api/schemas/preview", &h.csrf, Some(json!({"spec": wide, "event": {"kind": 1}}))).await;
+    assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("fields")));
+
+    // A non-admin author sees their own proposal as not reviewable, and can't review it.
+    let session = Arc::new(Session::demo_with(&root().join("config"), "erin", false).unwrap());
+    let csrf = session.csrf_token.clone();
+    let (updates, _) = broadcast::channel(8);
+    let (_r, ready) = watch::channel(true);
+    let state = ApiState { pool, updates, ready, session, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let app = router(state, None);
+    let (_, pr) = get(&app, "/api/rules/pricing-engine-warnings").await;
+    let mut proposed = pr["rule"].clone();
+    proposed["present"]["title"] = json!("Pricing warning");
+    let (s, p) = send(&app, "POST", "/api/proposals", &csrf, Some(json!({"rule_id": "pricing-engine-warnings", "base_revision": pr["revision"], "kind": "template", "summary": "s", "proposed_rule": proposed}))).await;
+    assert_eq!((s, p["can_review"].as_bool()), (StatusCode::CREATED, Some(false)));
+    let (s, _) = send(&app, "POST", &format!("/api/proposals/{}/accept", p["id"].as_str().unwrap()), &csrf, None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
 }

@@ -95,7 +95,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
       const forbidden = hasForbiddenKey(spec)
       if (forbidden) throw new Error(`Forbidden key "${forbidden}" in mapping YAML.`)
       if (save) {
-        const saved = await saveSchemaMapping(spec, mapping.saved?.revision)
+        const saved = await saveSchemaMapping(spec, mapping.saved && { schema: mapping.saved.spec.schema, revision: mapping.saved.revision })
         editMapping(saved)
         await load()
         setFeedback({ kind: 'ok', text: `Saved ${saved.spec.schema} revision ${saved.revision}.` })

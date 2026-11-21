@@ -406,6 +406,10 @@ struct SchemaWrite {
     spec: Value,
     #[serde(default)]
     expected_revision: Option<i64>,
+    /// The mapping being edited; required with `expected_revision`, so an
+    /// edited `spec.schema` can't overwrite a different mapping.
+    #[serde(default)]
+    schema: Option<String>,
 }
 
 /// Publish a schema mapping (create, or compare-and-set with expected_revision).
@@ -415,7 +419,20 @@ pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body
     state.session.check_csrf(&headers)?;
     require_admin(&state, "publishing schema mappings")?;
     let body = read_body(body, MAX_WRITE_BODY).await?;
-    let b: SchemaWrite = parse_body(&body, "{\"spec\": {...}, \"expected_revision\"?: <int>}")?;
+    let b: SchemaWrite = parse_body(&body, "{\"spec\": {...}, \"expected_revision\"?: <int>, \"schema\"?: \"...\"}")?;
+    if b.expected_revision.is_some() {
+        let name = b.spec.get("schema").and_then(Value::as_str);
+        match b.schema.as_deref() {
+            None => return Err(ApiError::bad_request("schema (the mapping being edited) is required with expected_revision")),
+            Some(target) if Some(target) != name => {
+                return Err(invalid(vec![config_store::Invalid {
+                    path: "schema".into(),
+                    message: format!("a mapping can't be renamed; publish `{}` as a new mapping", name.unwrap_or("")),
+                }]));
+            }
+            Some(_) => {}
+        }
+    }
     match config_store::save_schema(&state.pool, &b.spec, b.expected_revision, &state.session.actor()).await? {
         Ok((s, created)) => {
             let v = json!({"spec": s.spec, "revision": s.revision, "updated_at": ts(s.updated_at), "updated_by": s.updated_by});
@@ -449,7 +466,11 @@ pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, b
     let body = read_body(body, MAX_TEST_BODY).await?;
     let b: SchemaPreview = parse_body(&body, "{\"spec\": {...}, \"event\": {...}, \"source\": \"...\"}")?;
     let spec = config_store::validate_schema(&b.spec).map_err(invalid)?;
+    let Ok(slot) = TEST_SLOTS.try_acquire() else {
+        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "too_many_tests", "too many previews in flight, retry"));
+    };
     let out = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let m = beacon_core::mapping::SchemaMapping::compile(&spec).expect("validated above");
         let event = Event::new("preview".into(), b.source.unwrap_or_else(|| "http:preview".into()), b.event);
         let matched = m.detects(&event);

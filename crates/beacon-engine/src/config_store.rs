@@ -413,6 +413,8 @@ pub struct StoredSchema {
     pub updated_by: String,
 }
 
+const MAX_SCHEMA_FIELDS: usize = 64;
+
 /// Validate a mapping with the same compiler the matcher uses.
 pub fn validate_schema(spec: &Value) -> Result<SchemaMappingSpec, Vec<Invalid>> {
     let inv = |path: &str, message: String| vec![Invalid { path: path.into(), message }];
@@ -423,6 +425,17 @@ pub fn validate_schema(spec: &Value) -> Result<SchemaMappingSpec, Vec<Invalid>> 
         return Err(inv("", format!("a mapping must be under {} KiB", MAX_RULE_BYTES / 1024)));
     }
     let m: SchemaMappingSpec = serde_json::from_value(spec.clone()).map_err(|e| inv("", format!("not a valid mapping: {e}")))?;
+    // Each field clones its value out of the event, so the count bounds the work.
+    if m.fields.len() > MAX_SCHEMA_FIELDS {
+        return Err(inv("fields", format!("a mapping can have at most {MAX_SCHEMA_FIELDS} fields")));
+    }
+    // Redaction keys on the field name, so copying a secret into an ordinary
+    // name would let it out unmasked.
+    for (name, f) in &m.fields {
+        if f.path.as_deref().is_some_and(beacon_core::matcher::is_secret_path_str) {
+            return Err(inv(&format!("fields.{name}"), "this path holds a secret and can't be mapped".into()));
+        }
+    }
     if let Err(e) = beacon_core::mapping::SchemaMapping::compile(&m) {
         let msg = e.to_string();
         let path = match &e {
@@ -465,12 +478,21 @@ pub async fn schema_specs(pool: &PgPool) -> Result<Vec<SchemaMappingSpec>> {
 /// Create (no `expected_revision`) or compare-and-set update a mapping.
 /// Returns the saved mapping and whether it was created.
 pub async fn save_schema(pool: &PgPool, spec: &Value, expected_revision: Option<i64>, actor: &str) -> Result<Result<(StoredSchema, bool), WriteError>> {
+    let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
+    let res = save_schema_in(&mut tx, spec, expected_revision, actor).await?;
+    if res.is_ok() {
+        tx.commit().await?;
+    }
+    Ok(res)
+}
+
+/// [`save_schema`] inside the caller's transaction, which holds the ruleset lock.
+async fn save_schema_in(tx: &mut PgConnection, spec: &Value, expected_revision: Option<i64>, actor: &str) -> Result<Result<(StoredSchema, bool), WriteError>> {
     let m = match validate_schema(spec) {
         Ok(m) => m,
         Err(p) => return Ok(Err(WriteError::Invalid(p))),
     };
-    let mut tx = pool.begin().await?;
-    lock_rules(&mut tx).await?;
     let existing = sqlx::query("SELECT spec, revision, updated_at, updated_by FROM schema_mappings WHERE schema = $1 FOR UPDATE")
         .bind(&m.schema)
         .fetch_optional(&mut *tx)
@@ -496,13 +518,12 @@ pub async fn save_schema(pool: &PgPool, spec: &Value, expected_revision: Option<
     .bind(actor)
     .execute(&mut *tx)
     .await?;
-    bump(&mut tx).await?;
+    bump(&mut *tx).await?;
     let saved = sqlx::query("SELECT spec, revision, updated_at, updated_by FROM schema_mappings WHERE schema = $1")
         .bind(&m.schema)
         .fetch_one(&mut *tx)
         .await?;
     let saved = schema_row(&saved)?;
-    tx.commit().await?;
     Ok(Ok((saved, existing.is_none())))
 }
 
@@ -517,19 +538,25 @@ pub async fn get_schema(pool: &PgPool, schema: &str) -> Result<Option<StoredSche
         .transpose()
 }
 
+/// Import `config/schemas/*.yaml` once, when the table is empty. The check and
+/// the import share one transaction under the ruleset lock, so concurrent
+/// replicas can't both seed and a crash mid-import leaves the table empty.
 async fn seed_schemas_from_yaml(pool: &PgPool, config_dir: &Path) -> Result<()> {
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_mappings").fetch_one(pool).await?;
+    let specs: Vec<Value> = load_yaml_files(&config_dir.join("schemas"))?;
+    let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_mappings").fetch_one(&mut *tx).await?;
     if n > 0 {
         return Ok(());
     }
-    let specs: Vec<Value> = load_yaml_files(&config_dir.join("schemas"))?;
     let mut imported = 0;
     for spec in specs {
-        match save_schema(pool, &spec, None, "config").await? {
+        match save_schema_in(&mut tx, &spec, None, "config").await? {
             Ok(_) => imported += 1,
             Err(e) => warn!(?e, "seed schema mapping rejected"),
         }
     }
+    tx.commit().await?;
     info!(imported, "schema mappings seeded from config/schemas");
     Ok(())
 }

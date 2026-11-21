@@ -41,6 +41,9 @@ const COLUMNS: &str = "id, rule_id, rule_name, team, kind, summary, note, base_r
 
 fn view(state: &ApiState, r: &sqlx::postgres::PgRow) -> Result<Value, ApiError> {
     let team: String = r.try_get("team")?;
+    let author: String = r.try_get("author")?;
+    // Mirrors decide(): the team's members review, but not their own proposal.
+    let can_review = state.session.can_see(&team) && (state.session.admin || author != state.session.actor());
     Ok(json!({
         "id": r.try_get::<Uuid, _>("id")?.to_string(),
         "rule_id": r.try_get::<String, _>("rule_id")?,
@@ -51,14 +54,14 @@ fn view(state: &ApiState, r: &sqlx::postgres::PgRow) -> Result<Value, ApiError> 
         "base_revision": r.try_get::<i64, _>("base_revision")?,
         "base_rule": r.try_get::<Value, _>("base_rule")?,
         "proposed_rule": r.try_get::<Value, _>("proposed_rule")?,
-        "author": r.try_get::<String, _>("author")?,
+        "author": author,
         "auto": r.try_get::<bool, _>("auto")?,
         "alert_id": r.try_get::<Option<Uuid>, _>("alert_id")?.map(|u| u.to_string()),
         "created_at": ts(r.try_get("created_at")?),
         "state": r.try_get::<String, _>("state")?,
         "decided_by": r.try_get::<Option<String>, _>("decided_by")?,
         "decided_at": r.try_get::<Option<DateTime<Utc>>, _>("decided_at")?.map(ts),
-        "can_review": state.session.can_see(&team),
+        "can_review": can_review,
     }))
 }
 
@@ -160,9 +163,12 @@ pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bod
     if spec.id != b.rule_id {
         return Err(invalid("proposed_rule.id", "must be the rule being changed"));
     }
-    // Same team and routing rules as a direct edit.
+    // Same team and routing rules as a direct edit, which can't move a rule
+    // to another team either.
+    if spec.team != team {
+        return Err(invalid("proposed_rule.team", "team cannot be changed on an existing rule"));
+    }
     crate::rules::check_team(&state, &b.proposed_rule)?;
-    let _ = &spec;
     let name = current.spec.get("name").and_then(Value::as_str).unwrap_or(&b.rule_id).to_string();
     let id = Uuid::now_v7();
     let row = sqlx::query(&format!(
