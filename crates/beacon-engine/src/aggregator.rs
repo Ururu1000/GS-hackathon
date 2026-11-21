@@ -262,6 +262,7 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
             created_at: now,
             context: m.context.clone(),
             event: if reason == NotifyReason::New { m.event.clone() } else { None },
+            policy: m.policy.clone(),
         };
         plan.outbox.push(OutboxRow {
             kind: outbox_kind::NOTIFY,
@@ -894,6 +895,7 @@ mod tests {
             event: None,
             quiet_for_ms: None,
             group_key: None,
+            policy: Default::default(),
         }
     }
 

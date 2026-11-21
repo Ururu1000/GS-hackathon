@@ -47,6 +47,7 @@ fn rec(event: &str, fp: &str, kind: MatchKind, at: chrono::DateTime<Utc>) -> Mat
         }),
         quiet_for_ms: None,
         group_key: None,
+        policy: Default::default(),
     }
 }
 
