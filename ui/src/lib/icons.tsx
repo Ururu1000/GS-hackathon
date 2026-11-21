@@ -105,18 +105,12 @@ export const StatusIcon = ({ status, ...p }: IconProps & { status: 'open' | 'ack
   </Svg>
 )
 
-/** Brand logo: a stencil "B" (stem + two bowls) throwing light. Black badge, white mark; inverts with the theme.
- * Same artwork as public/favicon.svg. */
 export const BeaconLogo = ({ size = 26, className }: IconProps) => (
-  <svg className={className} width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true">
-    <rect width="32" height="32" rx="8" fill="currentColor" />
-    <g transform="translate(-2 0)">
-      <g fill="var(--background)">
-        <rect x="8" y="6.5" width="4.5" height="19" rx="2.25" />
-        <path d="M15.5 6.5h2.2a4.6 4.6 0 0 1 0 9.2h-2.2Z" />
-        <path d="M15.5 17.3h3a4.1 4.1 0 0 1 0 8.2h-3Z" />
-      </g>
-      <path d="M24.2 6.4l2.3-2.2M25.2 11h3" stroke="var(--background)" strokeWidth="1.8" strokeLinecap="round" />
-    </g>
-  </svg>
+  <img
+    className={className}
+    src={`${import.meta.env.BASE_URL}favicon.svg`}
+    width={size}
+    height={size}
+    alt=""
+  />
 )
