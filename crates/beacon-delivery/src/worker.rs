@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::breaker::{self, Gate};
+use crate::channel::email::mask_emails_in_text;
 use crate::channel::gateway_client::MAX_RETRY_AFTER;
 use crate::channel::{AlertView, Channel, Receipt, SendError};
 use crate::model::{AlertStatus, DeliveryJob, JobStatus};
@@ -128,7 +129,7 @@ pub async fn claim_batch(
 ///
 /// At most one row, ever:
 /// - `fallback_of IS NULL` on the dead job means a fallback never falls back again (one hop);
-/// - `ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING` skips the insert
+/// - `ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING` skips the insert
 ///   when the person already has any job on the fallback channel for the same notification.
 ///
 /// The fallback job's `route_info` keeps the provenance chain: `target`, `rule_id` and
@@ -142,7 +143,8 @@ async fn insert_fallback_job(
 ) -> Result<bool, sqlx::Error> {
     let res = sqlx::query(
         "INSERT INTO delivery_jobs \
-             (alert_id, notify_seq, recipient_id, channel, address, route_info, fallback_of) \
+             (alert_id, notify_seq, recipient_id, channel, address, route_info, fallback_of, \
+              escalation_step) \
          SELECT j.alert_id, j.notify_seq, j.recipient_id, \
                 j.route_info->'fallback'->>'channel', \
                 j.route_info->'fallback'->>'address', \
@@ -151,13 +153,13 @@ async fn insert_fallback_job(
                                     'reason', j.route_info->'reason', \
                                     'fallback_from', j.channel, \
                                     'fallback_reason', j.last_error), \
-                j.id \
+                j.id, j.escalation_step \
          FROM delivery_jobs j \
          WHERE j.id = $1 AND j.status = 'dead' AND j.fallback_of IS NULL \
            AND j.route_info ? 'fallback' \
            AND j.route_info->'fallback'->>'channel' IS NOT NULL \
            AND j.route_info->'fallback'->>'address' IS NOT NULL \
-         ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING",
+         ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING",
     )
     .bind(dead_id)
     .execute(&mut *tx)
@@ -261,8 +263,10 @@ pub async fn finalize_failed(
 /// cooldown `5 s`) give `2000 s`. A single job's *expected* horizon with production defaults
 /// (backoff base `1 s`, cap `60 s`: per-attempt uppers `1,2,4,8,16,32,60 s`, mean `upper/2`,
 /// floored by the `5 s` cooldown) is `5+5+5+5+8+16+30 = 74 s > 60 s`; independent of jitter,
-/// the failure before the final attempt waits at least `max(cooldown, backoff cap)` (60 s by
-/// default), so even the worst case is `6 * 5 s + 60 s = 90 s > 60 s`. `retry_horizon_stays_above_sixty_seconds`
+/// the failure before the final attempt, if it happens while the breaker is open, waits at least
+/// `max(cooldown, backoff cap)` (60 s by default) before that last try. Failures that happen
+/// before the breaker opens follow plain backoff, so this is a floor on the last gap, not a
+/// guaranteed total. `retry_horizon_stays_above_sixty_seconds`
 /// in `tests/delivery_m4.rs` pins this arithmetic; the sustained-outage test there pins the
 /// other end (a horizon-long outage does reach `dead` with exactly one fallback).
 pub async fn finalize_failed_while_open(
@@ -325,8 +329,8 @@ async fn finalize_failed_inner(
         // Deterministic floor before the FINAL attempt while the breaker is open: jitter alone
         // could let one job burn every attempt inside a short outage (worst case
         // `(max_attempts - 2) * cooldown`). Waiting at least `max(cooldown, backoff cap)` here
-        // makes the single-job worst-case horizon `6 * 5 s + 60 s = 90 s > 60 s` with the
-        // defaults, while short test policies (small cap) stay fast.
+        // (60 s by default) guarantees the final attempt comes at least that long after the
+        // previous failure while the breaker is open; short test policies (small cap) stay fast.
         if !cooldown_floor.is_zero() && job.attempts == job.max_attempts - 1 {
             delay = delay.max(cooldown_floor.max(policy.cap));
         }
@@ -442,6 +446,48 @@ async fn finalize_cancelled_logged(
     }
 }
 
+/// Render a throttle digest job: the title names the parked count and rule, the body
+/// lists the covered alert ids (one per line) plus where to read them.
+fn digest_alert_view(
+    alert_id: Uuid,
+    status: String,
+    severity: String,
+    route_info: &serde_json::Value,
+) -> AlertView {
+    let digest = route_info.get("digest");
+    let count = digest
+        .and_then(|d| d.get("count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let rule_id = digest
+        .and_then(|d| d.get("rule_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let ids: Vec<String> = digest
+        .and_then(|d| d.get("alert_ids"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let title = format!("{count} more alert(s) for rule {rule_id} were held back by throttling");
+    let body = if ids.is_empty() {
+        "Open the Beacon feed for details.".to_string()
+    } else {
+        format!("{}\nOpen the Beacon feed for details.", ids.join("\n"))
+    };
+    AlertView {
+        id: alert_id,
+        status,
+        severity,
+        title,
+        body,
+    }
+}
+
 async fn process_job(
     pool: &PgPool,
     channel: &dyn Channel,
@@ -466,17 +512,46 @@ async fn process_job(
     let Some((status, title, body, severity)) = alert else {
         return finalize_cancelled_logged(pool, &job, token, "alert not found").await;
     };
-    if !AlertStatus::parse(&status).is_some_and(AlertStatus::is_deliverable) {
+    // A throttle digest summarizes several alerts: it is never cancelled because the
+    // latest alert was acked or resolved, but the alert row must still exist.
+    let is_digest = job.route_info.get("digest").is_some_and(|v| v.is_object());
+    // Only open alerts page people (SPEC §2.2) — with one exception: an acked alert is
+    // still being worked on, so its approval-prompt jobs (`route_info.target =
+    // "approval"`, frozen by `approvals::request`) stay deliverable; the approval stays
+    // decidable until the alert resolves. Everything else on an acked alert is cancelled
+    // as always, and a resolved alert cancels everything, prompts included.
+    let is_prompt = job
+        .route_info
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        == Some("approval");
+    let deliverable = match AlertStatus::parse(&status) {
+        Some(AlertStatus::Open) => true,
+        Some(AlertStatus::Acked) => is_prompt,
+        Some(AlertStatus::Resolved) | None => false,
+    };
+    if !is_digest && !deliverable {
         return finalize_cancelled_logged(pool, &job, token, &format!("alert {status}")).await;
     }
 
-    let alert = AlertView {
-        id: job.alert_id,
-        status,
-        severity,
-        title,
-        body,
+    let alert = if is_digest {
+        digest_alert_view(job.alert_id, status, severity, &job.route_info)
+    } else {
+        AlertView {
+            id: job.alert_id,
+            status,
+            severity,
+            title,
+            body,
+        }
     };
+    // Email carries the filled-in runbook steps (SPEC §5.5); SMS keeps its short link.
+    let mut alert = alert;
+    if channel.name() == "email"
+        && let Some(section) = crate::runbook::email_section(pool, job.alert_id).await?
+    {
+        alert.body = format!("{}\n\n{}", alert.body, section);
+    }
     // A job that waited for a send slot must not send if the breaker opened meanwhile.
     if probe.is_none() && breaker::is_not_closed(pool, channel.name()).await? {
         let err = SendError::Transient("channel breaker open".into());
@@ -534,14 +609,14 @@ async fn process_job(
                     {
                         Some(outcome) if outcome.status == JobStatus::Dead => {
                             info!(job_id = %job.id, attempts = job.attempts, channel = channel.name(),
-                                  class = err.class().as_str(), error = err.message(),
+                                  class = err.class().as_str(), error = %mask_emails_in_text(err.message()),
                                   fallbacks = outcome.fallbacks,
                                   "delivery dead during channel breaker open");
                             Ok(Outcome::Dead(outcome.fallbacks))
                         }
                         Some(_) => {
                             warn!(job_id = %job.id, attempts = job.attempts, channel = channel.name(),
-                                  class = err.class().as_str(), error = err.message(),
+                                  class = err.class().as_str(), error = %mask_emails_in_text(err.message()),
                                   "delivery failed while breaker open, will retry after cooldown");
                             Ok(Outcome::Retried)
                         }
@@ -568,13 +643,15 @@ async fn finish_failed(
 ) -> Result<Outcome, sqlx::Error> {
     match finalize_failed_inner(pool, job, token, err, policy, Duration::ZERO).await? {
         Some(outcome) if outcome.status == JobStatus::Dead => {
+            // Privacy: scrubbed like the deferred log above; `delivery_jobs.last_error`
+            // itself still stores the full message for operators.
             info!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
-                  error = err.message(), fallbacks = outcome.fallbacks, "delivery dead");
+                  error = %mask_emails_in_text(err.message()), fallbacks = outcome.fallbacks, "delivery dead");
             Ok(Outcome::Dead(outcome.fallbacks))
         }
         Some(_) => {
             warn!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
-                  error = err.message(), "delivery failed, will retry");
+                  error = %mask_emails_in_text(err.message()), "delivery failed, will retry");
             Ok(Outcome::Retried)
         }
         None => {
@@ -658,11 +735,15 @@ pub async fn work_once(
     }
 
     for job in claimed.jobs {
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore never closed");
+        // The semaphore is never closed today; if it ever is, stop spawning instead of panicking
+        // (a panic here would end `run_worker` and take the whole process down, QA M10). Jobs
+        // claimed but not started keep their lease and are reclaimed when it expires.
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            warn!(
+                "delivery worker semaphore closed; leaving remaining claimed jobs to lease expiry"
+            );
+            break;
+        };
         // Reap finished tasks as we go so results are not held for the whole batch.
         while let Some(res) = set.try_join_next() {
             tally(&mut stats, &mut first_err, res);
@@ -690,8 +771,9 @@ pub async fn work_once(
     }
 }
 
-/// Loop `work_once` until shutdown; poll again at once after a non-empty batch, else sleep
-/// `cfg.poll_interval`. Logs and backs off on DB errors instead of exiting.
+/// Loop `work_once` until shutdown (the value becomes `true` or the sender is dropped); poll
+/// again at once after a non-empty batch, else sleep `cfg.poll_interval`. Logs and backs off on
+/// DB errors instead of exiting.
 pub async fn run_worker(
     pool: PgPool,
     channel: Arc<dyn Channel>,
@@ -700,16 +782,17 @@ pub async fn run_worker(
 ) {
     let mut shutdown = shutdown;
     info!(worker_id = %cfg.worker_id, channel = channel.name(), "delivery worker started");
-    while !*shutdown.borrow() {
+    while !*shutdown.borrow() && shutdown.has_changed().is_ok() {
         match work_once(&pool, &channel, &cfg).await {
             Ok(stats) if stats.claimed > 0 || stats.dead_on_claim > 0 => continue,
             Ok(_) => {
                 tokio::select! {
                     _ = tokio::time::sleep(cfg.poll_interval) => {}
                     res = shutdown.changed() => {
+                        // Sender dropped: the owner is gone, so stop like the router does
+                        // instead of spinning forever with a pool clone (QA M9).
                         if res.is_err() {
-                            // Sender dropped: nobody can signal shutdown any more; keep polling.
-                            tokio::time::sleep(cfg.poll_interval).await;
+                            break;
                         }
                     }
                 }
@@ -718,7 +801,11 @@ pub async fn run_worker(
                 error!(error = %e, "delivery worker iteration failed");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = shutdown.changed() => {}
+                    res = shutdown.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }

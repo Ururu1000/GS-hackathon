@@ -2,7 +2,7 @@
 //! resolving each recipient's channels per SPEC §4.4 and freezing the decision into
 //! `route_info` (M4, §5.4).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +13,11 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::config::{Directory, Person, Team, address_for};
-use crate::model::NotifyPayload;
+use crate::escalation;
+use crate::model::{NotifyPayload, NotifyReason};
 use crate::prefs::{self, Decision, RoutingContext};
+use crate::runbook;
+use crate::throttle::{self, PlannedJob};
 use crate::{RouterConfig, Shutdown};
 
 /// Channels the router can create delivery jobs for: email via SMTP, sms and phone via the
@@ -33,6 +36,12 @@ pub struct RouteStats {
     /// Recipients skipped (unknown target, no address for the channel, unsupported channel),
     /// counted once per `(person, channel)` pair.
     pub skipped: u64,
+    /// Recipient notifications parked by the throttle (M5a).
+    pub suppressed: u64,
+    /// Escalation timers started (M5a).
+    pub timers: u64,
+    /// Runbooks frozen onto alerts (M5b).
+    pub runbooks: u64,
 }
 
 /// Claim up to `cfg.batch_size` unprocessed notify rows with `FOR UPDATE SKIP LOCKED`, insert
@@ -78,6 +87,10 @@ pub async fn route_once(
         // several entries gets the union of channels, and the first decision for a pair
         // wins (SPEC §4.4).
         let mut seen: HashSet<(String, String)> = HashSet::new();
+        // Planned jobs per person (ordered for deterministic inserts); written after the
+        // throttle decision below (M5a: one token per recipient notification).
+        let mut planned_by_person: BTreeMap<String, Vec<PlannedJob>> = BTreeMap::new();
+        let policy = dir.rules.for_payload(&payload.rule_id, raw);
 
         for entry in &payload.route {
             let people = match dir.expand(&entry.to) {
@@ -142,22 +155,100 @@ pub async fn route_once(
                         route_info["fallback"] = json!({ "channel": fb, "address": fb_address });
                     }
 
-                    let res = sqlx::query(
-                        "INSERT INTO delivery_jobs \
-                           (alert_id, notify_seq, recipient_id, channel, address, route_info) \
-                         VALUES ($1, $2, $3, $4, $5, $6) \
-                         ON CONFLICT (alert_id, recipient_id, channel, notify_seq) DO NOTHING",
-                    )
-                    .bind(alert_id)
-                    .bind(payload.notify_seq)
-                    .bind(&person.id)
-                    .bind(&channel)
-                    .bind(address)
-                    .bind(route_info)
-                    .execute(&mut *tx)
-                    .await?;
-                    stats.jobs_inserted += res.rows_affected();
+                    planned_by_person
+                        .entry(person.id.clone())
+                        .or_default()
+                        .push(PlannedJob {
+                            channel: channel.clone(),
+                            address: address.to_string(),
+                            route_info,
+                        });
                 }
+            }
+        }
+
+        for (recipient_id, jobs) in &planned_by_person {
+            if let Some(spec) = &policy.throttle
+                && !throttle::take(&mut tx, &payload.rule_id, recipient_id, spec).await?
+            {
+                throttle::suppress(
+                    &mut tx,
+                    &payload.rule_id,
+                    recipient_id,
+                    *alert_id,
+                    payload.notify_seq,
+                    jobs,
+                )
+                .await?;
+                stats.suppressed += 1;
+                continue;
+            }
+            stats.jobs_inserted += insert_jobs(
+                &mut tx,
+                *alert_id,
+                payload.notify_seq,
+                recipient_id,
+                jobs,
+                None,
+            )
+            .await?;
+        }
+
+        // Freeze the selected runbook, rendered from the pinned event context, on the alert's
+        // first notification (SPEC §6.1, M5b).
+        if payload.reason == NotifyReason::New {
+            let alert = json!({
+                "id": alert_id, "team": payload.team, "rule_id": payload.rule_id,
+                "severity": payload.severity,
+            });
+            let tctx = runbook::template_context(raw, &alert);
+            if let Some(rb) = dir
+                .runbooks
+                .select(policy.runbook.as_deref(), &payload.team, &tctx)
+            {
+                let steps = runbook::render(rb, &tctx, &crate::actions::ActionRegistry::risk_of);
+                if runbook::attach(&mut tx, *alert_id, rb, &steps, &tctx).await? {
+                    stats.runbooks += 1;
+                }
+            }
+        }
+
+        // Escalation clock starts at the alert's first notification (SPEC §4.4); suppressed or
+        // failed sends still count as notified.
+        let interval = cfg.escalate_after_override.or(policy.escalate_after);
+        if payload.reason == NotifyReason::New
+            && let Some(interval) = interval
+        {
+            let notified: HashSet<String> = planned_by_person.keys().cloned().collect();
+            let chain = escalation::plan_chain(dir, &payload.route, &payload.team, &notified);
+            // The channels this notification planned, frozen onto the timer (S11-8):
+            // parked rows count too, so later jobs (fallback jobs, digests, prompts) cannot
+            // change an escalation step's fallback channels.
+            let planned_channels: Vec<String> = {
+                let mut seen = HashSet::new();
+                let mut out: Vec<String> = Vec::new();
+                for jobs in planned_by_person.values() {
+                    for job in jobs {
+                        if seen.insert(job.channel.clone()) {
+                            out.push(job.channel.clone());
+                        }
+                    }
+                }
+                out
+            };
+            if !chain.is_empty()
+                && escalation::schedule(
+                    &mut tx,
+                    *alert_id,
+                    payload.notify_seq,
+                    &ctx,
+                    &chain,
+                    interval,
+                    &planned_channels,
+                )
+                .await?
+            {
+                stats.timers += 1;
             }
         }
     }
@@ -171,6 +262,38 @@ pub async fn route_once(
 
     tx.commit().await?;
     Ok(stats)
+}
+
+/// Insert planned jobs `ON CONFLICT DO NOTHING`; returns how many rows were inserted. Shared with
+/// the escalation scheduler and the throttle digest (`escalation_step` is `Some` for escalations).
+pub async fn insert_jobs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    alert_id: Uuid,
+    notify_seq: i32,
+    recipient_id: &str,
+    jobs: &[PlannedJob],
+    escalation_step: Option<i32>,
+) -> Result<u64, sqlx::Error> {
+    let mut inserted = 0;
+    for job in jobs {
+        let res = sqlx::query(
+            "INSERT INTO delivery_jobs \
+               (alert_id, notify_seq, recipient_id, channel, address, route_info, escalation_step) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING",
+        )
+        .bind(alert_id)
+        .bind(notify_seq)
+        .bind(recipient_id)
+        .bind(&job.channel)
+        .bind(&job.address)
+        .bind(&job.route_info)
+        .bind(escalation_step.unwrap_or(0))
+        .execute(&mut **tx)
+        .await?;
+        inserted += res.rows_affected();
+    }
+    Ok(inserted)
 }
 
 /// Facts a preference can match on: the payload plus its optional raw `context` object
@@ -218,6 +341,12 @@ fn team_for_target<'a>(
 pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, shutdown: Shutdown) {
     let mut shutdown = shutdown;
     while !*shutdown.borrow() {
+        // Throttle digests ride along with routing: cheap when nothing is parked.
+        match throttle::digest_once(&pool, 100).await {
+            Ok(d) if d.digests > 0 => debug!(?d, "throttle digests"),
+            Ok(_) => {}
+            Err(err) => error!(%err, "throttle digest pass failed"),
+        }
         let wait = match route_once(&pool, &dir, &cfg).await {
             Ok(stats) => {
                 if stats != RouteStats::default() {

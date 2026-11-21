@@ -3,23 +3,32 @@
 //! BEFORE replying, and can simulate outages. It also serves the device-simulator read API that
 //! the UI uses (board #101/#102/#103); `router()` can be mounted by beacon-api later.
 //!
-//! Authentication (delivery review, "unauthenticated gateway on 0.0.0.0"): by default the
-//! gateway runs without auth (dev mode; `serve` logs a `warn!` about it). Configure a token
-//! with [`GatewayState::with_token`] and the control endpoints — `POST /provider/{sms|phone}`,
-//! `POST /api/simulator/outage`, `DELETE /api/simulator/outage` — require
-//! `Authorization: Bearer <token>` (compared in constant time) and answer `401 unauthorized`
-//! otherwise. The read endpoints the UI's device simulator uses (`GET /api/simulator/messages`,
-//! `GET /api/simulator/stream`, `GET /api/simulator/outage`) stay open.
+//! Authentication: by default the gateway runs without auth (dev mode; `serve` logs a
+//! `warn!` about it, and `serve` refuses to bind a non-loopback address without a token, so
+//! an unauthenticated gateway can only ever listen on loopback). Configure a token with
+//! [`GatewayState::with_token`] and EVERY `/api/simulator/*` route (reads included:
+//! `messages`, `stream`, `outage`, `mock`) and every `/provider/*` route requires
+//! `Authorization: Bearer <token>` (compared in constant time) and answers
+//! `401 unauthorized` otherwise. `POST /api/simulator/reply` additionally always needs the
+//! token: with no token configured it answers `503 unavailable`
+//! (`reply forwarding needs GATEWAY_TOKEN`) and signs nothing.
 //!
 //! Request limits: the provider and outage POST routes cap bodies at 16 KiB
 //! (`DefaultBodyLimit` → `413`), and `ProviderRequest` fields are validated (text <= 1600
 //! chars, to <= 32 chars of `+`/digits/spaces, recipient <= 128, approval_challenge <= 32,
 //! no NUL bytes → `400 bad_request`), which also bounds the SSE broadcast ring.
 //!
+//! Privacy: gateway logs never carry message text, SMS codes or approval challenges, and
+//! phone numbers are masked ([`mask_phone`]) — recipient ids are fine as-is.
+//!
 //! Provider side (called by `channel::gateway_client::GatewayChannel`):
 //! - `POST /provider/sms`, `POST /provider/phone`: body `ProviderRequest`, header
 //!   `Idempotency-Key: <job_id>`. Insert `ON CONFLICT (job_id) DO UPDATE SET duplicates =
 //!   duplicates + 1, last_seen_at = now()`; reply `200 ProviderResponse{receipt_id, duplicate}`.
+//!   An approval prompt whose approval is no longer `pending` — decided, expired or unknown,
+//!   checked against the job's `route_info.approval.id` in the same tx (S11-9) — is
+//!   persisted with `approval_challenge = NULL` and every 4-digit run in `text` masked to
+//!   `****`, like `approvals::scrub_code` does; the SSE broadcast carries that masked row.
 //!   During an outage of that channel: mode `down` → `503` + `Retry-After: <OUTAGE_RETRY_AFTER_S>`
 //!   without persisting; mode `lose_response` → persist as above, then reply `504`.
 //!
@@ -30,19 +39,22 @@
 //!   than 256 chars → `400`.
 //! - `GET /api/simulator/stream` (SSE): first `snapshot` `{items, next_cursor}`, then one
 //!   `simulator.message` event (a `SimMessage`) per new or duplicated receipt; `: ping` every
-//!   15 s; header `X-Accel-Buffering: no`.
+//!   15 s; header `X-Accel-Buffering: no`. Concurrent streams are capped (default 64, see
+//!   [`GatewayState::with_max_streams`]); past the cap the endpoint answers `503 unavailable`
+//!   (`too many streams`) and the slot is released when the stream ends.
 //! - `POST /api/simulator/outage` `{channel: sms|phone, seconds, mode?: down|lose_response}`
 //!   (default mode `down`) → `{outages}`; `DELETE /api/simulator/outage?channel=` ends it early;
 //!   `GET /api/simulator/outage` → `{outages: [{channel, mode, until}]}` (expired ones omitted).
 //! - Errors: `{error: {code, message}}` with 400/401/404/413. 500s are always the fixed
 //!   `{code: "internal", message: "internal error"}` (the real error is logged, never leaked).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -51,9 +63,12 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use chrono::{DateTime, Utc};
 use futures::StreamExt as _;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
+use tokio::sync::Semaphore;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -63,6 +78,9 @@ use crate::channel::gateway_client::ProviderRequest;
 
 /// `Retry-After` seconds returned while a channel is down.
 pub const OUTAGE_RETRY_AFTER_S: u64 = 2;
+
+/// Default cap on concurrent `/api/simulator/stream` (SSE) connections.
+pub const DEFAULT_MAX_STREAMS: usize = 64;
 
 /// Default page size for the simulator feed.
 const DEFAULT_LIMIT: i64 = 50;
@@ -118,15 +136,26 @@ pub struct Outage {
 }
 
 /// Shared state: the pool, the in-memory outage table, a broadcast of new receipts for SSE,
-/// and the optional bearer token for the control (provider + outage) endpoints.
+/// and the optional bearer token for the simulator and provider endpoints.
 #[derive(Clone)]
 pub struct GatewayState {
     pool: PgPool,
     outages: Arc<RwLock<HashMap<String, Outage>>>,
     tx: tokio::sync::broadcast::Sender<SimMessage>,
-    /// `Some` → the control endpoints require `Authorization: Bearer <token>`; `None` →
-    /// no auth (dev; `serve` warns about it once).
+    /// `Some` → every `/api/simulator/*` and `/provider/*` route requires
+    /// `Authorization: Bearer <token>`; `None` → no auth (dev; `serve` warns about it and
+    /// refuses non-loopback binds).
     token: Option<String>,
+    /// Cap on concurrent `/api/simulator/stream` connections (see [`Self::with_max_streams`]).
+    streams: Arc<Semaphore>,
+    /// M5b (agent C): where `POST /api/simulator/reply` forwards replies (`None` → the
+    /// endpoint answers `503 unavailable`).
+    reply_forward_url: Option<String>,
+    /// M5b (agent C): HMAC key for the forwarded replies' `X-Beacon-Signature`.
+    reply_secret: Option<Vec<u8>>,
+    /// M5b (agent B): mock action-target outcomes + call log (see the **Mock targets**
+    /// section of `crate::actions`). In-memory only, shared by every handler.
+    mocks: Arc<RwLock<MockState>>,
     /// Set by [`serve`]; ends open SSE streams on shutdown.
     shutdown: Option<Shutdown>,
 }
@@ -139,16 +168,29 @@ impl GatewayState {
             outages: Arc::new(RwLock::new(HashMap::new())),
             tx,
             token: None,
+            streams: Arc::new(Semaphore::new(DEFAULT_MAX_STREAMS)),
+            reply_forward_url: None,
+            reply_secret: None,
+            mocks: Arc::new(RwLock::new(MockState::default())),
             shutdown: None,
         }
     }
 
-    /// Require `Authorization: Bearer <token>` (constant-time compare) on
-    /// `POST /provider/{sms|phone}`, `POST /api/simulator/outage` and
-    /// `DELETE /api/simulator/outage`. `None` switches auth off again (dev). The read
-    /// endpoints the UI's device simulator uses stay open either way.
+    /// Require `Authorization: Bearer <token>` (constant-time compare) on EVERY
+    /// `/api/simulator/*` route (reads included) and every `/provider/*` route. `None`
+    /// switches auth off again (dev). The reply endpoint additionally needs the token even
+    /// to explain itself: with no token configured it answers `503 unavailable`.
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
+        self
+    }
+
+    /// Cap concurrent `/api/simulator/stream` (SSE) connections at `max`: past the cap the
+    /// endpoint answers `503 {error:{code:"unavailable"}}`. The slot is released exactly
+    /// when the stream ends (client disconnect or server shutdown). Default
+    /// [`DEFAULT_MAX_STREAMS`].
+    pub fn with_max_streams(mut self, max: usize) -> Self {
+        self.streams = Arc::new(Semaphore::new(max));
         self
     }
 
@@ -193,6 +235,48 @@ impl GatewayState {
     }
 }
 
+/// M5b (agent C): the device-simulator routes only (`/api/simulator/{messages,stream,outage}`
+/// and `POST /api/simulator/reply`), for beacon-api to mount on its origin (board #171). The
+/// `/provider/*` and `/mock/*` routes stay on the gateway role.
+pub fn simulator_router(state: GatewayState) -> axum::Router {
+    axum::Router::new()
+        .route("/api/simulator/messages", get(messages_handler))
+        .route("/api/simulator/stream", get(stream_handler))
+        .route(
+            "/api/simulator/outage",
+            post(outage_post_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
+        .route("/api/simulator/outage", get(outage_get_handler))
+        .route("/api/simulator/outage", delete(outage_delete_handler))
+        .route(
+            "/api/simulator/reply",
+            post(simulator_reply_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
+        .fallback(fallback_404)
+        .with_state(state)
+}
+
+impl GatewayState {
+    /// M5b (agent C): where `POST /api/simulator/reply {from, text}` forwards replies:
+    /// `POST {url}/api/replies` with `X-Beacon-Timestamp: <unix seconds>` and
+    /// `X-Beacon-Signature: hex(hmac_sha256(secret, "<timestamp>." + raw_body))`.
+    /// `None` → the reply endpoint answers `503 {error:{code:"unavailable"}}`.
+    pub fn with_reply_forward(self, url: Option<String>, secret: Option<Vec<u8>>) -> Self {
+        Self {
+            reply_forward_url: url,
+            reply_secret: secret,
+            ..self
+        }
+    }
+
+    /// M5b (agent B): reset the mock action targets (in-memory outcomes + call log);
+    /// mock outcomes default to `ok`.
+    pub fn with_mocks(self) -> Self {
+        *self.mocks.write().expect("mock lock") = MockState::default();
+        self
+    }
+}
+
 /// All gateway routes (provider + simulator) on one router. The two body-consuming POST
 /// routes are capped at [`REQUEST_BODY_LIMIT`] (a longer body is rejected with `413` before
 /// any handler or field validation runs).
@@ -210,12 +294,39 @@ pub fn router(state: GatewayState) -> axum::Router {
         )
         .route("/api/simulator/outage", get(outage_get_handler))
         .route("/api/simulator/outage", delete(outage_delete_handler))
+        // M5b (agent B): mock action targets + the mock control API. The health route
+        // is a wildcard so both `/mock/health/<name>` and deeper alias-mapped paths
+        // (e.g. `/mock/health/counterparty-service/health`) answer.
+        .route("/mock/health/{*rest}", get(mock_health_handler))
+        .route(
+            "/mock/workflows/{id}/retry",
+            post(mock_workflow_retry_handler),
+        )
+        .route(
+            "/mock/services/{name}/restart",
+            post(mock_service_restart_handler),
+        )
+        .route("/mock/tickets", post(mock_ticket_handler))
+        .route("/api/simulator/mock", get(mock_status_handler))
+        .route(
+            "/api/simulator/mock",
+            post(mock_set_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
+        // M5b (agent C): the fake phone's reply endpoint, forwarded to the delivery API.
+        .route(
+            "/api/simulator/reply",
+            post(simulator_reply_handler).layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT)),
+        )
         .fallback(fallback_404)
         .with_state(state)
 }
 
 /// Bind `addr` and serve `router(state)` until shutdown. Returns the bound address (so tests can
 /// pass port 0) through `on_bound` before serving.
+///
+/// Refuses to bind a non-loopback address without a token: an unauthenticated gateway can
+/// only ever listen on loopback. Returns an `io::Error` (kind `InvalidInput`) naming the
+/// missing `GATEWAY_TOKEN` instead of binding.
 pub async fn serve(
     mut state: GatewayState,
     addr: SocketAddr,
@@ -223,10 +334,19 @@ pub async fn serve(
     on_bound: impl FnOnce(SocketAddr) + Send,
 ) -> std::io::Result<()> {
     if state.token.is_none() {
+        if !addr.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to bind the unauthenticated gateway to non-loopback address \
+                     {addr}: configure GatewayState::with_token(Some(..)) (GATEWAY_TOKEN) \
+                     for anything exposed past localhost"
+                ),
+            ));
+        }
         warn!(
-            "gateway accepts UNAUTHENTICATED provider and outage requests; anyone reachable \
-             can send messages and trigger outages. Configure GatewayState::with_token(Some(..)) \
-             for anything exposed past localhost."
+            "gateway accepts UNAUTHENTICATED simulator and provider requests on loopback; \
+             configure GatewayState::with_token(Some(..)) for anything exposed past localhost."
         );
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -328,6 +448,23 @@ fn require_bearer(state: &GatewayState, headers: &HeaderMap) -> Option<Response>
             "missing or invalid Authorization: Bearer token",
         )),
     }
+}
+
+/// Mask a phone number for logs: keep the first three characters (the country prefix)
+/// and the last three digits, `*` in between. `+447700900125` becomes `+44*******125`.
+/// Recipient ids (`user:<id>`) are fine as-is and never pass through here. Short inputs
+/// (six chars or fewer) are fully masked.
+pub fn mask_phone(phone: &str) -> String {
+    let chars: Vec<char> = phone.chars().collect();
+    if chars.len() <= 6 {
+        return "*".repeat(chars.len());
+    }
+    let n = chars.len();
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| if i < 3 || i >= n - 3 { c } else { '*' })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -448,9 +585,11 @@ async fn provider_handler(
         Ok((msg, duplicate)) => {
             let receipt_id = msg.receipt_id;
             let _ = state.tx.send(msg.clone());
+            // Privacy: the phone number is masked, and message text, SMS codes and
+            // approval challenges are never logged.
             tracing::info!(
                 channel = %channel,
-                to = %req.to,
+                to = %mask_phone(&req.to),
                 job_id = %req.job_id,
                 duplicate,
                 "gateway accepted message"
@@ -474,15 +613,46 @@ async fn provider_handler(
 
 /// The single upsert statement owned by the provider side. Returns the row and whether this
 /// `job_id` had already been accepted (`xmax <> 0` is true only for the `DO UPDATE` path).
+///
+/// S11-9: an approval prompt whose approval was already decided (approved, rejected,
+/// expired — or no approval found) must not land with its plaintext code. The check runs in
+/// the SAME transaction as the persist, locking the approval row the job's
+/// `route_info.approval.id` names (`FOR SHARE`): a concurrent decide either committed
+/// before us — the read sees a non-pending state and the receipt is persisted masked — or
+/// blocks on our lock, and its `scrub_code` masks this receipt after we commit. Masked =
+/// `approval_challenge = NULL` and every 4-digit run in `text` replaced with `****`, the
+/// same treatment `approvals::scrub_code` gives older receipts; the returned (and SSE
+/// broadcast) `SimMessage` then carries no code either. Ordinary messages (no
+/// `approval_challenge`) are untouched.
 async fn persist_receipt(
     pool: &PgPool,
     channel: &str,
     req: &ProviderRequest,
 ) -> Result<(SimMessage, bool), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Only a challenge-bearing sms is a prompt; anything else persists as sent.
+    let prompt_decided: bool = match req.approval_challenge {
+        Some(_) => {
+            let pending: Option<bool> = sqlx::query_scalar(
+                "SELECT (a.state = 'pending') FROM approvals a \
+                 WHERE a.id::text = (SELECT route_info->'approval'->>'id' \
+                                     FROM delivery_jobs WHERE id = $1) \
+                 FOR SHARE",
+            )
+            .bind(req.job_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            // No approval row / no job / decided: nothing still pending authorizes the code.
+            pending != Some(true)
+        }
+        None => false,
+    };
     let row: PgRow = sqlx::query(
         "INSERT INTO gateway_receipts \
             (job_id, alert_id, channel, recipient, to_address, text, approval_challenge) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         VALUES ($1, $2, $3, $4, $5, \
+                 CASE WHEN $8 THEN regexp_replace($6, '\\d{4}', '****', 'g') ELSE $6 END, \
+                 CASE WHEN $8 THEN NULL ELSE $7 END) \
          ON CONFLICT (job_id) DO UPDATE SET \
             duplicates = gateway_receipts.duplicates + 1, last_seen_at = now() \
          RETURNING id, receipt_id, job_id, alert_id, channel, recipient, to_address, text, \
@@ -495,8 +665,10 @@ async fn persist_receipt(
     .bind(&req.to)
     .bind(&req.text)
     .bind(req.approval_challenge.as_deref())
-    .fetch_one(pool)
+    .bind(prompt_decided)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     let duplicate: bool = row.try_get("duplicate")?;
     Ok((row_to_message(&row)?, duplicate))
 }
@@ -596,8 +768,13 @@ async fn fetch_page(
 
 async fn messages_handler(
     State(state): State<GatewayState>,
+    headers: HeaderMap,
     Query(q): Query<MessagesQuery>,
 ) -> Response {
+    // Auth first, like every other simulator route when a token is configured.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let cursor: Option<FeedCursor> = match q.cursor {
         Some(ref s) => {
@@ -645,7 +822,23 @@ async fn messages_handler(
 // Simulator: SSE stream
 // ---------------------------------------------------------------------------------------------
 
-async fn stream_handler(State(state): State<GatewayState>) -> Response {
+async fn stream_handler(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    // Auth first: reads are operator- or UI-token-gated exactly like the control routes.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    // Cap concurrent streams: past the cap the endpoint answers 503 instead of stacking
+    // unbounded per-connection tasks and broadcast receivers.
+    let permit = match state.streams.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "too many streams",
+            );
+        }
+    };
     // Subscribe before the snapshot query so a receipt committed in between is not lost; it
     // may then appear in both, and clients upsert by id anyway (duplicates re-broadcast).
     let rx = state.tx.subscribe();
@@ -676,13 +869,23 @@ async fn stream_handler(State(state): State<GatewayState>) -> Response {
     });
     // Graceful shutdown waits for open connections, so a live SSE stream must end by itself.
     let mut shutdown = state.shutdown.clone();
-    let stream = first.chain(live).take_until(async move {
+    let combined = first.chain(live).take_until(async move {
         match shutdown.as_mut() {
             Some(rx) => drop(rx.wait_for(|v| *v).await),
             None => std::future::pending().await,
         }
     });
-    let sse = Sse::new(stream).keep_alive(
+    // Hold the semaphore permit inside the stream state so the slot is released exactly
+    // when the stream ends (client disconnect, server shutdown) or is dropped.
+    let guarded = futures::stream::unfold(
+        (Some(permit), Box::pin(combined)),
+        |(permit, mut inner)| async move {
+            let next = futures::StreamExt::next(&mut inner).await;
+            // `permit` drops with the state when the stream ends, releasing the slot.
+            next.map(|item| (item, (permit, inner)))
+        },
+    );
+    let sse = Sse::new(guarded).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("ping"),
@@ -746,7 +949,11 @@ async fn outage_post_handler(
     (StatusCode::OK, Json(outages_body(state.active_outages()))).into_response()
 }
 
-async fn outage_get_handler(State(state): State<GatewayState>) -> Response {
+async fn outage_get_handler(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    // Auth first, like every other simulator route when a token is configured.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
     (StatusCode::OK, Json(outages_body(state.active_outages()))).into_response()
 }
 
@@ -781,6 +988,183 @@ async fn outage_delete_handler(
         ),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Simulator: SMS replies (agent C)
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /api/simulator/reply {from, text}` — the fake phone's reply path. The gateway
+/// token is ALWAYS required here (unlike the other routes, dev mode has no open reply):
+/// with no token configured the endpoint answers `503 unavailable`
+/// (`reply forwarding needs GATEWAY_TOKEN`) and signs nothing. With a token it behaves like
+/// the other control endpoints (`401` without the bearer), validates the shape, then forwards
+/// the exact request bytes to `{reply_forward_url}/api/replies` signed with the shared
+/// contract: headers `X-Beacon-Timestamp: <unix seconds>` and
+/// `X-Beacon-Signature: hex(hmac_sha256(secret, "<timestamp>." + raw_body))`, and relays that
+/// endpoint's status + JSON body.
+#[derive(Debug, Deserialize)]
+struct SimulatorReply {
+    from: String,
+    text: String,
+}
+
+async fn simulator_reply_handler(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // The token gate is unconditional: signing needs the token, and an unsigned forwarder
+    // would be an unauthenticated signing proxy.
+    if state.token.is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "reply forwarding needs GATEWAY_TOKEN",
+        );
+    }
+    // Auth second, like the other simulator control endpoints.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    let reply: SimulatorReply = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("invalid JSON body: {e}"),
+            );
+        }
+    };
+    if reply.from.chars().count() > 32
+        || !reply
+            .from
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == ' ')
+        || !reply.from.chars().any(|c| c.is_ascii_digit())
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "from must be an E.164 phone number (digits, optional +)",
+        );
+    }
+    if reply.text.contains('\0') {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "text must not contain NUL bytes",
+        );
+    }
+    if reply.text.trim().is_empty() || reply.text.chars().count() > 160 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "text must be 1..=160 chars",
+        );
+    }
+    // The reply is recorded as a `simulator.message`-style log line (no new table: receipts
+    // are for messages the provider accepts, a reply never becomes one). Privacy: the phone
+    // is masked and the text (which carries the SMS code) is never logged.
+    tracing::info!(
+        from = %mask_phone(&reply.from),
+        "simulator.message: sms reply accepted"
+    );
+
+    let (Some(forward_url), Some(secret)) = (
+        state.reply_forward_url.as_deref(),
+        state.reply_secret.as_deref(),
+    ) else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "no delivery API configured to receive SMS replies",
+        );
+    };
+
+    // Sign the exact bytes we forward, prefixed with the timestamp the delivery API
+    // verifies: `hex(hmac_sha256(secret, "<timestamp>." + raw_body))`.
+    let timestamp = Utc::now().timestamp().to_string();
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(&body);
+    let signature = hex::encode(mac.finalize().into_bytes());
+
+    // No redirects, 5 s timeout: a broken delivery API must not park the simulator.
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "cannot build the reply forwarding http client");
+            return internal_error_response();
+        }
+    };
+    let url = format!("{}/api/replies", forward_url.trim_end_matches('/'));
+    let forwarded = client
+        .post(&url)
+        .header("X-Beacon-Timestamp", timestamp)
+        .header("X-Beacon-Signature", signature)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body.as_ref().to_vec())
+        .send()
+        .await;
+
+    let mut resp = match forwarded {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(url = %url, error = %e, "cannot forward the simulator reply");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "cannot reach the delivery API to forward this reply",
+            );
+        }
+    };
+    let status = match StatusCode::from_u16(resp.status().as_u16()) {
+        Ok(s) => s,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the delivery API answered with an invalid status",
+            );
+        }
+    };
+    // The relayed body is bounded (4 KiB): a hostile or broken upstream must not be buffered
+    // whole.
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < FORWARD_BODY_MAX_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = FORWARD_BODY_MAX_BYTES - buf.len();
+                if chunk.len() > room {
+                    buf.extend_from_slice(&chunk[..room]);
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    match serde_json::from_slice::<serde_json::Value>(&buf) {
+        Ok(value) => (status, Json(value)).into_response(),
+        Err(e) => {
+            warn!(url = %url, error = %e, "the delivery API did not answer with JSON");
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "bad_gateway",
+                "the delivery API did not answer with JSON",
+            )
+        }
+    }
+}
+
+// Cap on the bytes read from the delivery API's relayed response (its bodies are tiny).
+const FORWARD_BODY_MAX_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------------------------
 // Base64 (standard alphabet; decode also accepts URL-safe chars and missing padding so that
@@ -846,6 +1230,217 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Mock action targets (M5b, agent B; owned by `crate::actions`)
+// ---------------------------------------------------------------------------------------------
+
+/// Outcome of one mock target. `Default` (and any unset target) is `ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MockMode {
+    #[default]
+    Ok,
+    Fail,
+}
+
+impl MockMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            MockMode::Ok => "ok",
+            MockMode::Fail => "fail",
+        }
+    }
+}
+
+/// One recorded mock-target call, oldest first in `GET /api/simulator/mock`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MockCall {
+    /// `workflows` | `services` | `health` | `tickets`.
+    target: String,
+    method: String,
+    path: String,
+    at: DateTime<Utc>,
+}
+
+/// In-memory mock state: per-target outcomes + the call log. Modes default to `ok`.
+#[derive(Debug, Clone, Default)]
+struct MockState {
+    modes: HashMap<String, MockMode>,
+    calls: VecDeque<MockCall>,
+}
+
+/// The call log is bounded; the oldest entries drop first.
+const MAX_MOCK_CALLS: usize = 5000;
+
+fn is_mock_target(target: &str) -> bool {
+    matches!(target, "workflows" | "services" | "health" | "tickets")
+}
+
+/// Record one mock call and return that target's current mode (`ok` when unset).
+fn record_mock_call(state: &GatewayState, target: &str, method: &str, path: &str) -> MockMode {
+    let mut mocks = state.mocks.write().expect("mock lock");
+    while mocks.calls.len() >= MAX_MOCK_CALLS {
+        mocks.calls.pop_front();
+    }
+    mocks.calls.push_back(MockCall {
+        target: target.to_string(),
+        method: method.to_string(),
+        path: path.to_string(),
+        at: Utc::now(),
+    });
+    mocks.modes.get(target).copied().unwrap_or_default()
+}
+
+/// Every mock failure is the same body: `500 {"error": "mock failure"}`.
+fn mock_failure_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "mock failure" })),
+    )
+        .into_response()
+}
+
+async fn mock_health_handler(
+    State(state): State<GatewayState>,
+    Path(name): Path<String>,
+) -> Response {
+    let mode = record_mock_call(&state, "health", "GET", &format!("/mock/health/{name}"));
+    match mode {
+        MockMode::Ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "healthy" })),
+        )
+            .into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+async fn mock_workflow_retry_handler(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+    _body: Bytes,
+) -> Response {
+    let mode = record_mock_call(
+        &state,
+        "workflows",
+        "POST",
+        &format!("/mock/workflows/{id}/retry"),
+    );
+    match mode {
+        MockMode::Ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "workflow": id })),
+        )
+            .into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+async fn mock_service_restart_handler(
+    State(state): State<GatewayState>,
+    Path(name): Path<String>,
+    _body: Bytes,
+) -> Response {
+    let mode = record_mock_call(
+        &state,
+        "services",
+        "POST",
+        &format!("/mock/services/{name}/restart"),
+    );
+    match mode {
+        MockMode::Ok => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "service": name })),
+        )
+            .into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+async fn mock_ticket_handler(State(state): State<GatewayState>, _body: Bytes) -> Response {
+    let mode = record_mock_call(&state, "tickets", "POST", "/mock/tickets");
+    match mode {
+        MockMode::Ok => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        MockMode::Fail => mock_failure_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MockSetRequest {
+    target: String,
+    mode: String,
+}
+
+/// Switch one mock target's outcome. Needs the gateway token exactly like the outage
+/// control endpoints; unknown targets and modes are `400 bad_request`.
+async fn mock_set_handler(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Result<Json<MockSetRequest>, JsonRejection>,
+) -> Response {
+    // Auth first, like the outage control endpoints.
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    let req = match body {
+        Ok(Json(req)) => req,
+        Err(e) => return json_rejection_response(e),
+    };
+    if !is_mock_target(&req.target) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            format!(
+                "unknown mock target {:?}; expected workflows|services|health|tickets",
+                req.target
+            ),
+        );
+    }
+    let mode = match req.mode.as_str() {
+        "ok" => MockMode::Ok,
+        "fail" => MockMode::Fail,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("unknown mock mode {:?}; expected ok|fail", req.mode),
+            );
+        }
+    };
+    state
+        .mocks
+        .write()
+        .expect("mock lock")
+        .modes
+        .insert(req.target.clone(), mode);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "target": req.target, "mode": mode.as_str() })),
+    )
+        .into_response()
+}
+
+/// `GET /api/simulator/mock` → `{modes, calls}`. Token-gated like every other simulator
+/// route when a token is configured.
+async fn mock_status_handler(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = require_bearer(&state, &headers) {
+        return resp;
+    }
+    let mocks = state.mocks.read().expect("mock lock");
+    let mode_of = |target: &str| mocks.modes.get(target).copied().unwrap_or_default();
+    let modes = serde_json::json!({
+        "workflows": mode_of("workflows"),
+        "services": mode_of("services"),
+        "health": mode_of("health"),
+        "tickets": mode_of("tickets"),
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "modes": modes, "calls": mocks.calls })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +1490,19 @@ mod tests {
         assert!(!constant_time_eq(b"", b"token"));
         // Same length, differs only in the last byte: the classic early-exit leak case.
         assert!(!constant_time_eq(b"aaaaaaaX", b"aaaaaaaY"));
+    }
+
+    #[test]
+    fn mask_phone_keeps_prefix_and_last_three_digits() {
+        // The documented example: country prefix + last three digits survive.
+        assert_eq!(mask_phone("+447700900125"), "+44*******125");
+        assert_eq!(mask_phone("+15550001111"), "+15******111");
+        assert_eq!(mask_phone("+44 7700 900125"), "+44*********125");
+        // Recipient ids are not phones, but masking must not panic on them either.
+        assert_eq!(mask_phone("user:anna"), "use***nna");
+        // Short inputs are fully masked.
+        assert_eq!(mask_phone("+1555"), "*****");
+        assert_eq!(mask_phone(""), "");
     }
 
     #[test]

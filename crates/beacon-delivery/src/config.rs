@@ -180,16 +180,37 @@ pub struct Directory {
     pub teams: HashMap<String, Team>,
     /// `config/delivery.yaml` (fallback chain). `from_parts` uses the default.
     pub delivery: DeliverySettings,
+    /// `escalate_after` / `throttle` per rule from `config/rules` (part (a)'s files, optional).
+    pub rules: crate::rules::RulePolicies,
+    /// `config/runbooks` (M5b). `from_parts` gives an empty library.
+    pub runbooks: crate::runbook::RunbookLibrary,
 }
 
 impl Directory {
     /// Load `<root>/people/*.yaml` and `<root>/teams/*.yaml`. Missing subdirectories are empty.
     /// Rejects duplicate ids and team members / on-call entries naming unknown people.
+    /// Load `<root>/people` and `<root>/teams` (both required, QA M11: a typo in
+    /// `BEACON_CONFIG_DIR` must fail at startup, not route every alert to nobody) plus the
+    /// optional `<root>/delivery.yaml`.
     pub fn load(root: &Path) -> Result<Self, ConfigError> {
+        for sub in ["people", "teams"] {
+            let dir = root.join(sub);
+            if !dir.is_dir() {
+                return Err(ConfigError::Invalid(format!(
+                    "config directory {} is missing (set BEACON_CONFIG_DIR to the repo's config/)",
+                    dir.display()
+                )));
+            }
+        }
         let people: Vec<Person> = load_dir(&root.join("people"))?;
         let teams: Vec<Team> = load_dir(&root.join("teams"))?;
         let mut dir = Self::from_parts(people, teams)?;
         dir.delivery = DeliverySettings::load(root)?;
+        dir.rules = crate::rules::RulePolicies::load(&root.join("rules"));
+        dir.runbooks = crate::runbook::RunbookLibrary::load(
+            &root.join("runbooks"),
+            crate::actions::ActionRegistry::known(),
+        )?;
         Ok(dir)
     }
 
@@ -290,6 +311,8 @@ impl Directory {
             people: people_map,
             teams: teams_map,
             delivery: DeliverySettings::default(),
+            rules: Default::default(),
+            runbooks: Default::default(),
         })
     }
 
@@ -696,8 +719,14 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_subdirs_is_empty() {
+    fn load_fails_fast_on_missing_subdirs() {
         let root = tmp("missing");
+        let err = Directory::load(&root).unwrap_err().to_string();
+        assert!(err.contains("people") && err.contains("missing"), "{err}");
+        std::fs::create_dir_all(root.join("people")).unwrap();
+        let err = Directory::load(&root).unwrap_err().to_string();
+        assert!(err.contains("teams"), "{err}");
+        std::fs::create_dir_all(root.join("teams")).unwrap();
         let d = Directory::load(&root).unwrap();
         assert!(d.people.is_empty() && d.teams.is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -707,6 +736,7 @@ mod tests {
     fn load_reports_parse_error_with_path() {
         let root = tmp("bad");
         std::fs::create_dir_all(root.join("people")).unwrap();
+        std::fs::create_dir_all(root.join("teams")).unwrap();
         std::fs::write(root.join("people/x.yaml"), "contact: {}\n").unwrap();
         match Directory::load(&root) {
             Err(ConfigError::Parse { path, .. }) => assert!(path.ends_with("x.yaml"), "{path}"),
@@ -719,6 +749,7 @@ mod tests {
     fn load_rejects_duplicate_ids_across_files() {
         let root = tmp("dup");
         std::fs::create_dir_all(root.join("people")).unwrap();
+        std::fs::create_dir_all(root.join("teams")).unwrap();
         for f in ["a.yaml", "b.yaml"] {
             std::fs::write(root.join("people").join(f), "user: same\ncontact: {}\n").unwrap();
         }
@@ -746,7 +777,11 @@ mod tests {
         let rules: Vec<serde_json::Value> = load_dir(&root.join("rules")).unwrap();
         assert!(!rules.is_empty(), "no seed rules found");
         for rule in &rules {
-            for entry in rule["route"].as_array().into_iter().flatten() {
+            // A rule without a route list would silently route to nobody: fail loudly.
+            let route = rule["route"]
+                .as_array()
+                .unwrap_or_else(|| panic!("rule {}: route must be a list", rule["id"]));
+            for entry in route {
                 let to = entry["to"].as_str().unwrap();
                 let people = d
                     .expand(to)

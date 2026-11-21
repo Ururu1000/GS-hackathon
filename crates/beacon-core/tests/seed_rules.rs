@@ -83,14 +83,17 @@ fn anna_fires_and_recovers_on_same_fingerprint() {
     let ev = fire[0].event.as_ref().expect("anna's rule has a runbook");
     assert_eq!(ev.raw["labels"]["region"], json!("eu-west"));
     assert_eq!(ev.fields["service"], json!("payments-api"));
-    // Rules without one don't carry it (pricing has no runbook).
+    // Team runbooks can match the event even without an explicit rule binding.
     let (_, p) = run(&cfg, "http:logs", sample("pricing-log-warn.json"));
-    assert!(p[0].event.is_none());
+    let ev = p[0].event.as_ref().expect("pricing carries context for team runbooks");
+    assert_eq!(ev.raw["instrument"], json!("EURUSD"));
+    assert_eq!(ev.fields["severity"], json!("warning"));
 
     let (_, rec) = run(&cfg, "http:alertmanager", sample("high-error-rate-resolved.json"));
     assert_eq!(rec.len(), 1, "{rec:?}");
     assert_eq!(rec[0].kind, MatchKind::Recover);
     assert_eq!(rec[0].fingerprint, fire[0].fingerprint);
+    assert!(rec[0].event.is_none());
 }
 
 #[test]

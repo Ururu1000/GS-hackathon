@@ -1,0 +1,11 @@
+-- Escalation (S11-8): freeze the channels the notification that started the timer actually
+-- planned (throttle-parked rows included) onto the timer itself. The fire path's
+-- "nothing sendable" fallback reads these instead of re-reading delivery_jobs, whose
+-- channels drift over time (fallback jobs, digests, approval prompts). NULL — timers
+-- written before this column — keeps the historical behaviour: the distinct channels of
+-- the alert's existing jobs for the timer's notify_seq.
+--
+-- Version note: the review asked for 20261121030000, but that version is already taken by
+-- the concurrent 20261121030000_core_group_key.sql and sqlx versions must be unique, so
+-- this migration lives one step later.
+ALTER TABLE escalation_timers ADD COLUMN planned_channels text[];
