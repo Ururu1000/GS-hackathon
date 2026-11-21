@@ -120,7 +120,7 @@ fn require_json(headers: &HeaderMap) -> Result<(), Response> {
     if json {
         Ok(())
     } else {
-        Err(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "Content-Type must be application/json"))
+        Err(error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "send Content-Type: application/json (curl: -H 'content-type: application/json')"))
     }
 }
 
