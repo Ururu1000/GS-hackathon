@@ -15,6 +15,7 @@ CREATE TABLE offhours_held (
     created_at   timestamptz NOT NULL DEFAULT now(),
     released_at  timestamptz,                       -- set when a digest covered this row
     digest_alert uuid,                              -- alert the digest job was filed under
+    digest_job   uuid,                              -- delivery_jobs.id of that digest (timeline)
     UNIQUE (alert_id, recipient_id, notify_seq)
 );
 

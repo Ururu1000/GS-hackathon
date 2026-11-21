@@ -600,7 +600,10 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         if (!Array.isArray(v)) return out.push({ path: `${at}.${k}`, message: 'must be a list of channels' })
         for (const c of v) {
           // `digest` (one morning email) is only valid outside a time window, like the backend.
-          if (c === 'digest') { if (k !== 'otherwise') out.push({ path: `${at}.${k}`, message: '`digest` is only allowed in `otherwise`' }) }
+          if (c === 'digest') {
+            if (k !== 'otherwise') out.push({ path: `${at}.${k}`, message: '`digest` is only allowed in `otherwise`' })
+            else if (v.some((x: unknown) => x !== 'digest' && x !== 'ui')) out.push({ path: `${at}.${k}`, message: "`digest` can't be combined with other channels (only with ui)" })
+          }
           else if (!known.includes(c)) out.push({ path: `${at}.${k}`, message: `unknown channel "${c}"` })
         }
       }

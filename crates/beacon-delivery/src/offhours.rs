@@ -8,7 +8,8 @@
 //! - **Never for critical.** The router sends `digest` as email for a critical alert.
 //!   Escalation steps and runbook actions resolve `digest` to email too
 //!   (`prefs::resolve_channels`), so nothing urgent waits for the morning.
-//! - **Release.** [`release_once`], run by the scheduler role each pass, picks people with due rows. Per person, in one transaction,
+//! - **Release.** [`release_once`], run by the scheduler role each pass with its current
+//!   directory (the email address is read at release, not frozen at hold), picks people with due rows. Per person, in one transaction,
 //!   it takes a per-person advisory lock (skipped if another pass holds it) and locks their due rows,
 //!   files ONE email job under the latest held row's `(alert_id, notify_seq)` with
 //!   `escalation_step = -1` ([`OFFHOURS_DIGEST_STEP`], so it never collides with that
@@ -24,6 +25,9 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use tracing::warn;
+
+use crate::config::{Directory, address_for};
 use crate::throttle::PlannedJob;
 
 /// `delivery_jobs.escalation_step` of a digest job. 0 is the plain notification, 1.. escalation
@@ -77,6 +81,7 @@ pub struct ReleaseStats {
 /// One pass: send a digest to every person (up to `limit`) with held rows due at `now`.
 pub async fn release_once(
     pool: &PgPool,
+    dir: &Directory,
     now: DateTime<Utc>,
     limit: i64,
 ) -> Result<ReleaseStats, sqlx::Error> {
@@ -92,7 +97,7 @@ pub async fn release_once(
 
     let mut stats = ReleaseStats::default();
     for recipient_id in &people {
-        if let Some(rows) = release_person(pool, recipient_id, now).await? {
+        if let Some(rows) = release_person(pool, dir, recipient_id, now).await? {
             stats.digests += 1;
             stats.rows_released += rows;
         }
@@ -103,6 +108,7 @@ pub async fn release_once(
 /// Release one person's due rows. `None` when another pass holds them or none are due.
 async fn release_person(
     pool: &PgPool,
+    dir: &Directory,
     recipient_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<u64>, sqlx::Error> {
@@ -158,9 +164,27 @@ async fn release_person(
             }),
         );
     }
+    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+
+    // The CURRENT address, not the one frozen at hold time: the digest waits hours, and the
+    // person may have changed or removed their email, or left the directory, meanwhile.
+    let Some(address) = dir
+        .person(recipient_id)
+        .and_then(|p| address_for(p, "email"))
+        .map(str::to_string)
+    else {
+        warn!(recipient = %recipient_id, rows = ids.len(),
+              "off-hours digest dropped: person or email address no longer in the directory");
+        sqlx::query("UPDATE offhours_held SET released_at = now() WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(None);
+    };
     let job = PlannedJob {
         channel: "email".into(),
-        address: latest.3.clone(),
+        address,
         route_info,
     };
     crate::router::insert_jobs(
@@ -172,13 +196,25 @@ async fn release_person(
         Some(OFFHOURS_DIGEST_STEP),
     )
     .await?;
+    let job_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM delivery_jobs \
+         WHERE alert_id = $1 AND recipient_id = $2 AND channel = 'email' \
+           AND notify_seq = $3 AND escalation_step = $4",
+    )
+    .bind(latest.1)
+    .bind(recipient_id)
+    .bind(latest.2)
+    .bind(OFFHOURS_DIGEST_STEP)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
     sqlx::query(
-        "UPDATE offhours_held SET released_at = now(), digest_alert = $2 WHERE id = ANY($1)",
+        "UPDATE offhours_held SET released_at = now(), digest_alert = $2, digest_job = $3 \
+         WHERE id = ANY($1)",
     )
     .bind(&ids)
     .bind(latest.1)
+    .bind(job_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;

@@ -154,13 +154,13 @@ async fn night_warnings_are_held_and_sent_as_one_morning_email(pool: PgPool) {
     update_alert_status(&pool, a2, "resolved").await;
 
     // 07:59: not yet.
-    let r = offhours::release_once(&pool, utc("2026-01-15T07:59:59Z"), 100)
+    let r = offhours::release_once(&pool, &dir, utc("2026-01-15T07:59:59Z"), 100)
         .await
         .expect("release");
     assert_eq!(r, offhours::ReleaseStats::default());
 
     // 08:00: one digest job for anna covering all three alerts.
-    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:00Z"), 100)
+    let r = offhours::release_once(&pool, &dir, utc("2026-01-15T08:00:00Z"), 100)
         .await
         .expect("release");
     assert_eq!(r.digests, 1);
@@ -181,7 +181,7 @@ async fn night_warnings_are_held_and_sent_as_one_morning_email(pool: PgPool) {
     );
 
     // A second pass finds nothing (no double send).
-    let r = offhours::release_once(&pool, utc("2026-01-15T09:00:00Z"), 100)
+    let r = offhours::release_once(&pool, &dir, utc("2026-01-15T09:00:00Z"), 100)
         .await
         .expect("release");
     assert_eq!(r.digests, 0);
@@ -327,7 +327,7 @@ async fn a_failed_release_keeps_rows_held_and_a_rerun_sends_once(pool: PgPool) {
         .execute(&mut *blocker)
         .await
         .expect("lock");
-    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:00Z"), 100)
+    let r = offhours::release_once(&pool, &dir, utc("2026-01-15T08:00:00Z"), 100)
         .await
         .expect("release");
     assert_eq!(r.digests, 0, "locked rows are skipped, not double-sent");
@@ -336,7 +336,7 @@ async fn a_failed_release_keeps_rows_held_and_a_rerun_sends_once(pool: PgPool) {
 
     // After the "restart", two passes in a row file exactly one job.
     for _ in 0..2 {
-        offhours::release_once(&pool, utc("2026-01-15T08:00:05Z"), 100)
+        offhours::release_once(&pool, &dir, utc("2026-01-15T08:00:05Z"), 100)
             .await
             .expect("release");
     }
@@ -408,15 +408,65 @@ async fn a_release_in_progress_elsewhere_is_skipped(pool: PgPool) {
         .execute(&mut *other)
         .await
         .expect("lock");
-    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:00Z"), 100)
+    let r = offhours::release_once(&pool, &dir, utc("2026-01-15T08:00:00Z"), 100)
         .await
         .expect("release");
     assert_eq!(r.digests, 0);
     other.rollback().await.expect("rollback");
 
-    let r = offhours::release_once(&pool, utc("2026-01-15T08:00:01Z"), 100)
+    let r = offhours::release_once(&pool, &dir, utc("2026-01-15T08:00:01Z"), 100)
         .await
         .expect("release");
     assert_eq!(r.digests, 1);
     assert_eq!(jobs_for(&pool, "anna").await.len(), 1);
+}
+
+/// Review S2: the digest goes to the address the person has AT RELEASE; with no address (or no
+/// person) left, the held rows are closed and nothing is sent to the old mailbox.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_digest_uses_the_current_address_and_drops_when_it_is_gone(pool: PgPool) {
+    let dir = directory();
+    let cfg = router_cfg(Arc::new(FixedClock::new(utc("2026-01-15T03:00:00Z"))));
+    let a = insert_alert(&pool, "open", "HighLatency on payments-api").await;
+    notify(&pool, a, "warning").await;
+    route_once(&pool, &dir, &cfg).await.expect("route");
+
+    // Overnight anna changes her email: the morning digest follows it.
+    let mut moved = directory();
+    moved.people.get_mut("anna").expect("anna").contact.email =
+        Some("anna@new.example.test".into());
+    let r = offhours::release_once(&pool, &moved, utc("2026-01-15T08:00:00Z"), 100)
+        .await
+        .expect("release");
+    assert_eq!(r.digests, 1);
+    let address: String = sqlx::query_scalar(
+        "SELECT address FROM delivery_jobs WHERE recipient_id = 'anna' AND escalation_step = $1",
+    )
+    .bind(offhours::OFFHOURS_DIGEST_STEP)
+    .fetch_one(&pool)
+    .await
+    .expect("digest job");
+    assert_eq!(address, "anna@new.example.test");
+
+    // Next night she has left the directory: the held row is closed, no job is filed.
+    let cfg = router_cfg(Arc::new(FixedClock::new(utc("2026-01-16T03:00:00Z"))));
+    let b = insert_alert(&pool, "open", "QueueLag on payments-api").await;
+    notify(&pool, b, "warning").await;
+    route_once(&pool, &dir, &cfg).await.expect("route");
+    let mut gone = directory();
+    gone.people.remove("anna");
+    let r = offhours::release_once(&pool, &gone, utc("2026-01-16T08:00:00Z"), 100)
+        .await
+        .expect("release");
+    assert_eq!(r.digests, 0);
+    assert_eq!(
+        held_pending(&pool).await,
+        0,
+        "the row is closed, not retried forever"
+    );
+    assert_eq!(
+        jobs_for(&pool, "anna").await.len(),
+        1,
+        "only the first morning's digest"
+    );
 }

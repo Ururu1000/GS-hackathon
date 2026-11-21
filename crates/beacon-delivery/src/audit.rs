@@ -140,7 +140,7 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
 
     // Derived: off-hours holds (`crate::offhours`): held outside someone's working hours,
     // then sent in their digest email when the hours started.
-    // `sent_at` of the digest job that carried the row (it is filed under `digest_alert`),
+    // `sent_at` of the digest job that carried the row (`digest_job`),
     // so the timeline says "sent" only once the email actually went out (#767 E).
     type HeldRow = (
         String,
@@ -151,14 +151,10 @@ pub async fn timeline_entries(pool: &PgPool, alert_id: Uuid) -> Result<Vec<Value
     );
     let held: Vec<HeldRow> = sqlx::query_as(
         "SELECT h.recipient_id, h.created_at, h.release_at, h.released_at, \
-                (SELECT j.sent_at FROM delivery_jobs j \
-                  WHERE j.alert_id = h.digest_alert AND j.recipient_id = h.recipient_id \
-                    AND j.escalation_step = $2 AND j.sent_at IS NOT NULL \
-                  ORDER BY j.sent_at LIMIT 1) \
+                (SELECT j.sent_at FROM delivery_jobs j WHERE j.id = h.digest_job) \
          FROM offhours_held h WHERE h.alert_id = $1 ORDER BY h.id",
     )
     .bind(alert_id)
-    .bind(crate::offhours::OFFHOURS_DIGEST_STEP)
     .fetch_all(pool)
     .await?;
     for (recipient, at, release_at, released_at, sent_at) in held {

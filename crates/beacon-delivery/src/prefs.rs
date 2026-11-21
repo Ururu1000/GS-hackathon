@@ -22,8 +22,8 @@
 //! A rule with `when` and no `otherwise` does not match outside its window (evaluation goes on to
 //! the next rule).
 //!
-//! **Off-hours digest.** `otherwise` may name the pseudo-channel `digest` (alone or next to real
-//! channels): outside the window, the notification is held and sent as part of ONE email at the
+//! **Off-hours digest.** `otherwise` may name the pseudo-channel `digest` (alone or with `ui`):
+//! outside the window, the notification is held and sent as part of ONE email at the
 //! window's next start ("overnight: 3 alerts, 1 resolved"), see `crate::offhours`. `digest` is
 //! only valid in `otherwise`, because the window's start is the release time. Critical alerts are
 //! never held (the router sends `digest` as email for them), and escalation steps and runbook
@@ -302,7 +302,18 @@ pub fn parse_preferences(
                 if when.is_none() {
                     return Err(at(i, "`otherwise` requires `when`"));
                 }
-                Some(channels(i, v, "`otherwise`", true)?)
+                let list = channels(i, v, "`otherwise`", true)?;
+                // A digest means "one morning email instead of a page": combined with a real
+                // channel it would be both sent now and held (and the router sends it now).
+                if list.iter().any(|c| c == DIGEST) && list.iter().any(|c| c != DIGEST && c != "ui")
+                {
+                    return Err(at(
+                        i,
+                        "`digest` can't be combined with other channels in `otherwise` \
+                         (only with `ui`)",
+                    ));
+                }
+                Some(list)
             }
         };
 
@@ -745,6 +756,8 @@ mod tests {
         for raw in [
             json!([{ "match": {}, "channels": ["digest"] }]),
             json!([{ "default": ["digest"] }]),
+            json!([{ "match": {}, "channels": ["email"],
+                     "when": {"between": "08:00-20:00", "tz": "UTC"}, "otherwise": ["sms", "digest"] }]),
             json!([{ "match": {}, "channels": ["digest"],
                      "when": {"between": "08:00-20:00", "tz": "UTC"}, "otherwise": ["email"] }]),
         ] {
@@ -753,7 +766,8 @@ mod tests {
                 other => panic!("{raw} should be rejected, got {other:?}"),
             };
             assert!(
-                msg.contains("`digest` is only allowed in `otherwise`"),
+                msg.contains("`digest` is only allowed in `otherwise`")
+                    || msg.contains("`digest` can't be combined with other channels"),
                 "{msg}"
             );
         }

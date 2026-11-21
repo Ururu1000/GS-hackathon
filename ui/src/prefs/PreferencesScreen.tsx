@@ -8,7 +8,7 @@ import { SEVERITY_LABEL } from '../alert/badges'
 import { ChevronDownIcon, ChevronUpIcon, CloseIcon } from '../lib/icons'
 import { maskAddress } from '../lib/redact'
 import { ChannelPicker, CHANNEL_NAME } from '../rules/sections'
-import { parseWindow, resolveChannels } from './resolve'
+import { digestExclusive, parseWindow, resolveChannels } from './resolve'
 
 interface Props {
   kind: 'person' | 'team' | null
@@ -179,7 +179,7 @@ function PrefLine({ line, index, count, hit, teams, onChange, onMove, onRemove }
             {badWindow && <p className="problems-inline">Use times like 08:00 and 20:00.</p>}
             <div className="inline wrap">
               <span className="small">otherwise send by</span>
-              <ChannelPicker label="Outside those hours" options={OUTSIDE_HOURS} value={line.otherwise ?? []} onChange={(otherwise) => onChange({ ...line, otherwise })} />
+              <ChannelPicker label="Outside those hours" options={OUTSIDE_HOURS} value={line.otherwise ?? []} onChange={(otherwise) => onChange({ ...line, otherwise: digestExclusive(line.otherwise ?? [], otherwise) })} />
               {!line.otherwise?.length && <span className="muted small">(skip this line outside those hours)</span>}
               {line.otherwise?.includes('digest') && <span className="muted small">(held and sent as one email when your hours start; critical alerts are never held)</span>}
             </div>

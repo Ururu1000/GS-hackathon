@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Preference } from '../api/types'
-import { inWindow, resolveChannels } from './resolve'
+import { digestExclusive, inWindow, resolveChannels } from './resolve'
 
 // Anna from Appendix A / config/people/anna.yaml.
 const anna: Preference[] = [
@@ -33,6 +33,12 @@ describe('resolveChannels', () => {
     expect(resolveChannels(prefs, crit, night).channels).toEqual(['email'])
     const both: Preference[] = [{ ...prefs[0], otherwise: ['email', 'digest'] } as Preference]
     expect(resolveChannels(both, crit, night).channels).toEqual(['email'])
+  })
+
+  it('keeps the digest exclusive (only In-app beside it) in the picker', () => {
+    expect(digestExclusive(['sms', 'ui'], ['sms', 'ui', 'digest'])).toEqual(['ui', 'digest'])
+    expect(digestExclusive(['digest'], ['email', 'digest'])).toEqual(['email'])
+    expect(digestExclusive(['digest'], ['ui', 'digest'])).toEqual(['ui', 'digest'])
   })
 
   it('falls through lines, then the default, then the team, then in-app', () => {

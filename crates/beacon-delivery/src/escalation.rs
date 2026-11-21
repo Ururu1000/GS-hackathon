@@ -759,7 +759,7 @@ pub async fn run_scheduler(
         let dir = effective.get(&pool).await;
         // Off-hours digests whose window reopened ride along (crate::offhours): one cheap
         // indexed query when nothing is due, and no extra role in the default command.
-        match crate::offhours::release_once(&pool, Utc::now(), 100).await {
+        match crate::offhours::release_once(&pool, &dir, Utc::now(), 100).await {
             Ok(r) if r.digests > 0 => debug!(?r, "off-hours digests"),
             Ok(_) => {}
             Err(err) => error!(%err, "off-hours digest pass failed"),

@@ -85,3 +85,12 @@ export function resolveChannels(prefs: Preference[], a: AlertFacts, at: Date, te
   if (teamDefault.length) return { channels: teamDefault, line: null, via: 'team', in_window: null, problem: null }
   return { channels: ['ui'], line: null, via: 'ui', in_window: null, problem: null }
 }
+
+/** The digest replaces paging: it combines only with In-app (the backend rejects the rest).
+ *  Turning digest on keeps only `ui` beside it; turning a real channel on drops the digest. */
+export function digestExclusive(prev: string[], next: string[]): string[] {
+  const added = next.filter((c) => !prev.includes(c))
+  if (added.includes('digest')) return next.filter((c) => c === 'digest' || c === 'ui')
+  if (added.some((c) => c !== 'ui')) return next.filter((c) => c !== 'digest')
+  return next
+}
