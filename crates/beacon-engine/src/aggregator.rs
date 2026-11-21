@@ -436,11 +436,98 @@ fn sanitized_json<T: Serialize>(value: &T) -> Result<Value> {
 
 /// Apply one batch in a single transaction. Returns the plan that was written.
 pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
+    match apply_batch_fenced(pool, batch, &[]).await? {
+        Ok(plan) => Ok(plan),
+        Err(Fenced) => unreachable!("no fences given"),
+    }
+}
+
+/// The partition checkpoint advanced together with a batch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fence {
+    pub partition: i32,
+    pub epoch: i64,
+    /// First offset not yet applied once this batch commits.
+    pub next_offset: i64,
+}
+
+/// Another owner claimed one of the batch's partitions; nothing was written.
+#[derive(Debug, PartialEq)]
+pub struct Fenced;
+
+pub const CHECKPOINT_PIPELINE: &str = "aggregator";
+
+/// Take ownership of a partition: bump its epoch and return (epoch, next_offset).
+/// `next_offset` is -1 when nothing has been applied yet.
+pub async fn claim_partition(pool: &PgPool, partition: i32) -> Result<(i64, i64)> {
+    let row = sqlx::query(
+        "INSERT INTO checkpoints (pipeline, topic, partition, epoch, next_offset) VALUES ($1, $2, $3, 1, -1)
+         ON CONFLICT (pipeline, topic, partition) DO UPDATE SET epoch = checkpoints.epoch + 1, updated_at = now()
+         RETURNING epoch, next_offset",
+    )
+    .bind(CHECKPOINT_PIPELINE)
+    .bind(ALERTS_MATCHES)
+    .bind(partition)
+    .fetch_one(pool)
+    .await?;
+    Ok((row.try_get("epoch")?, row.try_get("next_offset")?))
+}
+
+/// Apply one batch and advance its partition checkpoints in the same
+/// transaction. If any checkpoint's epoch moved (a newer owner), nothing is
+/// written and `Fenced` is returned.
+pub async fn apply_batch_fenced(pool: &PgPool, batch: &[MatchRecord], fences: &[Fence]) -> Result<Result<Plan, Fenced>> {
     // Lookup by (rule_id, fingerprint) so the partial unique index is used.
     let mut keys: Vec<(String, String)> = batch.iter().map(|m| (m.rule_id.clone(), m.fingerprint.clone())).collect();
     keys.sort();
     keys.dedup();
     let mut tx = pool.begin().await?;
+    if !fences.is_empty() {
+        let parts: Vec<i32> = fences.iter().map(|f| f.partition).collect();
+        let epochs: Vec<i64> = fences.iter().map(|f| f.epoch).collect();
+        let nexts: Vec<i64> = fences.iter().map(|f| f.next_offset).collect();
+        let advanced = sqlx::query(
+            "UPDATE checkpoints c SET next_offset = f.next, updated_at = now()
+             FROM unnest($3::int[], $4::bigint[], $5::bigint[]) AS f(part, epoch, next)
+             WHERE c.pipeline = $1 AND c.topic = $2 AND c.partition = f.part AND c.epoch = f.epoch
+               AND c.next_offset < f.next",
+        )
+        .bind(CHECKPOINT_PIPELINE)
+        .bind(ALERTS_MATCHES)
+        .bind(&parts)
+        .bind(&epochs)
+        .bind(&nexts)
+        .execute(&mut *tx)
+        .await
+        .context("advancing checkpoints")?
+        .rows_affected();
+        if advanced != fences.len() as u64 {
+            tx.rollback().await?;
+            // Either a newer owner took a partition, or this exact batch was
+            // already committed and only the acknowledgement was lost (the
+            // retry after an ambiguous commit). Only the latter is fine.
+            let rows = sqlx::query(
+                "SELECT partition, epoch, next_offset FROM checkpoints
+                 WHERE pipeline = $1 AND topic = $2 AND partition = ANY($3)",
+            )
+            .bind(CHECKPOINT_PIPELINE)
+            .bind(ALERTS_MATCHES)
+            .bind(&parts)
+            .fetch_all(pool)
+            .await?;
+            let already = fences.iter().all(|f| {
+                rows.iter().any(|r| {
+                    r.get::<i32, _>("partition") == f.partition
+                        && r.get::<i64, _>("epoch") == f.epoch
+                        && r.get::<i64, _>("next_offset") >= f.next_offset
+                })
+            });
+            if already {
+                return Ok(Ok(Plan::default()));
+            }
+            return Ok(Err(Fenced));
+        }
+    }
     let existing = load_active(&mut tx, &keys).await?;
     let recovered = load_recoveries(&mut tx, &keys).await?;
     let plan = plan(batch, existing, recovered, Utc::now());
@@ -516,13 +603,16 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
             .await?;
     }
     tx.commit().await?;
-    Ok(plan)
+    Ok(Ok(plan))
 }
 
 pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let consumer = kafka::consumer(&bootstrap, GROUP, &[ALERTS_MATCHES], true)?;
     let linger = linger();
     info!(linger_ms = linger.as_millis() as u64, "aggregator started");
+    // partition -> (epoch, next_offset) for partitions this consumer claimed.
+    let mut owned: HashMap<i32, (i64, i64)> = HashMap::new();
+    let (mut skipped, mut last_skip_log) = (0u64, std::time::Instant::now());
     loop {
         // Block for the first message, then linger briefly to build a batch.
         let first = tokio::select! {
@@ -549,18 +639,36 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                 Err(_) => break,
             }
         }
+        // Fencing: claim each partition the first time we see it, and skip
+        // messages below its checkpoint (already applied before a crash or
+        // rebalance). Kafka offsets are only a resume hint.
+        let mut fences: HashMap<i32, Fence> = HashMap::new();
         let mut batch = Vec::with_capacity(msgs.len());
         for m in &msgs {
+            let p = m.partition();
+            if let std::collections::hash_map::Entry::Vacant(slot) = owned.entry(p) {
+                let claim = claim_partition(&pool, p).await?;
+                info!(partition = p, epoch = claim.0, next_offset = claim.1, "claimed partition");
+                slot.insert(claim);
+            }
+            let (epoch, next) = owned[&p];
+            let f = fences.entry(p).or_insert(Fence { partition: p, epoch, next_offset: next });
+            f.next_offset = f.next_offset.max(m.offset() + 1);
+            if m.offset() < next {
+                skipped += 1;
+                continue;
+            }
             match m.payload().map(serde_json::from_slice::<MatchRecord>) {
                 Some(Ok(rec)) => batch.push(rec),
-                Some(Err(e)) => error!(partition = m.partition(), offset = m.offset(), error = %e, "undecodable match; skipped"),
+                Some(Err(e)) => error!(partition = p, offset = m.offset(), error = %e, "undecodable match; skipped"),
                 None => {}
             }
         }
+        let fences: Vec<Fence> = fences.into_values().collect();
         let mut backoff = Duration::from_millis(50);
         loop {
-            match apply_batch(&pool, &batch).await {
-                Ok(plan) => {
+            match apply_batch_fenced(&pool, &batch, &fences).await {
+                Ok(Ok(plan)) => {
                     tracing::debug!(
                         matches = batch.len(),
                         inserts = plan.inserts.len(),
@@ -568,6 +676,11 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                         "batch applied"
                     );
                     break;
+                }
+                Ok(Err(Fenced)) => {
+                    // A newer owner took a partition. Restart from committed
+                    // offsets and re-claim; the checkpoint skips what's applied.
+                    anyhow::bail!("fenced by a newer owner of one of the partitions; restarting");
                 }
                 Err(e) => {
                     error!(error = format!("{e:#}"), "applying batch failed; retrying");
@@ -578,6 +691,16 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                     }
                 }
             }
+        }
+        for f in &fences {
+            if let Some(o) = owned.get_mut(&f.partition) {
+                o.1 = o.1.max(f.next_offset);
+            }
+        }
+        if skipped > 0 && last_skip_log.elapsed() > Duration::from_secs(5) {
+            info!(skipped, "skipped already-applied matches after replay");
+            skipped = 0;
+            last_skip_log = std::time::Instant::now();
         }
         for m in &msgs {
             if let Err(e) = consumer.store_offset_from_message(m) {

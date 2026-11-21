@@ -14,7 +14,7 @@
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
 //! | `INGEST_ADDR`        | `0.0.0.0:8090`                            | ingest            |
 //! | `INGEST_MAX_INFLIGHT`| `20000` (events in flight before 429)     | ingest            |
-//! | `MATCHER_WORKERS`    | `2` (consumers in the matcher group)      | matcher           |
+//! | `MATCHER_WORKERS`    | `8` (consumers in the matcher group)      | matcher           |
 //! | `AGGREGATOR_WORKERS` | `2` (consumers in the aggregator group)   | aggregator        |
 //! | `RELAY_WORKERS`      | `1`                                       | relay             |
 //! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
                     .await
                     .with_context(|| format!("loading rules and schemas ({})", config_dir.display()))?;
                 let samples = beacon_engine::matcher::SampleSink::start(pool.clone());
-                for _ in 0..workers("MATCHER_WORKERS", "2")? {
+                for _ in 0..workers("MATCHER_WORKERS", "8")? {
                     let (kafka, snapshot, samples, rx) = (kafka.clone(), snapshot.clone(), samples.clone(), shutdown_rx.clone());
                     tasks.spawn(supervise("matcher", rx.clone(), move || {
                         beacon_engine::matcher::run_matcher(kafka.clone(), snapshot.clone(), Some(samples.clone()), rx.clone())

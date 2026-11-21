@@ -106,6 +106,9 @@ struct Counters {
     accepted: AtomicU64,
     rejected_429: AtomicU64,
     failed: AtomicU64,
+    /// Events that match a rule and were accepted (202): the exact total the
+    /// alert counts must add up to.
+    matching_accepted: AtomicU64,
 }
 
 #[tokio::main]
@@ -207,9 +210,11 @@ async fn main() -> Result<()> {
     for b in 0..total_batches {
         let intended = start + period.mul_f64(b as f64);
         tokio::time::sleep_until(intended.into()).await;
+        let mut matching_in_batch = 0u64;
         let events: Vec<Value> = (0..args.batch)
             .map(|_| {
                 let matching = rng.random_bool(args.match_ratio.clamp(0.0, 1.0));
+                matching_in_batch += matching as u64;
                 make_event(&mut rng, &run_id, args.distinct_keys, matching)
             })
             .collect();
@@ -238,7 +243,10 @@ async fn main() -> Result<()> {
                 .send()
                 .await;
             match res.map(|r| r.status().as_u16()) {
-                Ok(202) => counters.accepted.fetch_add(n, Ordering::Relaxed),
+                Ok(202) => {
+                    counters.matching_accepted.fetch_add(matching_in_batch, Ordering::Relaxed);
+                    counters.accepted.fetch_add(n, Ordering::Relaxed)
+                }
                 Ok(429) => counters.rejected_429.fetch_add(n, Ordering::Relaxed),
                 _ => counters.failed.fetch_add(n, Ordering::Relaxed),
             };
@@ -273,6 +281,7 @@ async fn main() -> Result<()> {
         accepted,
         rejected_429: counters.rejected_429.load(Ordering::Relaxed),
         failed: counters.failed.load(Ordering::Relaxed),
+        matching_accepted: counters.matching_accepted.load(Ordering::Relaxed),
         late_batches: late.load(Ordering::Relaxed),
         send_secs: send_elapsed.as_secs_f64(),
         drain_secs: drain_elapsed.as_secs_f64(),
@@ -302,6 +311,7 @@ struct Report {
     accepted: u64,
     rejected_429: u64,
     failed: u64,
+    matching_accepted: u64,
     late_batches: u64,
     send_secs: f64,
     drain_secs: f64,
@@ -348,9 +358,10 @@ impl Report {
         s.push_str(&format!("| Host | {host} |\n| Ingest URL | {} |\n\n", a.url));
         s.push_str("## Throughput\n\n| Metric | Value |\n|---|---|\n");
         s.push_str(&format!(
-            "| Sent | {} |\n| Accepted (202) | {} |\n| Rejected (429) | {} |\n| Failed | {} |\n| Accepted rate | {:.0} events/s |\n| Shed by client (over concurrency budget) | {} events |\n| Alert updates observed | {} |\n| Distinct alerts observed | {} |\n| Drain after send stopped | {:.1} s |\n\n",
+            "| Sent | {} |\n| Accepted (202) | {} |\n| Matching events accepted (expected sum of alert counts) | {} |\n| Rejected (429) | {} |\n| Failed | {} |\n| Accepted rate | {:.0} events/s |\n| Shed by client (over concurrency budget) | {} events |\n| Alert updates observed | {} |\n| Distinct alerts observed | {} |\n| Drain after send stopped | {:.1} s |\n\n",
             self.sent,
             self.accepted,
+            self.matching_accepted,
             self.rejected_429,
             self.failed,
             self.accepted as f64 / self.send_secs.max(0.001),
