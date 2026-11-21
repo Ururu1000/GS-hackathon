@@ -394,7 +394,7 @@ fn seed_runbooks_load() {
     let items = runbook::list_items(lib);
     assert_eq!(items.len(), 4);
     for item in &items {
-        for key in ["id", "title", "format", "team", "steps"] {
+        for key in ["id", "revision", "title", "format", "team", "steps"] {
             assert!(item.get(key).is_some(), "item missing {key}");
         }
     }

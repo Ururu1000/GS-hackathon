@@ -1237,6 +1237,7 @@ pub fn list_items(lib: &RunbookLibrary) -> Vec<Value> {
         .map(|r| {
             json!({
                 "id": r.id,
+                "revision": r.revision,
                 "title": r.title,
                 "format": r.format.as_str(),
                 "team": r.team,
@@ -1244,6 +1245,50 @@ pub fn list_items(lib: &RunbookLibrary) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// `GET /api/runbooks/{id}`: the CURRENT library version of one runbook, its steps as
+/// templates (unrendered, no event values), for comparing with an alert's frozen copy
+/// (`alert_runbooks`, see [`runbook_view`]). `action` is `{name, label}` (params are
+/// templates and stay server-side) and `approval` the effective value, computed exactly as
+/// the frozen copy does it (`required` also when the action's risk is high), so the two
+/// compare field by field. `None` for an unknown id.
+pub fn detail_item(lib: &RunbookLibrary, id: &str) -> Option<Value> {
+    let r = lib.get(id)?;
+    let steps: Vec<Value> = r
+        .steps
+        .iter()
+        .map(|s| {
+            let action = s
+                .action
+                .as_deref()
+                .map(|name| json!({ "name": name, "label": action_label(name) }));
+            let approval = if s.approval_required
+                || s.action
+                    .as_deref()
+                    .is_some_and(|a| crate::actions::ActionRegistry::risk_of(a) == "high")
+            {
+                "required"
+            } else {
+                "none"
+            };
+            json!({
+                "id": s.id,
+                "kind": s.kind.as_str(),
+                "text": s.text,
+                "action": action,
+                "approval": approval,
+            })
+        })
+        .collect();
+    Some(json!({
+        "id": r.id,
+        "revision": r.revision,
+        "title": r.title,
+        "format": r.format.as_str(),
+        "team": r.team,
+        "steps": steps,
+    }))
 }
 
 #[cfg(test)]
