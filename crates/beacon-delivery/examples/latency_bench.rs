@@ -56,7 +56,9 @@ use uuid::Uuid;
 
 const DEFAULT_EVENTS: u64 = 500;
 const DEFAULT_RATE: f64 = 50.0;
-const DEFAULT_WARMUP: u64 = 20;
+const DEFAULT_WARMUP: u64 = 50;
+/// Longest wait for the warmup events to drain before the measured stream starts.
+const SETTLE_LIMIT: Duration = Duration::from_secs(60);
 const DEFAULT_TIMEOUT: u64 = 120;
 /// One run posts at most this many events: keeps the send loop and the t0 table
 /// honest on a small machine.
@@ -190,6 +192,12 @@ async fn run(args: Args) -> Result<(), String> {
     let started_at = Utc::now();
     let mut next = first_send_at;
     for i in 0..total {
+        if i == warmup && warmup > 0 {
+            // Let the warmup drain (Kafka consumer groups joined, caches and connections
+            // warm) so the measured events see a steady pipeline, not the cold start.
+            settle(&pool, &title_pattern, run_start, warmup).await?;
+            next = tokio::time::Instant::now() + Duration::from_secs(1);
+        }
         // Fixed schedule: sleep to the slot, then fire the POST without ever waiting
         // for its response before the next send (open loop).
         tokio::time::sleep_until(next).await;
@@ -487,7 +495,8 @@ fn usage() {
     println!("  --events N    measured events, at most 1,000,000 per run (default 500)");
     println!("  --rate R      events/s, open loop (default 50)");
     println!("  --mix MIX     sms | email | both (default both)");
-    println!("  --warmup W    extra warmup events first, excluded from stats (default 20)");
+    println!("  --warmup W    extra warmup events first, excluded from stats (default 50); the");
+    println!("                measured stream starts once their deliveries have drained");
     println!("  --timeout S   seconds to wait after the posts for every receipt (default 120)");
     println!("  --out PATH    also write the report as JSON to PATH (overwritten)");
     println!();
@@ -853,6 +862,46 @@ fn evaluate(
 
 /// One poll: the run's alerts (by title), their delivery jobs, and the gateway
 /// receipts of those jobs.
+/// Wait until the run's `warmup` alerts exist and none of their delivery jobs is still
+/// pending or in flight (at most [`SETTLE_LIMIT`]; then it warns and goes on).
+async fn settle(
+    pool: &sqlx::PgPool,
+    title_pattern: &str,
+    run_start: DateTime<Utc>,
+    warmup: u64,
+) -> Result<(), String> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let (alerts, jobs, open): (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(DISTINCT a.id), count(j.id), \
+                    count(j.id) FILTER (WHERE j.status IN ('pending', 'in_flight')) \
+             FROM alerts a LEFT JOIN delivery_jobs j ON j.alert_id = a.id \
+             WHERE a.title LIKE $1 AND a.first_seen >= $2",
+        )
+        .bind(title_pattern)
+        .bind(run_start)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("settle query failed: {e}"))?;
+        if alerts as u64 >= warmup && jobs > 0 && open == 0 {
+            println!(
+                "[warmup] {alerts} alerts, {jobs} jobs drained in {:.1}s; measuring",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+        if started.elapsed() >= SETTLE_LIMIT {
+            println!(
+                "warning: warmup not drained after {}s ({alerts}/{warmup} alerts, {open} of {jobs} \
+                 jobs open); measuring anyway",
+                SETTLE_LIMIT.as_secs()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn snapshot(
     pool: &sqlx::PgPool,
     tag: &str,
@@ -1375,7 +1424,7 @@ mod tests {
                 default.warmup,
                 default.timeout
             ),
-            (500, 50.0, 20, 120)
+            (500, 50.0, 50, 120)
         );
         assert_eq!(default.mix, Mix::Both);
         assert!(default.out.is_none());
