@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same PR or branch cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Test infra, matching deploy/docker-compose.yml.
+  DATABASE_URL: postgres://beacon:beacon@localhost:5432/beacon
+  SMTP_HOST: localhost
+  SMTP_PORT: "1025"
+  MAILPIT_URL: http://localhost:8025
+
+jobs:
+  rust:
+    name: rust (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      # One job per heavy crate, so their DB suites run in parallel.
+      matrix:
+        include:
+          - name: delivery
+            args: -p beacon-delivery
+          - name: api
+            args: -p beacon-api
+          - name: engine and the rest
+            args: --workspace --exclude beacon-delivery --exclude beacon-api
+    services:
+      postgres:
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_DB: beacon
+          POSTGRES_USER: beacon
+          POSTGRES_PASSWORD: beacon
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U beacon -d beacon"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      mailpit:
+        image: axllent/mailpit:v1.27
+        env:
+          MP_MAX_MESSAGES: "20000"
+        ports: ["1025:1025", "8025:8025"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Caches ~/.cargo and target/ (incl. the librdkafka C build) per job.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.name }}
+      - name: Build tests
+        run: cargo test --locked ${{ matrix.args }} --no-run
+      - name: Test
+        run: cargo test --locked ${{ matrix.args }}
+
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
