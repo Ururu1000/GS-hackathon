@@ -334,3 +334,20 @@ it('applies detector precedence before resolving matching detectors with the sam
   expect(await request('/api/rules/test', 200, 'POST', { rule: RULES[0], event, source: 'http:alertmanager' }))
     .toMatchObject({ schema: 'prometheus.alert', fields: { stage: 'firing' } })
 })
+
+it('suggests a mapping for a pasted event without storing it', async () => {
+  const before = await request('/api/schemas')
+  const event = { alertname: 'DiskFull', level: 'WARN', labels: { service: 'ledger', env: 'prod' }, ts: 1763700000, summary: 'Disk 95% full' }
+  const out = await request('/api/schemas/suggest', 200, 'POST', { event, source: 'http:playground' })
+  expect(out).toMatchObject({ provider: 'mock', model: null, preview: { matched: true } })
+  expect(out.spec.fields).toMatchObject({
+    type: { path: 'alertname' }, severity: { path: 'level', enum: 'severity' }, service: { path: 'labels.service' },
+    environment: { path: 'labels.env' }, occurred_at: { path: 'ts', as: 'epoch_s' }, message: { path: 'summary' },
+  })
+  expect(out.preview.fields).toMatchObject({ severity: 'warning', service: 'ledger' })
+  expect(await request('/api/schemas')).toEqual(before)
+  await request('/api/schemas/suggest', 404, 'POST', { schema: 'unknown:nope' })
+  await request('/api/schemas/suggest', 400, 'POST', {})
+  await request('/api/schemas/suggest', 422, 'POST', { event: {} })
+  expect((await request('/api/session')).capabilities.llm_suggest).toBe(true)
+})
