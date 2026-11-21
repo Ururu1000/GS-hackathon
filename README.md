@@ -7,6 +7,8 @@ A service that ingests events of any shape from many sources, matches them again
 - Problem statement: [docs/PROBLEM_STATEMENT.md](docs/PROBLEM_STATEMENT.md)
 - Delivery (routing, channels, escalation, throttles, runbooks, approvals, outage results): [docs/DELIVERY.md](docs/DELIVERY.md)
 - Ingest, engine and API (part a), with every review and limit: [progress.md](progress.md); engine load tests: [loadtest/README.md](loadtest/README.md)
+- Adding a real SMS/phone/email provider (what is mocked and how small the swap is): [docs/PROVIDERS.md](docs/PROVIDERS.md)
+- How we used AI tools, and security/privacy: [docs/AI_USAGE.md](docs/AI_USAGE.md)
 
 ## Quick start
 
