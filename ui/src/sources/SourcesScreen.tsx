@@ -104,38 +104,50 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
   return (
     <div className="screen feature-screen">
       <header className="screen-head">
-        <div className="screen-title"><h1>Sources &amp; schemas</h1></div>
+        <div className="screen-title">
+          <h1>Sources &amp; schemas</h1>
+          <span className="muted small">Where events come from, shapes Beacon hasn’t seen before, and how they map onto alert fields.</span>
+        </div>
         <span className="spacer" />
         <button className="btn" onClick={() => void load()} disabled={busy}>Refresh</button>
       </header>
 
-      {loadError && <p className="notice notice-warn" role="alert">Couldn’t load sources and schemas. {loadError}</p>}
-      {!data && !loadError && <p className="muted" role="status">Loading sources…</p>}
+      <div className="feature-body">
+      {loadError && <div className="notice notice-error" role="alert">Couldn’t load sources and schemas: {loadError}</div>}
+      {!data && !loadError && <div className="empty" role="status"><p>Loading…</p></div>}
       {data && (
         <>
-          <section className="editor-section">
-            <h2>Sources</h2>
-            <div className="feature-table-wrap">
-              <table className="feature-table">
-                <thead><tr><th>Source</th><th>Transport</th><th>Last received</th><th className="num">Events in 24h</th></tr></thead>
-                <tbody>{data.sources.map((source) => (
-                  <tr key={source.id}>
-                    <td><code>{source.id}</code>{source.topics?.length ? <div className="muted small">{source.topics.join(', ')}</div> : null}</td>
-                    <td>{source.kind === 'http' ? 'Webhook' : source.kind === 'kafka' ? 'Kafka' : 'Log file'}</td>
-                    <td>{source.last_seen ? absTime(source.last_seen) : 'No events yet'}</td>
-                    <td className="num">{source.events_24h.toLocaleString()}</td>
-                  </tr>
-                ))}</tbody>
-              </table>
-              {!data.sources.length && <p className="muted">No sources have sent events yet.</p>}
+          <section className="feature-card">
+            <div className="card-head">
+              <h2>Sources <span className="count">{data.sources.length}</span></h2>
             </div>
+            {data.sources.length ? (
+              <div className="feature-table-wrap">
+                <table className="table table-static">
+                  <thead><tr><th scope="col">Source</th><th scope="col">Transport</th><th scope="col">Last received</th><th scope="col" className="num">Events in 24 h</th></tr></thead>
+                  <tbody>{data.sources.map((source) => (
+                    <tr key={source.id}>
+                      <td><span className="mono">{source.id}</span>{source.topics?.length ? <div className="muted small">{source.topics.join(', ')}</div> : null}</td>
+                      <td><span className={`source-kind ${source.last_seen ? 'is-live' : ''}`}>{source.kind === 'http' ? 'Webhook' : source.kind === 'kafka' ? 'Kafka' : 'Log file'}</span></td>
+                      <td className={source.last_seen ? '' : 'muted'}>{source.last_seen ? absTime(source.last_seen) : 'No events yet'}</td>
+                      <td className="num">{source.events_24h ? source.events_24h.toLocaleString() : <span className="muted">0</span>}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            ) : <p className="card-empty">No sources have sent events yet.</p>}
           </section>
           <div className="feature-columns">
-            <section className="editor-section">
-              <h2>New schemas</h2>
-              {!data.discovered.length && <p className="muted">No unknown event shapes yet. Send an unfamiliar payload to see it here.</p>}
+            <section className="feature-card">
+              <div className="card-head">
+                <div>
+                  <h2>New schemas</h2>
+                  <span className="hint">Event shapes no built-in or saved mapping recognises.</span>
+                </div>
+              </div>
+              {!data.discovered.length && <p className="card-empty">No unknown event shapes yet. Send an unfamiliar payload to see it here.</p>}
               {data.discovered.length > 0 && (
-                <div className="stack tight">
+                <div className="stack">
                   <label className="form-field">
                     <span className="label">Discovered sample</span>
                     <select className="select" value={sample ? keyFor(sample) : ''} disabled={busy} onChange={(e) => { setSelected(e.target.value); setPreview(null) }}>
@@ -145,8 +157,8 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                   {sample && (
                     <>
                       <pre className="feature-code">{JSON.stringify(sample.sample, null, 2)}</pre>
-                      <p className="muted small">Last received {absTime(sample.last_seen)}</p>
-                      <div className="inline">
+                      <p className="hint">Last received {absTime(sample.last_seen)}</p>
+                      <div className="inline wrap">
                         <button className="btn btn-primary" onClick={() => onCreateRule(sample)}>Create rule from this event</button>
                         <button className="btn" onClick={() => editMapping()} disabled={busy}>Map this schema</button>
                       </div>
@@ -155,27 +167,32 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                 </div>
               )}
             </section>
-            <section className="editor-section">
-              <h2>Send a sample</h2>
+            <section className="feature-card">
+              <div className="card-head">
+                <div>
+                  <h2>Send a sample</h2>
+                  <span className="hint">Ingests into the live feed on <code>http:playground</code>.</span>
+                </div>
+              </div>
               <label className="form-field">
                 <span className="label">Event JSON</span>
                 <textarea className="input mono feature-textarea" rows={7} maxLength={64 * 1024} spellCheck={false} value={payload} disabled={busy} onChange={(e) => { setPayload(e.target.value); if (previewFrom === 'paste') setPreview(null) }} placeholder={'{ "type": "example", "amount": 125 }'} />
               </label>
-              <p className="hint">Ingests into the live feed on <code>http:playground</code>.</p>
-              <button className="btn" disabled={busy || !payload.trim()} onClick={() => void submitEvent()}>Ingest sample</button>
+              <div className="inline">
+                <span className="spacer" />
+                <button className="btn" disabled={busy || !payload.trim()} onClick={() => void submitEvent()}>Ingest sample</button>
+              </div>
             </section>
           </div>
-          <section className="editor-section">
-            <div className="inline">
-              <h2>Schema mappings</h2>
+          <section className="feature-card">
+            <div className="card-head">
+              <div>
+                <h2>Schema mappings <span className="count">{data.mappings.length}</span></h2>
+                <span className="hint">Map a payload’s fields onto alert fields so rules can use them.</span>
+              </div>
               <span className="spacer" />
-              <button className="btn" onClick={() => editMapping()} disabled={busy}>New mapping</button>
+              <button className="btn btn-sm" onClick={() => editMapping()} disabled={busy}>New mapping</button>
             </div>
-            {data.mappings.length ? (
-              <ul className="feature-items">
-                {data.mappings.map((entry) => <li key={entry.spec.schema}><code>{entry.spec.schema}</code><span className="muted">Revision {entry.revision}</span><button className="btn btn-sm" disabled={busy} onClick={() => editMapping(entry)}>Edit</button></li>)}
-              </ul>
-            ) : <p className="muted">No saved mappings.</p>}
             {mapping && (
               <div className="stack">
                 <label className="form-field">
@@ -183,34 +200,47 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                   <textarea className="input mono feature-textarea" rows={11} maxLength={64 * 1024} value={mapping.text} onChange={(e) => { setMapping({ ...mapping, text: e.target.value }); setPreview(null) }} disabled={busy} spellCheck={false} />
                 </label>
                 <p className="hint">Use payload-relative paths such as <code>labels.service</code>.</p>
-                <label className="form-field">
-                  <span className="label">Preview event</span>
-                  <select className="select" value={previewFrom} disabled={busy} onChange={(e) => {
-                    setPreviewInput(e.target.value === 'discovered' ? 'discovered' : 'paste')
-                    setPreview(null)
-                  }}>
-                    <option value="discovered" disabled={!sample}>Discovered sample</option>
-                    <option value="paste">Pasted JSON on http:playground</option>
-                  </select>
-                </label>
-                <div className="inline">
+                <div className="inline wrap">
+                  <label className="inline">
+                    <span className="small muted">Preview event</span>
+                    <select className="select" value={previewFrom} disabled={busy} onChange={(e) => {
+                      setPreviewInput(e.target.value === 'discovered' ? 'discovered' : 'paste')
+                      setPreview(null)
+                    }}>
+                      <option value="discovered" disabled={!sample}>Discovered sample</option>
+                      <option value="paste">Pasted JSON on http:playground</option>
+                    </select>
+                  </label>
+                  <span className="spacer" />
+                  <button className="btn btn-ghost" disabled={busy} onClick={() => { setMapping(null); setPreview(null) }}>Close editor</button>
                   <button className="btn" disabled={busy || (previewFrom === 'discovered' ? !sample : !payload.trim())} onClick={() => void applyMapping(false)}>Preview mapping</button>
                   <button className="btn btn-primary" disabled={busy} onClick={() => void applyMapping(true)}>Save mapping</button>
-                  <button className="btn btn-ghost" disabled={busy} onClick={() => { setMapping(null); setPreview(null) }}>Close editor</button>
                 </div>
                 {preview && (
-                  <div>
-                    <p role="status">{preview.matched ? 'The detector matches this sample.' : 'The detector does not match this sample.'}</p>
+                  <div className={preview.matched ? 'notice' : 'notice notice-warn'}>
+                    <p role="status"><strong>{preview.matched ? 'The detector matches this sample.' : 'The detector does not match this sample.'}</strong></p>
                     <pre className="feature-code">{JSON.stringify(preview.fields, null, 2)}</pre>
                     {preview.warnings.length > 0 && <ul>{preview.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
                   </div>
                 )}
               </div>
             )}
+            {data.mappings.length ? (
+              <ul className="feature-items">
+                {data.mappings.map((entry) => (
+                  <li key={entry.spec.schema}>
+                    <span className="grow mono">{entry.spec.schema}</span>
+                    <span className="muted small">Revision {entry.revision}</span>
+                    <button className="btn btn-sm" disabled={busy} onClick={() => editMapping(entry)}>Edit</button>
+                  </li>
+                ))}
+              </ul>
+            ) : !mapping && <p className="card-empty">No saved mappings.</p>}
           </section>
         </>
       )}
-      {feedback && <p className={feedback.kind === 'error' ? 'notice notice-warn' : 'notice'} role={feedback.kind === 'error' ? 'alert' : 'status'}>{feedback.text}</p>}
+      {feedback && <div className={feedback.kind === 'error' ? 'notice notice-error' : 'notice'} role={feedback.kind === 'error' ? 'alert' : 'status'}>{feedback.text}</div>}
+      </div>
     </div>
   )
 }

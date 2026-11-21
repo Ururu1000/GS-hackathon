@@ -127,44 +127,61 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
   return (
     <div className="screen feature-screen">
       <header className="screen-head">
-        <div className="screen-title"><h1>Device simulator</h1><span className="muted small" role="status">{connected ? 'Live gateway feed' : 'Gateway disconnected'}</span></div>
+        <div className="screen-title">
+          <h1>Device simulator</h1>
+          <span className="muted small">SMS and phone calls Beacon sent through the demo gateway. Reply to an SMS to approve or acknowledge.</span>
+        </div>
         <span className="spacer" />
+        <div className={`conn ${connected ? 'conn-live' : 'conn-down'}`} role="status">
+          <span className="conn-dot" aria-hidden="true" />
+          {connected ? 'Live gateway feed' : 'Gateway disconnected'}
+        </div>
         <a className="btn" href={MAILPIT_URL} target="_blank" rel="noreferrer">Open Mailpit</a>
       </header>
+      <div className="feature-body">
+      {error && <div className="notice notice-error" role="alert">{error}</div>}
       <div className="feature-columns simulator-layout">
-        <section className="editor-section">
-          <h2>Inbox</h2>
-          <label className="form-field">
-            <span className="label">Recipient</span>
-            <select className="select" value={recipient} onChange={(e) => { setRecipient(e.target.value); setSelected(null); setDraft(null) }}>
-              <option value="">All recipients</option>
-              {recipients.map((name) => <option key={name} value={name}>{name.replace(/^user:/, '')}</option>)}
-            </select>
-          </label>
-          {items.length ? <ul className="feature-items simulator-inbox">
+        <section className="feature-card">
+          <div className="card-head">
+            <h2>Inbox {page && <span className="count">{items.length}</span>}</h2>
+            <span className="spacer" />
+            <label>
+              <span className="sr-only">Recipient</span>
+              <select className="select select-sm" value={recipient} onChange={(e) => { setRecipient(e.target.value); setSelected(null); setDraft(null) }}>
+                <option value="">All recipients</option>
+                {recipients.map((name) => <option key={name} value={name}>{name.replace(/^user:/, '')}</option>)}
+              </select>
+            </label>
+          </div>
+          {items.length ? <ul className="simulator-inbox">
             {items.map((item) => (
               <li key={item.receipt_id}>
-                <button className="btn btn-ghost" aria-pressed={current?.receipt_id === item.receipt_id} onClick={() => { setSelected(item.receipt_id); setDraft(null) }}>
-                  <span>{item.channel === 'sms' ? 'SMS' : 'Call'} · {item.recipient.replace(/^user:/, '')}</span>
-                  <span className="muted small">{item.text}</span>
+                <button className="sim-item" aria-pressed={current?.receipt_id === item.receipt_id} onClick={() => { setSelected(item.receipt_id); setDraft(null) }}>
+                  <span className={`pill ${item.channel === 'sms' ? 'pill-auto' : 'pill-risk'}`}>{item.channel === 'sms' ? 'SMS' : 'Call'}</span>
+                  <span className="sim-who">{item.recipient.replace(/^user:/, '')}</span>
+                  <span className="sim-time">{absTime(item.received_at)}</span>
+                  <span className="sim-text">{item.text}</span>
                 </button>
               </li>
             ))}
-          </ul> : <p className="muted">{page ? 'No messages for this recipient.' : 'Waiting for the gateway…'}</p>}
-          {page?.next_cursor && <button className="btn" disabled={loading} onClick={() => void older()}>{loading ? 'Loading…' : 'Load older messages'}</button>}
+          </ul> : <p className="card-empty">{page ? 'No messages for this recipient.' : 'Waiting for the gateway…'}</p>}
+          {page?.next_cursor && <div className="inline"><span className="spacer" /><button className="btn btn-sm" disabled={loading} onClick={() => void older()}>{loading ? 'Loading…' : 'Load older messages'}</button><span className="spacer" /></div>}
         </section>
-        <section className="simulator-phone stack" aria-label="Simulated phone">
-          <div className="simulator-phone-header">
-            <h2>{current?.channel === 'phone' ? 'Incoming call' : 'Messages'}</h2>
+        <section className="feature-card simulator-phone" aria-label="Simulated phone">
+          <div className="card-head">
+            <div>
+              <h2>{current?.channel === 'phone' ? 'Incoming call' : 'Messages'}</h2>
+              {current && <span className="hint">{current.recipient.replace(/^user:/, '')}{from ? ` · ${from}` : ''} · {absTime(current.received_at)}</span>}
+            </div>
+            <span className="spacer" />
+            {current && <a className="btn btn-sm" href={`#/alerts/${encodeURIComponent(current.alert_id)}`}>Open alert</a>}
           </div>
           {current && (
             <>
-              <p className="small muted">{current.recipient.replace(/^user:/, '')} · {absTime(current.received_at)}</p>
-              <div className="simulator-message">{current.text}</div>
+              <div className={`simulator-message ${current.channel === 'phone' ? 'is-call' : ''}`}>{current.text}</div>
               {current.duplicates > 0 && <p className="hint">{current.duplicates} duplicate receipt{current.duplicates === 1 ? '' : 's'}</p>}
-              <a href={`#/alerts/${encodeURIComponent(current.alert_id)}`}>Open alert</a>
               {current.channel === 'sms' && current.approval_challenge && (
-                decided[current.receipt_id] ? <p className="notice" role="status">{replyStatus[decided[current.receipt_id]!.outcome]}</p>
+                decided[current.receipt_id] ? <div className="notice" role="status">{replyStatus[decided[current.receipt_id]!.outcome]}</div>
                   : from ? (
                     <form className="stack tight" onSubmit={(e) => { e.preventDefault(); void send(reply) }}>
                       <label className="form-field">
@@ -175,6 +192,7 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
                         }} placeholder={approvalReply ?? undefined} />
                       </label>
                       <div className="inline">
+                        <span className="spacer" />
                         {approvalReply && <button className="btn" type="button" disabled={sending} onClick={() => void send(approvalReply)}>Reply {approvalReply}</button>}
                         <button className="btn btn-primary" type="submit" disabled={sending || !reply.trim()}>Send reply</button>
                       </div>
@@ -183,10 +201,10 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
               )}
             </>
           )}
-          {!current && <p className="muted">Select a receipt to open it here.</p>}
+          {!current && <p className="card-empty">Select a message to open it here.</p>}
         </section>
       </div>
-      {error && <p className="notice notice-warn" role="alert">{error}</p>}
+      </div>
     </div>
   )
 }

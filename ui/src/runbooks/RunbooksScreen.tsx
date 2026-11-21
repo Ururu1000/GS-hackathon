@@ -74,13 +74,26 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
 
   return (
     <div className="screen feature-screen">
-      <header className="screen-head"><div className="screen-title"><h1>Runbooks</h1></div></header>
+      <header className="screen-head">
+        <div className="screen-title">
+          <h1>Runbooks</h1>
+          <span className="muted small">Step-by-step checklists that responders follow from an alert. Attach one to a rule in the rule editor.</span>
+        </div>
+      </header>
+      <div className="feature-body">
+      {!canImport && <div className="notice">The live service loads runbooks from its configuration.</div>}
+      {!canImport && problem && <div className="notice notice-error" role="alert">{problem}</div>}
       {canImport && <div className="feature-columns">
-        <section className="editor-section stack">
-          <h2>Import runbook</h2>
+        <section className="feature-card">
+          <div className="card-head">
+            <div>
+              <h2>Import runbook</h2>
+              <span className="hint">Paste or upload a document, or link to one. You can edit the steps before saving.</span>
+            </div>
+          </div>
           <label className="form-field">
             <span className="label">Title</span>
-            <input className="input" value={draft.title} disabled={busy} maxLength={120} onChange={(e) => change({ title: e.target.value })} />
+            <input className="input" value={draft.title} disabled={busy} maxLength={120} placeholder="e.g. Settlement timeout" onChange={(e) => change({ title: e.target.value })} />
           </label>
           <div className="grid-2">
             <label className="form-field">
@@ -106,60 +119,75 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
               ? <input className="input mono" type="url" value={draft.content} disabled={busy} onChange={(e) => change({ content: e.target.value })} placeholder="https://wiki.example/runbook" />
               : <textarea className="input mono feature-textarea" rows={10} value={draft.content} maxLength={64 * 1024} disabled={busy} onChange={(e) => change({ content: e.target.value })} />}
           </label>
-          <div className="inline">
+          <div className="inline wrap">
             {draft.format !== 'link' && (
-              <label className="form-field">
-                <span className="label">Upload a file</span>
-                <input type="file" accept=".md,.markdown,.yaml,.yml,.txt,text/plain" disabled={busy} onChange={(e) => void importFile(e.target.files?.[0])} />
+              <label className="inline">
+                <span className="sr-only">Upload a file</span>
+                <input className="file-input" type="file" accept=".md,.markdown,.yaml,.yml,.txt,text/plain" disabled={busy} onChange={(e) => void importFile(e.target.files?.[0])} />
               </label>
             )}
             <span className="spacer" />
-            <button className="btn" disabled={busy || !teamId || !draft.title.trim() || !draft.content.trim()} onClick={() => void submit(false)}>Preview runbook</button>
+            <button className="btn btn-primary" disabled={busy || !teamId || !draft.title.trim() || !draft.content.trim()} onClick={() => void submit(false)}>Preview runbook</button>
           </div>
         </section>
-        <section className="editor-section stack">
-          <h2>Checklist preview</h2>
-          {!preview && <p className="muted">Preview an import to edit its steps before saving.</p>}
+        <section className="feature-card">
+          <div className="card-head">
+            <div>
+              <h2>Checklist preview</h2>
+              <span className="hint">What responders will see. Edit or remove steps, then save.</span>
+            </div>
+          </div>
+          {!preview && <p className="card-empty">Preview an import to edit its steps before saving.</p>}
           {preview && (
             <>
               {draft.format === 'link' && <p className="mono feature-wrap">{draft.content}</p>}
-              <ol className="feature-checklist">
+              {preview.steps.length > 0 && <ol className="feature-checklist">
                 {preview.steps.map((step, index) => (
                   <li key={step.id}>
-                    <label className="form-field">
-                      <span className="label">Step {index + 1}{step.action ? ` · ${step.action.label}` : ''}</span>
-                      <textarea className="input feature-textarea" rows={2} maxLength={2_000} value={step.text} disabled={busy} onChange={(e) => setPreview({
+                    <span className="step-n" aria-hidden="true">{index + 1}</span>
+                    <div className="stack tight">
+                      {step.action && <span className="small muted">{step.action.label}</span>}
+                      <textarea className="input feature-textarea" rows={2} maxLength={2_000} value={step.text} disabled={busy} aria-label={`Step ${index + 1}${step.action ? ` · ${step.action.label}` : ''}`} onChange={(e) => setPreview({
                         ...preview, steps: preview.steps.map((current) => current.id === step.id ? { ...current, text: e.target.value } : current),
                       })} />
-                    </label>
-                    {step.hint && <p className="hint">{step.hint}</p>}
-                    {step.approval === 'required' && <p className="hint">Approval required</p>}
-                    <button className="btn btn-sm btn-ghost" disabled={busy} onClick={() => setPreview({ ...preview, steps: preview.steps.filter((current) => current.id !== step.id) })}>Remove step {index + 1}</button>
+                      {step.hint && <p className="hint">{step.hint}</p>}
+                      {step.approval === 'required' && <span><span className="pill pill-approval">Approval required</span></span>}
+                    </div>
+                    <button className="icon-btn sm" disabled={busy} aria-label={`Remove step ${index + 1}`} title="Remove step" onClick={() => setPreview({ ...preview, steps: preview.steps.filter((current) => current.id !== step.id) })}>✕</button>
                   </li>
                 ))}
-              </ol>
+              </ol>}
               <div className="inline">
                 {draft.format !== 'link' && (
                   <button className="btn" disabled={busy || preview.steps.length >= 50} onClick={() => setPreview({
                     ...preview, steps: [...preview.steps, { id: `manual-${crypto.randomUUID()}`, kind: 'manual', text: '' }],
                   })}>Add step</button>
                 )}
+                <span className="spacer" />
                 <button className="btn btn-primary" disabled={busy || (draft.format !== 'link' && !preview.steps.length) || preview.steps.some((step) => !step.text.trim())} onClick={() => void submit(true)}>Save runbook</button>
               </div>
             </>
           )}
-          {problem && <p className="notice notice-warn" role="alert">{problem}</p>}
-          {saved && <p className="notice" role="status">Saved {saved.title}. Choose it in the <a href="#/rules">rule editor</a> to attach it.</p>}
+          {problem && <div className="notice notice-error" role="alert">{problem}</div>}
+          {saved && <div className="notice" role="status">Saved {saved.title}. Choose it in the <a href="#/rules">rule editor</a> to attach it.</div>}
         </section>
       </div>}
-      {!canImport && <p className="muted">The live service loads runbooks from its configuration.</p>}
-      {!canImport && problem && <p className="notice notice-warn" role="alert">{problem}</p>}
-      <section className="editor-section">
-        <h2>Saved runbooks</h2>
+      <section className="feature-card">
+        <div className="card-head">
+          <h2>Saved runbooks {items && <span className="count">{items.length}</span>}</h2>
+        </div>
         {items?.length ? <ul className="feature-items">{items.map((item) => (
-          <li key={item.id}><strong>{item.title}</strong><span className="muted">{formatLabel(item.format)} · {item.steps} steps</span><code>{item.id}</code></li>
-        ))}</ul> : <p className="muted">{items ? 'No saved runbooks.' : 'Runbook list unavailable while loading.'}</p>}
+          <li key={item.id}>
+            <div className="grow">
+              <strong>{item.title}</strong>
+              <code>{item.id}</code>
+            </div>
+            <span className="pill">{formatLabel(item.format)}</span>
+            <span className="muted small">{item.steps} {item.steps === 1 ? 'step' : 'steps'}</span>
+          </li>
+        ))}</ul> : <p className="card-empty">{items ? 'No saved runbooks.' : 'Runbook list unavailable while loading.'}</p>}
       </section>
+      </div>
     </div>
   )
 }
