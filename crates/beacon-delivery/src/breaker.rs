@@ -17,7 +17,8 @@
 //!     (no deadlock in `half_open`).
 //! - Permanent errors (bad address) never count: they say nothing about the provider.
 //!
-//! Every UPDATE sets `updated_at = now()`. A missing row means `closed` (created on first use).
+//! Every UPDATE that changes the row sets `updated_at = now()`. A missing row means `closed`
+//! (created on first use).
 
 use std::time::Duration;
 
@@ -139,10 +140,13 @@ pub async fn record_success(
             .await?;
         }
         None => {
+            // Only a failure streak needs resetting: a healthy channel's row is left alone,
+            // so concurrent successful sends don't all queue on this one row's lock (and a
+            // WAL write each). `updated_at` therefore moves only when something changed.
             sqlx::query(
                 "UPDATE channel_breakers \
                  SET consecutive_failures = 0, updated_at = now() \
-                 WHERE channel = $1 AND state = 'closed'",
+                 WHERE channel = $1 AND state = 'closed' AND consecutive_failures <> 0",
             )
             .bind(channel)
             .execute(pool)

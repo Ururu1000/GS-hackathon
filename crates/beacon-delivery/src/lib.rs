@@ -36,6 +36,7 @@ pub mod router;
 pub mod rules;
 pub mod runbook;
 pub mod throttle;
+pub mod wake;
 pub mod worker;
 
 use std::sync::Arc;
@@ -58,6 +59,9 @@ pub struct RouterConfig {
     /// Run the throttle digest pass before each batch. With several router tasks
     /// (`ROUTER_TASKS`) only one needs it; the others would only repeat empty queries.
     pub digest: bool,
+    /// Woken early by `NOTIFY beacon_outbox` ([`wake::OUTBOX_CHANNEL`], key
+    /// [`wake::OUTBOX_KEY`]); `Wake::never()` (the default) only polls.
+    pub wake: wake::Wake,
 }
 
 impl Default for RouterConfig {
@@ -68,6 +72,7 @@ impl Default for RouterConfig {
             clock: Arc::new(clock::SystemClock),
             escalate_after_override: None,
             digest: true,
+            wake: wake::Wake::never(),
         }
     }
 }
@@ -107,6 +112,9 @@ pub struct WorkerConfig {
     /// `None` (the default) renders the link-less "Decide in Beacon" form — the prompt
     /// email still names the request, it just cannot carry a deciding link.
     pub email_link: Option<email_link::EmailLinkConfig>,
+    /// Woken early by `NOTIFY beacon_delivery_jobs` ([`wake::JOBS_CHANNEL`], keyed by this
+    /// worker's channel name); `Wake::never()` (the default) only polls.
+    pub wake: wake::Wake,
 }
 
 impl Default for WorkerConfig {
@@ -120,6 +128,7 @@ impl Default for WorkerConfig {
             backoff: BackoffPolicy::default(),
             breaker: breaker::BreakerPolicy::default(),
             email_link: None,
+            wake: wake::Wake::never(),
         }
     }
 }

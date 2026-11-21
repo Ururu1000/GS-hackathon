@@ -376,7 +376,8 @@ fn is_retryable_conflict(err: &sqlx::Error) -> bool {
 }
 
 /// Loop `route_once` until shutdown. Polls again immediately after a full batch, otherwise
-/// sleeps `cfg.poll_interval`. Logs and backs off on DB errors instead of exiting.
+/// sleeps `cfg.poll_interval` or until `cfg.wake` fires (a new outbox row). Logs and backs
+/// off on DB errors instead of exiting.
 ///
 /// The startup directory is wrapped in an [`crate::overrides::EffectiveDirectory`] and
 /// re-read (one cheap stamp query) every pass, so a saved preference or team change
@@ -386,6 +387,7 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
     let effective = Arc::new(crate::overrides::EffectiveDirectory::new(dir));
     let mut conflicts: u64 = 0;
     while !*shutdown.borrow() {
+        let pass_started = tokio::time::Instant::now();
         // Throttle digests ride along with routing: cheap when nothing is parked.
         if cfg.digest {
             match throttle::digest_once(&pool, 100).await {
@@ -419,6 +421,8 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            // A new outbox row: this task was picked to route it (paced under load).
+            _ = cfg.wake.notified() => crate::wake::Wake::pace(pass_started).await,
             // `Err` means the sender is gone, so nobody can signal shutdown any more: stop.
             res = shutdown.changed() => {
                 if res.is_err() {
