@@ -152,10 +152,7 @@ export function SimulatorScreen({ mockReplies }: { mockReplies: boolean }) {
           <span className="muted small">SMS and phone calls Beacon sent through the demo gateway. Reply to an SMS to approve or acknowledge.</span>
         </div>
         <span className="spacer" />
-        <div className={`conn ${connected ? 'conn-live' : 'conn-down'}`} role="status">
-          <span className="conn-dot" aria-hidden="true" />
-          {connected ? 'Live gateway feed' : 'Gateway disconnected'}
-        </div>
+        <div className={connected ? 'sr-only' : 'conn conn-down'} role="status">{connected ? 'Gateway connected' : 'Gateway disconnected'}</div>
         {MAILPIT_URL && <a className="btn" href={MAILPIT_URL} target="_blank" rel="noopener noreferrer">Open Mailpit</a>}
       </header>
       <div className="feature-body">

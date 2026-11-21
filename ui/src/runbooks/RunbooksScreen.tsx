@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { errorText, listRunbooks } from '../api/client'
 import { previewRunbook, publishRunbook, type RunbookImport, type RunbookPreview } from '../api/screens'
 import type { RunbookFormat, RunbookSummary, Session } from '../api/types'
+import { CloseIcon } from '../lib/icons'
 
 const formats: { id: RunbookFormat; label: string }[] = [
   { id: 'yaml', label: 'Structured YAML' },
@@ -9,7 +10,7 @@ const formats: { id: RunbookFormat; label: string }[] = [
   { id: 'link', label: 'Link' },
   { id: 'text', label: 'Plain text' },
 ]
-const formatLabel = (format: string) => formats.find((entry) => entry.id === format)?.label ?? format
+const formatLabel = (format: string) => format === 'yaml' ? 'YAML' : formats.find((entry) => entry.id === format)?.label ?? format
 
 export function RunbooksScreen({ teams, team, canImport }: { teams: Session['teams']; team: string | null; canImport: boolean }) {
   const [items, setItems] = useState<RunbookSummary[] | null>(null)
@@ -144,7 +145,7 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
           {!preview && <p className="card-empty">Preview an import to edit its steps before saving.</p>}
           {preview && (
             <>
-              {draft.format === 'link' && <p className="mono feature-wrap">{draft.content}</p>}
+              {draft.format === 'link' && <p className="feature-wrap">{draft.content}</p>}
               {preview.steps.length > 0 && <ol className="feature-checklist">
                 {preview.steps.map((step, index) => (
                   <li key={step.id}>
@@ -157,7 +158,9 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
                       {step.hint && <p className="hint">{step.hint}</p>}
                       {step.approval === 'required' && <span><span className="pill pill-approval">Approval required</span></span>}
                     </div>
-                    <button className="icon-btn sm" disabled={busy} aria-label={`Remove step ${index + 1}`} title="Remove step" onClick={() => setPreview({ ...preview, steps: preview.steps.filter((current) => current.id !== step.id) })}>✕</button>
+                    <button className="icon-btn sm" disabled={busy} aria-label={`Remove step ${index + 1}`} title="Remove step" onClick={() => setPreview({ ...preview, steps: preview.steps.filter((current) => current.id !== step.id) })}>
+                      <CloseIcon size={13} />
+                    </button>
                   </li>
                 ))}
               </ol>}
@@ -184,10 +187,9 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
           <li key={item.id}>
             <div className="grow">
               <strong>{item.title}</strong>
-              <code>{item.id}</code>
+              <span className="muted small">{item.id}</span>
             </div>
-            <span className="pill">{formatLabel(item.format)}</span>
-            <span className="muted small">{item.steps} {item.steps === 1 ? 'step' : 'steps'}</span>
+            <span className="muted small">{formatLabel(item.format)} · {item.steps} {item.steps === 1 ? 'step' : 'steps'}</span>
           </li>
         ))}</ul> : <p className="card-empty">{items ? 'No saved runbooks.' : 'Runbook list unavailable while loading.'}</p>}
       </section>

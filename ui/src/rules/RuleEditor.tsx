@@ -9,6 +9,7 @@ import { SEVERITIES, type NodeDiagnostic, type PersonDirectoryEntry, type RuleIt
 import { SEVERITY_LABEL } from '../alert/badges'
 import { FORBIDDEN_KEYS, isSensitivePath } from '../lib/redact'
 import { relTime } from '../lib/time'
+import { ChevronLeftIcon } from '../lib/icons'
 import { ConditionBuilder } from './ConditionBuilder'
 import { flattenPaths, fromYaml, ruleEquals, slugify, TEMPLATES, toYaml } from './draft'
 import { NoiseEditor, PresentEditor, Problems, problemsAt, RouteEditor, type EditorEnv } from './sections'
@@ -197,7 +198,7 @@ export function RuleEditor({ id, from, team, initialEvent, mockTransports, onEve
   return (
     <div className="screen rule-editor">
       <header className="screen-head">
-        <button className="btn btn-ghost" onClick={() => onNavigate('#/rules')}>← Rules</button>
+        <button className="btn btn-ghost" onClick={() => onNavigate('#/rules')}><ChevronLeftIcon size={14} />Rules</button>
         <div className="screen-title">
           <h1>{draft.name || (isNew ? 'New rule' : draft.id)}</h1>
           <span className="muted small">

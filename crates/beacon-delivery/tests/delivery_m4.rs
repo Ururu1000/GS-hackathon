@@ -250,9 +250,10 @@ async fn breaker_opens_blocks_probes_and_recovers(pool: PgPool) {
         .into_channel();
     let stats = work_once_bounded(&pool, &bad, &cfg).await;
     assert_eq!(stats.claimed, 3, "{stats:?}");
-    // Exactly the failure that reaches the threshold defers; the two before it retry.
-    assert_eq!(stats.deferred, 1, "{stats:?}");
-    assert_eq!(stats.retried, 2, "{stats:?}");
+    // Every one of these was a real send attempt, so each consumes its attempt even though
+    // the third failure opened the breaker: nothing is refunded.
+    assert_eq!(stats.deferred, 0, "{stats:?}");
+    assert_eq!(stats.retried, 3, "{stats:?}");
     assert_eq!(stats.dead + stats.sent, 0, "{stats:?}");
     assert_eq!(
         breaker::status(&pool, "sms").await.expect("status"),
@@ -261,8 +262,10 @@ async fn breaker_opens_blocks_probes_and_recovers(pool: PgPool) {
 
     let jobs = job_rows(&pool, alert).await;
     assert!(jobs.iter().all(|j| j.status == "pending"), "{jobs:?}");
-    assert_eq!(jobs.iter().filter(|j| j.attempts == 0).count(), 1, "refund");
-    assert_eq!(jobs.iter().filter(|j| j.attempts == 1).count(), 2);
+    assert!(
+        jobs.iter().all(|j| j.attempts == 1),
+        "real attempts are consumed even when they open the breaker: {jobs:?}"
+    );
     assert!(jobs.iter().all(|j| j.lease_token.is_none()));
 
     // --- while open, nothing is claimed and attempts do not move -------------------------------
@@ -336,14 +339,27 @@ async fn breaker_opens_blocks_probes_and_recovers(pool: PgPool) {
         add_stats(&mut total, &stats);
     }
     assert_eq!(total.claimed, 1, "exactly one probe job: {total:?}");
-    assert_eq!(total.deferred, 1, "the failed probe defers: {total:?}");
-    assert_eq!(total.sent + total.dead + total.retried, 0, "{total:?}");
+    assert_eq!(
+        total.retried, 1,
+        "the failed probe consumes its attempt: {total:?}"
+    );
+    assert_eq!(total.deferred, 0, "{total:?}");
+    assert_eq!(total.sent + total.dead, 0, "{total:?}");
     assert_eq!(bad_fake.calls() - calls_before_probe, 1);
 
-    // The probe job was refunded and parked until the cooldown ends.
+    // The probe job consumed its attempt and waits out the cooldown (30 s here, far above
+    // its ~1 s backoff, so the cooldown floor pins `due_at`).
     let d_row = job_row(&pool, d).await;
     assert_eq!(d_row.status, "pending");
-    assert_eq!(d_row.attempts, 0, "deferred jobs do not consume attempts");
+    assert_eq!(
+        d_row.attempts, 1,
+        "a real probe attempt consumes its attempt"
+    );
+    let probe_due_in = d_row.due_at - Utc::now();
+    assert!(
+        probe_due_in >= chrono::Duration::seconds(29),
+        "due_at must respect the 30 s cooldown floor, got {probe_due_in}"
+    );
     assert!(
         d_row.due_at > Utc::now(),
         "due_at in the future: {:?}",
@@ -352,13 +368,24 @@ async fn breaker_opens_blocks_probes_and_recovers(pool: PgPool) {
     assert_eq!(d_row.last_error_class.as_deref(), Some("transient"));
     assert!(d_row.last_error.is_some());
     assert!(d_row.lease_token.is_none() && d_row.locked_until.is_none());
-    // The backlog was untouched.
+    // The backlog was untouched: only the probe job moved (0 -> 1 attempts).
     let attempts_probed: Vec<(Uuid, i32)> =
         sqlx::query_as("SELECT id, attempts FROM delivery_jobs WHERE channel = 'sms' ORDER BY id")
             .fetch_all(&pool)
             .await
             .expect("attempts after probe");
-    assert_eq!(attempts_after, attempts_probed, "probe claims only one job");
+    let before_map: std::collections::HashMap<Uuid, i32> = attempts_before.into_iter().collect();
+    for (id, attempts) in &attempts_probed {
+        let expected = if *id == d {
+            1
+        } else {
+            *before_map.get(id).expect("job seen before")
+        };
+        assert_eq!(
+            *attempts, expected,
+            "probe claims only one job (id={id}): {attempts_probed:?}"
+        );
+    }
     // The failed probe reopened the breaker.
     let (state, failures) = breaker::status(&pool, "sms").await.expect("status");
     assert_eq!(state, "open");
@@ -1069,17 +1096,27 @@ async fn jobs_queued_behind_a_send_slot_do_not_send_once_the_breaker_opens(pool:
 
     let stats = work_once_bounded(&pool, &bad, &cfg).await;
     assert_eq!(stats.claimed, 3, "{stats:?}");
-    assert_eq!(stats.deferred, 3, "{stats:?}");
+    // The first job is a real send: it opens the breaker (threshold 1) and consumes its
+    // attempt. The two jobs still waiting for the send slot never reach the provider, so
+    // only they defer with a refund.
+    assert_eq!(stats.retried, 1, "{stats:?}");
+    assert_eq!(stats.deferred, 2, "{stats:?}");
     assert_eq!(
         fake.calls(),
         1,
         "only the send that opened the breaker goes out"
     );
     let jobs = job_rows(&pool, alert).await;
-    assert!(
-        jobs.iter()
-            .all(|j| j.status == "pending" && j.attempts == 0),
-        "{jobs:?}"
+    assert!(jobs.iter().all(|j| j.status == "pending"), "{jobs:?}");
+    assert_eq!(
+        jobs.iter().filter(|j| j.attempts == 1).count(),
+        1,
+        "the real attempt is consumed: {jobs:?}"
+    );
+    assert_eq!(
+        jobs.iter().filter(|j| j.attempts == 0).count(),
+        2,
+        "jobs that never sent keep their refund: {jobs:?}"
     );
 }
 
@@ -1116,4 +1153,208 @@ async fn a_probe_with_nothing_to_send_is_released_at_once(pool: PgPool) {
         breaker::status(&pool, "sms").await.expect("status").0,
         "closed"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 6. Retry horizon (SPEC §9c) and exhaustion without refunds
+// ---------------------------------------------------------------------------------------------
+
+/// SPEC §9c needs the retry horizon to stay well above the 60 s outage, so a 60 s outage
+/// drains with 0 dead. This pins the arithmetic from first principles (no 60 s sleep):
+/// probes are spaced at least `cooldown` apart, every real probe consumes one attempt, and
+/// the failed probe's `due_at` push spreads probes across jobs via the claim's `due_at`
+/// ordering, so a batch of `N` jobs survives at least `N * max_attempts * cooldown`.
+#[test]
+fn retry_horizon_stays_above_sixty_seconds() {
+    // Production defaults: backoff base 1 s / cap 60 s, breaker cooldown 5 s, DB
+    // `delivery_jobs.max_attempts` default 8 (see migration
+    // `20261120203000_delivery_create_delivery_jobs.sql`).
+    let backoff = BackoffPolicy::default();
+    let breaker = BreakerPolicy::default();
+    assert_eq!(backoff.base, Duration::from_secs(1));
+    assert_eq!(backoff.cap, Duration::from_secs(60));
+    assert_eq!(breaker.cooldown, Duration::from_secs(5));
+    let max_attempts: i32 = 8;
+
+    // Single job, expected (mean) horizon: full-jitter uniform in `[0, upper]` has mean
+    // `upper/2` (the `base/2` floor only matters for the first attempt), floored by the
+    // cooldown each attempt. Uppers for attempts 1..=7 are 1,2,4,8,16,32,60 (capped).
+    let mut expected_secs = 0.0;
+    for k in 1..max_attempts {
+        let upper = (backoff.base.as_secs_f64() * 2f64.powi(k - 1)).min(backoff.cap.as_secs_f64());
+        expected_secs += (upper / 2.0).max(breaker.cooldown.as_secs_f64());
+    }
+    // 5+5+5+5+8+16+30 = 74 s.
+    assert!(
+        expected_secs > 60.0,
+        "single-job expected horizon must exceed the 60 s outage, got {expected_secs:.1} s"
+    );
+
+    // The SPEC §9c batch spreads probes across jobs: 50 jobs * 8 attempts, one probe per
+    // cooldown window minimum.
+    let batch_min_secs = 50.0 * max_attempts as f64 * breaker.cooldown.as_secs_f64();
+    assert!(
+        batch_min_secs > 60.0,
+        "50-job batch minimum horizon must exceed 60 s, got {batch_min_secs:.1} s"
+    );
+
+    // The faster policy used by the outage tests below (base 100 ms / cap 1 s, cooldown
+    // 300 ms): same batch argument gives 50 * 8 * 0.3 = 120 s.
+    let test_batch_min_secs = 50.0 * 8.0 * 0.3;
+    assert!(
+        test_batch_min_secs > 60.0,
+        "test-policy batch minimum horizon must exceed 60 s, got {test_batch_min_secs:.1} s"
+    );
+}
+
+/// A horizon-long outage does kill: with a short policy and an always-failing channel, a job
+/// consumes one attempt per probe (no refunds for real sends) and eventually reaches `dead`
+/// with exactly one one-hop fallback job.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sustained_outage_exhausts_attempts_and_creates_one_fallback(pool: PgPool) {
+    let cfg = WorkerConfig {
+        worker_id: "w-exhaust".into(),
+        breaker: BreakerPolicy {
+            threshold: 2,
+            cooldown: Duration::from_millis(50),
+            probe_lease: Duration::from_secs(1),
+        },
+        backoff: BackoffPolicy {
+            base: Duration::from_millis(10),
+            cap: Duration::from_millis(50),
+        },
+        ..WorkerConfig::default()
+    };
+    let alert = insert_alert(&pool, "open", &format!("exhaust m4 {}", unique_tag())).await;
+    let sms_id = insert_sms_job(
+        &pool,
+        alert,
+        "bob",
+        "+44111",
+        fallback_route("email", "bob-fallback@example.test"),
+    )
+    .await;
+    // Small budget so the test exhausts it in a handful of iterations.
+    sqlx::query("UPDATE delivery_jobs SET max_attempts = 5 WHERE id = $1")
+        .bind(sms_id)
+        .execute(&pool)
+        .await
+        .expect("set max_attempts");
+
+    let (fake, channel) = Scripted::new("sms")
+        .always_failing(SendError::Transient("sms provider 503".into()))
+        .into_channel();
+
+    // Drive the worker, fast-forwarding past every cooldown and retry delay (as if the outage
+    // lasted longer than the horizon): each pass is one real attempt.
+    let mut total = WorkStats::default();
+    let mut died = false;
+    for _ in 0..20 {
+        sqlx::query("UPDATE delivery_jobs SET due_at = now() WHERE id = $1")
+            .bind(sms_id)
+            .execute(&pool)
+            .await
+            .expect("make due");
+        sqlx::query(
+            "UPDATE channel_breakers SET open_until = now() - interval '1 second' \
+             WHERE channel = 'sms'",
+        )
+        .execute(&pool)
+        .await
+        .expect("cooldown over");
+        let stats = work_once_bounded(&pool, &channel, &cfg).await;
+        add_stats(&mut total, &stats);
+        if stats.dead == 1 {
+            died = true;
+            break;
+        }
+    }
+    assert!(died, "an always-failing job must eventually die: {total:?}");
+    assert_eq!(
+        fake.calls(),
+        5,
+        "one send per attempt, no phantom retries: {total:?}"
+    );
+    assert_eq!(
+        total.deferred, 0,
+        "real attempts are never refunded: {total:?}"
+    );
+
+    let sms = job_row(&pool, sms_id).await;
+    assert_eq!(sms.status, "dead");
+    assert_eq!(
+        sms.attempts, 5,
+        "every real attempt consumed its attempt: {sms:?}"
+    );
+    assert_eq!(sms.last_error_class.as_deref(), Some("transient"));
+
+    let fallbacks: Vec<DeliveryJob> =
+        sqlx::query_as("SELECT * FROM delivery_jobs WHERE fallback_of = $1")
+            .bind(sms_id)
+            .fetch_all(&pool)
+            .await
+            .expect("fallback rows");
+    assert_eq!(fallbacks.len(), 1, "exactly one fallback: {fallbacks:?}");
+    assert_eq!(fallbacks[0].channel, "email");
+    assert_eq!(fallbacks[0].address, "bob-fallback@example.test");
+    assert_eq!(fallbacks[0].status, "pending");
+}
+
+/// Round-2 review (board #439): with the breaker open, the failure before a job's FINAL attempt
+/// waits at least `max(cooldown, backoff cap)`, independent of jitter, so one job cannot burn
+/// every attempt inside a 60 s outage. Earlier failures keep the normal floor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn penultimate_failure_while_open_waits_at_least_the_backoff_cap(pool: PgPool) {
+    let policy = BackoffPolicy::default(); // base 1 s, cap 60 s
+    let cooldown = BreakerPolicy::default().cooldown; // 5 s
+    let cfg = WorkerConfig {
+        worker_id: "w-floor".into(),
+        ..WorkerConfig::default()
+    };
+    let alert = insert_alert(&pool, "open", &format!("floor m4 {}", unique_tag())).await;
+    let err = SendError::Transient("sms provider 503".into());
+
+    // (attempts before the claim, expected minimum delay, expected maximum delay)
+    for (before_claim, min_s, max_s) in [(6, 60.0, 61.0), (2, 5.0, 8.5)] {
+        let id = insert_sms_job(
+            &pool,
+            alert,
+            &format!("p{before_claim}"),
+            "+44111",
+            json!({}),
+        )
+        .await;
+        sqlx::query("UPDATE delivery_jobs SET attempts = $2, max_attempts = 8 WHERE id = $1")
+            .bind(id)
+            .bind(before_claim)
+            .execute(&pool)
+            .await
+            .expect("set attempts");
+        let claimed = claim_batch(&pool, "sms", &cfg).await.expect("claim");
+        let job = claimed
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .expect("claimed")
+            .clone();
+        assert_eq!(job.attempts, before_claim + 1);
+        let token = job.lease_token.expect("lease token");
+        let status =
+            worker::finalize_failed_while_open(&pool, &job, token, &err, &policy, cooldown)
+                .await
+                .expect("finalize");
+        assert_eq!(status, Some(beacon_delivery::model::JobStatus::Pending));
+        let secs: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch from due_at - updated_at)::float8 FROM delivery_jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("due_at");
+        assert!(
+            secs >= min_s - 0.01 && secs <= max_s,
+            "attempt {} of 8: due_at - updated_at = {secs:.2}s, want [{min_s}, {max_s}]",
+            job.attempts
+        );
+    }
 }

@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { errorText, HttpError, isConflict, listPeople, listTeams, savePreferences, saveTeam } from '../api/client'
 import { SEVERITIES, type PersonView, type Preference, type Severity, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
-import { CloseIcon } from '../lib/icons'
+import { ChevronDownIcon, ChevronUpIcon, CloseIcon } from '../lib/icons'
 import { maskAddress } from '../lib/redact'
 import { ChannelPicker, CHANNEL_NAME } from '../rules/sections'
 import { parseWindow, resolveChannels } from './resolve'
@@ -115,10 +115,12 @@ function SeverityPicker({ value, onChange }: { value: Severity[]; onChange: (v: 
   )
 }
 
-function PrefLine({ line, index, count, teams, onChange, onMove, onRemove }: {
+function PrefLine({ line, index, count, hit, teams, onChange, onMove, onRemove }: {
   line: Line
   index: number
   count: number
+  /** This line decides the "Try it" example. */
+  hit: boolean
   teams: TeamView[]
   onChange: (l: Line) => void
   onMove: (d: -1 | 1) => void
@@ -132,9 +134,12 @@ function PrefLine({ line, index, count, teams, onChange, onMove, onRemove }: {
   const badWindow = line.when && !parseWindow(line.when.between)
   const [from = '08:00', to = '20:00'] = (line.when?.between ?? '08:00-20:00').split('-')
   return (
-    <li className="pref-line">
-      <div className="pref-num" aria-hidden="true">{index + 1}</div>
+    <li className={`pref-line ${hit ? 'is-hit' : ''}`}>
       <div className="pref-body">
+        <div className="pref-line-head">
+          <span className="pref-num">Line {index + 1}</span>
+          {hit && <span className="pref-hit">Matches example</span>}
+        </div>
         <div className="inline wrap">
           <span className="small">When severity is</span>
           <SeverityPicker value={sev} onChange={(v) => setMatch({ ...line.match, severity: v.length === 1 ? v[0] : v })} />
@@ -184,8 +189,8 @@ function PrefLine({ line, index, count, teams, onChange, onMove, onRemove }: {
         )}
       </div>
       <div className="pref-tools">
-        <button type="button" className="icon-btn sm" disabled={index === 0} onClick={() => onMove(-1)} aria-label="Move up" title="Move up">↑</button>
-        <button type="button" className="icon-btn sm" disabled={index === count - 1} onClick={() => onMove(1)} aria-label="Move down" title="Move down">↓</button>
+        <button type="button" className="icon-btn sm move-btn" disabled={index === 0} onClick={() => onMove(-1)} aria-label="Move up" title="Move up"><ChevronUpIcon size={14} /></button>
+        <button type="button" className="icon-btn sm move-btn" disabled={index === count - 1} onClick={() => onMove(1)} aria-label="Move down" title="Move down"><ChevronDownIcon size={14} /></button>
         <button type="button" className="icon-btn sm" onClick={onRemove} aria-label="Remove this line" title="Remove"><CloseIcon size={13} /></button>
       </div>
     </li>
@@ -267,7 +272,9 @@ function PersonEditor({ person, me, teams, onSaved, onToast }: { person: PersonV
         </div>
       ) : (
         <>
-          <p className="small">Checked from the top; the first line that fits the alert decides.</p>
+          <div className="pref-grid">
+          <div className="stack">
+          <p className="muted">Checked from the top; the first line that fits the alert decides.</p>
           <ol className="pref-lines">
             {lines.map((l, i) => (
               <PrefLine
@@ -275,15 +282,16 @@ function PersonEditor({ person, me, teams, onSaved, onToast }: { person: PersonV
                 line={l}
                 index={i}
                 count={lines.length}
+                hit={res?.via === 'preference' && res.line === i}
                 teams={teams}
                 onChange={(next) => setLines((ls) => ls.map((x, j) => (j === i ? next : x)))}
                 onMove={(d) => move(i, d)}
                 onRemove={() => setLines((ls) => ls.filter((_, j) => j !== i))}
               />
             ))}
-            <li className="pref-line pref-fallback">
-              <div className="pref-num" aria-hidden="true">{lines.length + 1}</div>
+            <li className={`pref-line pref-fallback ${res?.via === 'default' ? 'is-hit' : ''}`}>
               <div className="pref-body">
+                {res?.via === 'default' && <div className="pref-line-head"><span className="pref-hit">Matches example</span></div>}
                 <label className="check small">
                   <input type="checkbox" checked={fallback !== null} onChange={(e) => setFallback(e.target.checked ? ['ui'] : null)} />
                   Anything else
@@ -302,40 +310,43 @@ function PersonEditor({ person, me, teams, onSaved, onToast }: { person: PersonV
           <div className="inline">
             <button className="btn btn-sm" onClick={() => setLines((ls) => [...ls, { match: { severity: 'critical' }, channels: ['sms'] }])}>Add a line</button>
           </div>
+          </div>
 
           <section className="try-it" aria-label="Try these preferences">
             <h3>Try it</h3>
-            <div className="inline wrap">
-              <span className="small">A</span>
-              <select className="select" value={trySev} onChange={(e) => setTrySev(e.target.value as Severity)} aria-label="Severity">
-                {SEVERITIES.map((s) => <option key={s} value={s}>{SEVERITY_LABEL[s].toLowerCase()}</option>)}
+            <p className="muted">Pick an example alert to see which line decides and where it goes.</p>
+            <div className="try-form">
+              <label htmlFor="try-sev">Severity</label>
+              <select id="try-sev" className="select" value={trySev} onChange={(e) => setTrySev(e.target.value as Severity)}>
+                {SEVERITIES.map((s) => <option key={s} value={s}>{SEVERITY_LABEL[s]}</option>)}
               </select>
-              <span className="small">alert from</span>
-              <input className="input w-md" value={tryService} onChange={(e) => setTryService(e.target.value)} aria-label="Service" placeholder="service" />
-              <span className="small">for</span>
-              <select className="select" value={tryTeam} onChange={(e) => setTryTeam(e.target.value)} aria-label="Team">
+              <label htmlFor="try-service">Service</label>
+              <input id="try-service" className="input" value={tryService} onChange={(e) => setTryService(e.target.value)} placeholder="any service" />
+              <label htmlFor="try-team">Team</label>
+              <select id="try-team" className="select" value={tryTeam} onChange={(e) => setTryTeam(e.target.value)}>
                 {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
               </select>
-              <span className="small">at</span>
-              <input className="input" type="datetime-local" value={tryAt} onChange={(e) => setTryAt(e.target.value)} aria-label="When" />
+              <label htmlFor="try-at">At</label>
+              <input id="try-at" className="input" type="datetime-local" value={tryAt} onChange={(e) => setTryAt(e.target.value)} />
             </div>
             {res && (
-              <p className="try-result" aria-live="polite">
-                → <strong>{channelsText(res.channels)}</strong>{' '}
-                <span className="muted small">
+              <div className="try-result" aria-live="polite">
+                <p>Sent by <strong>{channelsText(res.channels)}</strong></p>
+                <p className="muted">
                   {res.via === 'preference'
-                    ? `(line ${res.line! + 1}${res.in_window === true ? ', inside its hours' : res.in_window === false ? ', outside its hours' : ''})`
+                    ? `Line ${res.line! + 1} decides${res.in_window === true ? ', inside its hours' : res.in_window === false ? ', outside its hours' : ''}.`
                     : res.via === 'default'
-                      ? '(anything else)'
+                      ? 'No line fits, so “Anything else” decides.'
                       : res.via === 'team'
-                        ? '(no line fits: the team’s default)'
-                        : '(no line fits and the team has no default: in-app only)'}
-                </span>
-                {res.problem && <span className="err-text small"> {res.problem}</span>}
-              </p>
+                        ? 'No line fits, so the team’s default channels apply.'
+                        : 'No line fits and the team has no default, so in-app only.'}
+                </p>
+                {res.problem && <p className="err-text">{res.problem}</p>}
+              </div>
             )}
             <p className="hint">Rules that name channels explicitly override this.</p>
           </section>
+          </div>
 
           {problem && <p className="problems-inline" role="alert">{problem}</p>}
           <footer className={`save-bar ${dirty ? 'is-dirty' : ''}`}>
@@ -387,7 +398,7 @@ function TeamEditor({ team, me, people, onSaved, onNavigate, onToast }: { team: 
   }
 
   return (
-    <div className="pref-editor">
+    <div className="pref-editor is-narrow">
       <div className="pref-head">
         <h2>{t.name}</h2>
         <span className="muted small">Team <code>{t.id}</code> · rules route here with <code>team:{t.id}</code></span>
@@ -427,7 +438,7 @@ function TeamEditor({ team, me, people, onSaved, onNavigate, onToast }: { team: 
         {Object.entries(t.oncall).map(([s, list]) => (
           <div key={s} className="rotation">
             <div className="inline">
-              <strong className="mono small">oncall:{s}</strong>
+              <strong>oncall:{s}</strong>
               <span className="spacer" />
               {!readOnly && <button className="btn btn-xs" onClick={() => { const { [s]: _d, ...rest } = t.oncall; setT({ ...t, oncall: rest }) }}>Remove rotation</button>}
             </div>
@@ -440,8 +451,8 @@ function TeamEditor({ team, me, people, onSaved, onNavigate, onToast }: { team: 
                   <span className="spacer" />
                   {!readOnly && (
                     <>
-                      <button className="icon-btn sm" disabled={i === 0} onClick={() => { const n = [...list]; [n[i - 1], n[i]] = [n[i]!, n[i - 1]!]; setRotation(s, n) }} aria-label="Earlier" title="Earlier">↑</button>
-                      <button className="icon-btn sm" disabled={i === list.length - 1} onClick={() => { const n = [...list]; [n[i + 1], n[i]] = [n[i]!, n[i + 1]!]; setRotation(s, n) }} aria-label="Later" title="Later">↓</button>
+                      <button className="icon-btn sm move-btn" disabled={i === 0} onClick={() => { const n = [...list]; [n[i - 1], n[i]] = [n[i]!, n[i - 1]!]; setRotation(s, n) }} aria-label="Earlier" title="Earlier"><ChevronUpIcon size={14} /></button>
+                      <button className="icon-btn sm move-btn" disabled={i === list.length - 1} onClick={() => { const n = [...list]; [n[i + 1], n[i]] = [n[i]!, n[i + 1]!]; setRotation(s, n) }} aria-label="Later" title="Later"><ChevronDownIcon size={14} /></button>
                       <button className="icon-btn sm" onClick={() => setRotation(s, list.filter((x) => x !== u))} aria-label={`Take ${name(u)} off the rotation`} title="Remove"><CloseIcon size={13} /></button>
                     </>
                   )}

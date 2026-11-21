@@ -95,7 +95,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
       const forbidden = hasForbiddenKey(spec)
       if (forbidden) throw new Error(`Forbidden key "${forbidden}" in mapping YAML.`)
       if (save) {
-        const saved = await saveSchemaMapping(spec, mapping.saved?.revision)
+        const saved = await saveSchemaMapping(spec, mapping.saved && { schema: mapping.saved.spec.schema, revision: mapping.saved.revision })
         editMapping(saved)
         await load()
         setFeedback({ kind: 'ok', text: `Saved ${saved.spec.schema} revision ${saved.revision}.` })
@@ -135,13 +135,13 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
             {data.sources.length ? (
               <div className="feature-table-wrap">
                 <table className="table table-static">
-                  <thead><tr><th scope="col">Source</th><th scope="col">Transport</th><th scope="col">Last received</th><th scope="col" className="num">Events in 24 h</th></tr></thead>
+                  <thead><tr><th scope="col">Source</th><th scope="col">Events in 24 h</th><th scope="col">Transport</th><th scope="col">Last received</th></tr></thead>
                   <tbody>{data.sources.map((source) => (
                     <tr key={source.id}>
-                      <td><span className="mono">{source.id}</span>{source.topics?.length ? <div className="muted small">{source.topics.join(', ')}</div> : null}</td>
+                      <td>{source.id}{source.topics?.length ? <div className="muted small">{source.topics.join(', ')}</div> : null}</td>
+                      <td className="tabular">{source.events_24h ? source.events_24h.toLocaleString() : <span className="muted">0</span>}</td>
                       <td><span className={`source-kind ${source.last_seen ? 'is-live' : ''}`}>{source.kind === 'http' ? 'Webhook' : source.kind === 'kafka' ? 'Kafka' : 'Log file'}</span></td>
                       <td className={source.last_seen ? '' : 'muted'}>{source.last_seen ? absTime(source.last_seen) : 'No events yet'}</td>
-                      <td className="num">{source.events_24h ? source.events_24h.toLocaleString() : <span className="muted">0</span>}</td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -240,7 +240,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
               <ul className="feature-items">
                 {data.mappings.map((entry) => (
                   <li key={entry.spec.schema}>
-                    <span className="grow mono">{entry.spec.schema}</span>
+                    <span className="grow">{entry.spec.schema}</span>
                     <span className="muted small">Revision {entry.revision}</span>
                     <button className="btn btn-sm" disabled={busy} onClick={() => editMapping(entry)}>Edit</button>
                   </li>

@@ -380,6 +380,7 @@ paths:
               properties:
                 spec: { $ref: '#/components/schemas/SchemaSpec' }
                 expected_revision: { type: integer, description: Omit for a new mapping }
+                schema: { type: string, description: "Name of the mapping being edited; required with expected_revision, and must equal spec.schema (mappings can't be renamed)" }
       responses:
         '200': { $ref: '#/components/responses/SchemaMapping' }
         '201': { $ref: '#/components/responses/SchemaMapping' }
@@ -652,6 +653,7 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
   /api/proposals/count:
     get:
       operationId: countPendingProposals

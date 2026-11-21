@@ -45,26 +45,38 @@ export function RuleDiff({ before, after }: { before: string; after: string }) {
 }
 
 export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Props) {
-  const [items, setItems] = useState<Proposal[] | null>(null)
+  // Waiting is its own query: the full list is only the newest page, so
+  // older pending proposals would drop out if it were filtered here.
+  const [lists, setLists] = useState<{ pending: Proposal[]; all: Proposal[] } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [show, setShow] = useState<'pending' | 'all'>('pending')
   const [busy, setBusy] = useState<string | null>(null)
 
-  const load = () => listProposals(team).then(setItems, (e: unknown) => setError(errorText(e)))
+  // Each list renders on its own: a failed All request must not hide the queue.
+  const load = () => Promise.allSettled([listProposals(team, 'pending'), listProposals(team)]).then(([pending, all]) => {
+    const failed = [pending, all].find((r) => r.status === 'rejected')
+    setError(failed ? errorText(failed.reason) : null)
+    if (pending.status === 'fulfilled' || all.status === 'fulfilled')
+      setLists({ pending: pending.status === 'fulfilled' ? pending.value : [], all: all.status === 'fulfilled' ? all.value : [] })
+  })
   useEffect(() => {
-    setItems(null)
+    setLists(null)
     setError(null)
     void load()
   }, [team])
+  const items = lists && (show === 'all' ? lists.all : lists.pending)
 
   useEffect(() => {
     if (!id || !items) return
     document.getElementById(`proposal-${id}`)?.scrollIntoView({ block: 'start' })
   }, [id, items])
 
-  const scoped = items ?? []
-  const shown = scoped.filter((p) => show === 'all' || p.state === 'pending' || p.id === id)
-  const pending = scoped.filter((p) => p.state === 'pending').length
+  // A deep link to a decided proposal still shows it on the Waiting tab.
+  const target = show === 'pending' && id && !lists?.pending.some((p) => p.id === id)
+    ? lists?.all.find((p) => p.id === id)
+    : undefined
+  const shown = [...(items ?? []), ...(target ? [target] : [])]
+  const pending = lists?.pending.length ?? 0
 
   const decide = async (p: Proposal, op: 'accept' | 'reject') => {
     setBusy(p.id)
@@ -90,7 +102,7 @@ export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Pr
         <span className="spacer" />
         <div className="chips" role="group" aria-label="Show">
           <button className="chip" aria-pressed={show === 'pending'} onClick={() => setShow('pending')}>Waiting <span className="chip-n">{pending}</span></button>
-          <button className="chip" aria-pressed={show === 'all'} onClick={() => setShow('all')}>All <span className="chip-n">{scoped.length}</span></button>
+          <button className="chip" aria-pressed={show === 'all'} onClick={() => setShow('all')}>All <span className="chip-n">{lists?.all.length ?? 0}</span></button>
         </div>
       </header>
       {error && <div className="notice notice-error banner">Couldn’t load proposals: {error}</div>}
@@ -124,7 +136,7 @@ export function ProposalsScreen({ id, team, onNavigate, onToast, onChanged }: Pr
               <div className="inline end">
                 {p.can_review === false ? (
                   <>
-                    <span className="small muted">Only members of the owning team can review this proposal.</span>
+                    <span className="small muted">Someone else on the owning team has to review this proposal.</span>
                     <span className="spacer" />
                     <button className="btn" onClick={() => onNavigate(`#/rules/${encodeURIComponent(p.rule_id)}`)}>Open rule</button>
                   </>
