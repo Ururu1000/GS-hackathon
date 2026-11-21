@@ -6,12 +6,19 @@
 //! API's PUTs write one override row per id, the first save at revision 2, each later
 //! save `+1` (compare-and-set on `expected_revision`, see `api`). A person row's `body`
 //! is `{"preferences": [...]}`; a team row's `body` is the full effective team after the
-//! save (`{"members", "lead", "oncall", "default_channels"}`).
+//! save (`{"members", "lead", "oncall", "default_channels"}`). The API's POSTs also
+//! CREATE ids the YAML base does not have (`POST /api/people`, `POST /api/teams`,
+//! admin-only): one row at revision 1 whose body says `"created": true` — a created
+//! person's body carries the whole person (`{"name", "contact", "preferences"}`), a
+//! created team's is the full team body plus `"created"` — so the row alone rebuilds
+//! the object. The person PUT preserves those keys when it rewrites the preferences.
 //!
 //! [`apply`] replaces the overridden fields and rebuilds the whole directory with
 //! `Directory::from_parts`, so a saved edit goes through exactly the parsing and
-//! cross-reference validation a YAML import does (SPEC §4.6: one validator). Overrides
-//! naming ids that are no longer in the base are ignored with a warning.
+//! cross-reference validation a YAML import does (SPEC §4.6: one validator). An override
+//! for an id the base does not have is a runtime creation when its body says
+//! `"created": true` — it becomes a whole new person or team; any other such override
+//! (its id left the YAML) is ignored with a warning.
 //!
 //! [`EffectiveDirectory`] caches the applied view and rebuilds it only when the table's
 //! `(count, sum(revision))` stamp moves — one cheap query per pass, the pattern the
@@ -29,7 +36,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{error, warn};
 
-use crate::config::{ConfigError, Directory, Person, Team};
+use crate::config::{ConfigError, Contact, Directory, Person, Team};
 
 /// `directory_overrides.kind` for a person row.
 pub const KIND_PERSON: &str = "person";
@@ -38,14 +45,17 @@ pub const KIND_TEAM: &str = "team";
 /// `directory_overrides.kind` for a runbook imported at runtime (`POST /api/runbooks`).
 pub const KIND_RUNBOOK: &str = "runbook";
 
-/// One saved person edit: the raw `{"preferences": [...]}` body plus its revision.
+/// One saved person row: an edit's body is `{"preferences": [...]}`; a row written by
+/// `POST /api/people` (revision 1) is the whole person, `{"created": true, "name",
+/// "contact", "preferences"}`.
 #[derive(Debug, Clone)]
 pub struct PersonOverride {
     pub body: Value,
     pub revision: i64,
 }
 
-/// One saved team edit: the full effective team body plus its revision.
+/// One saved team row: the full effective team body an edit writes, plus `"created":
+/// true` on a row `POST /api/teams` wrote.
 #[derive(Debug, Clone)]
 pub struct TeamOverride {
     pub body: Value,
@@ -106,21 +116,13 @@ pub fn revision_of(ov: &Overrides, kind: &str, id: &str) -> i64 {
 /// The base directory with every override applied: a person's raw `preferences` and a
 /// team's members / lead / on-call / default channels are replaced from the override
 /// bodies, then the whole directory is rebuilt with `Directory::from_parts` — the same
-/// parsing and validation a YAML import goes through. `delivery`, `rules` and `runbooks`
-/// are carried over from the base unchanged. Overrides for ids missing from the base
-/// (removed from the YAML) are ignored with a warning.
+/// parsing and validation a YAML import goes through. An override with `"created": true`
+/// in its body for an id the base does not have is a person/team CREATED at runtime
+/// (`POST /api/people`, `POST /api/teams`): it is built from the body and joined to the
+/// lists, people before teams so a created team may name a created person. Other
+/// overrides for ids missing from the base (removed from the YAML) are ignored with a
+/// warning. `delivery`, `rules` and `runbooks` are carried over from the base unchanged.
 pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError> {
-    for id in ov.people.keys() {
-        if !base.people.contains_key(id) {
-            warn!(person = %id, "override for a person not in the base directory, ignoring");
-        }
-    }
-    for id in ov.teams.keys() {
-        if !base.teams.contains_key(id) {
-            warn!(team = %id, "override for a team not in the base directory, ignoring");
-        }
-    }
-
     let mut people: Vec<Person> = base.people.values().cloned().collect();
     for p in &mut people {
         let Some(o) = ov.people.get(&p.id) else {
@@ -131,6 +133,19 @@ pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError>
             p.preferences = Some(preferences.clone());
         }
     }
+    // People created at runtime: the body IS the person (name, contact, preferences).
+    // They join before the teams below, so a created team may name one of them; any
+    // other override for an unknown id is a save whose person left the YAML: ignored.
+    for (id, o) in &ov.people {
+        if base.people.contains_key(id) {
+            continue;
+        }
+        if is_created(&o.body) {
+            people.push(created_person(id, &o.body));
+        } else {
+            warn!(person = %id, "override for a person not in the base directory, ignoring");
+        }
+    }
 
     let mut teams: Vec<Team> = base.teams.values().cloned().collect();
     for t in &mut teams {
@@ -138,6 +153,17 @@ pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError>
             continue;
         };
         apply_team_body(t, &o.body);
+    }
+    // Teams created at runtime, same rule as the people above.
+    for (id, o) in &ov.teams {
+        if base.teams.contains_key(id) {
+            continue;
+        }
+        if is_created(&o.body) {
+            teams.push(created_team(id, &o.body));
+        } else {
+            warn!(team = %id, "override for a team not in the base directory, ignoring");
+        }
     }
 
     let mut dir = Directory::from_parts(people, teams)?;
@@ -202,11 +228,55 @@ fn apply_team_body(t: &mut Team, body: &Value) {
     }
 }
 
+/// Whether an override body is a runtime creation (`POST /api/people`, `POST /api/teams`)
+/// rather than an edit of an id the YAML base already has.
+fn is_created(body: &Value) -> bool {
+    body.get("created").and_then(Value::as_bool) == Some(true)
+}
+
+/// The [`Person`] a created row's body builds: `{"created": true, "name", "contact":
+/// {"email","phone"}, "preferences"}`. Missing keys mean `None`; `from_parts` parses the
+/// preferences into rules exactly like a YAML import.
+fn created_person(id: &str, body: &Value) -> Person {
+    let contact = body.get("contact");
+    Person {
+        id: id.to_string(),
+        name: body.get("name").and_then(Value::as_str).map(str::to_string),
+        contact: Contact {
+            email: contact
+                .and_then(|c| c.get("email"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            phone: contact
+                .and_then(|c| c.get("phone"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+        preferences: body.get("preferences").cloned(),
+        rules: Vec::new(),
+    }
+}
+
+/// The [`Team`] a created row's body builds — the same body shape a team save stores,
+/// plus `"created": true` — so both paths read one shape through [`apply_team_body`].
+fn created_team(id: &str, body: &Value) -> Team {
+    let mut t = Team {
+        id: id.to_string(),
+        members: Vec::new(),
+        lead: None,
+        oncall: HashMap::new(),
+        default_channels: None,
+    };
+    apply_team_body(&mut t, body);
+    t
+}
+
 /// [`apply`], but one override that no longer validates (say a team naming a person since
-/// removed from the YAML) drops only itself, with a warning, instead of the whole set.
-/// Returns the directory and the overrides that were applied. If the whole set applies
-/// this is exactly [`apply`]; otherwise overrides are tried one at a time in a fixed
-/// order (people, then teams, each by id) and kept only if the set so far still applies.
+/// removed from the YAML, or a created row whose stored body went bad) drops only
+/// itself, with a warning, instead of the whole set. Returns the directory and the
+/// overrides that were applied. If the whole set applies this is exactly [`apply`];
+/// otherwise overrides are tried one at a time in a fixed order (people, then teams,
+/// each by id — created rows included) and kept only if the set so far still applies.
 pub fn apply_lenient(base: &Directory, ov: &Overrides) -> (Directory, Overrides) {
     if let Ok(dir) = apply(base, ov) {
         return (dir, ov.clone());
@@ -497,6 +567,119 @@ mod tests {
         assert!(!d.people.contains_key("ghost"));
         assert!(!d.teams.contains_key("ghost-team"));
         assert!(d.person("bob").unwrap().rules.is_empty());
+    }
+
+    #[test]
+    fn created_overrides_become_people_and_teams() {
+        let mut ov = Overrides::default();
+        ov.people.insert(
+            "newbie".into(),
+            PersonOverride {
+                body: json!({
+                    "created": true,
+                    "name": "New Bee",
+                    "contact": { "email": "newbie@example.test", "phone": "+44 7700 900777" },
+                    "preferences": [{ "default": ["sms"] }],
+                }),
+                revision: 1,
+            },
+        );
+        // A created team may name the created person as member, lead and on-call.
+        ov.teams.insert(
+            "newteam".into(),
+            TeamOverride {
+                body: json!({
+                    "created": true,
+                    "members": ["newbie", "bob"],
+                    "lead": "newbie",
+                    "oncall": { "newteam-primary": ["newbie"] },
+                    "default_channels": ["email"],
+                }),
+                revision: 1,
+            },
+        );
+        let d = apply(&base(), &ov).expect("created rows apply");
+        let newbie = d.person("newbie").expect("newbie is in the directory");
+        assert_eq!(newbie.name.as_deref(), Some("New Bee"));
+        assert_eq!(newbie.contact.email.as_deref(), Some("newbie@example.test"));
+        assert_eq!(newbie.contact.phone.as_deref(), Some("+44 7700 900777"));
+        assert_eq!(
+            newbie.rules.len(),
+            1,
+            "preferences parsed like a YAML import"
+        );
+        let newteam = &d.teams["newteam"];
+        assert_eq!(newteam.members, ["newbie", "bob"]);
+        assert_eq!(newteam.lead.as_deref(), Some("newbie"));
+        assert_eq!(newteam.default_channels, Some(vec!["email".to_string()]));
+        assert_eq!(d.expand("oncall:newteam-primary").unwrap().len(), 1);
+        // The base is untouched.
+        assert_eq!(d.people.len(), 4);
+        assert_eq!(d.teams.len(), 3);
+    }
+
+    #[test]
+    fn a_created_team_naming_an_unknown_person_fails_validation() {
+        let mut ov = Overrides::default();
+        ov.teams.insert(
+            "newteam".into(),
+            TeamOverride {
+                body: json!({
+                    "created": true,
+                    "members": ["ghost"],
+                    "lead": null,
+                    "oncall": {},
+                    "default_channels": ["email"],
+                }),
+                revision: 1,
+            },
+        );
+        let err = apply(&base(), &ov).expect_err("unknown member must not apply");
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn a_created_row_that_goes_bad_drops_alone_in_lenient_apply() {
+        let mut ov = Overrides::default();
+        // newbie was created, but her stored preferences have since gone bad.
+        ov.people.insert(
+            "newbie".into(),
+            PersonOverride {
+                body: json!({
+                    "created": true,
+                    "name": null,
+                    "contact": { "email": "newbie@example.test" },
+                    "preferences": [{ "default": ["fax"] }],
+                }),
+                revision: 2,
+            },
+        );
+        // A valid save for a base person, and a created team naming only base people.
+        insert_person(&mut ov, "bob", json!([{ "default": ["sms"] }]));
+        ov.teams.insert(
+            "newteam".into(),
+            TeamOverride {
+                body: json!({
+                    "created": true,
+                    "members": ["bob"],
+                    "lead": "bob",
+                    "oncall": {},
+                    "default_channels": ["email"],
+                }),
+                revision: 1,
+            },
+        );
+        assert!(
+            apply(&base(), &ov).is_err(),
+            "the strict validator rejects the set"
+        );
+        let (dir, applied) = apply_lenient(&base(), &ov);
+        assert!(!dir.people.contains_key("newbie"), "the bad row drops");
+        assert!(!applied.people.contains_key("newbie"));
+        assert!(applied.people.contains_key("bob"));
+        assert!(applied.teams.contains_key("newteam"));
+        assert!(dir.teams.contains_key("newteam"));
+        assert!(dir.person("bob").unwrap().preferences.is_some());
     }
 
     #[test]

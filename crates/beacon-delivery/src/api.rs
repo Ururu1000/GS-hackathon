@@ -15,6 +15,8 @@
 //! | `GET /api/teams` | `200 {items}` of `TeamView` | `401 unauthorized` |
 //! | `PUT /api/people/{personId}/preferences` `{preferences, expected_revision}` | `200 PersonView` (revision = the new one) | `401 unauthorized`; `403 forbidden` (not that person or an admin); `404 not_found`; `409 revision_conflict` (+`error.current`); `415`; `422 invalid` (preferences fail the YAML validation); `400 bad_request` (malformed body / non-integer `expected_revision`) |
 //! | `PUT /api/teams/{teamId}` `{members?, lead?, oncall?, default_channels?, expected_revision}` | `200 TeamView` | `401`; `403 forbidden` (not the team's current lead or an admin); `404`; `409 revision_conflict` (+`error.current`); `415`; `422 invalid` (members/lead/on-call name unknown people, unknown channel); `400` |
+//! | `POST /api/people` `{id, name?, contact: {email?, phone?}, preferences?}` | `201 PersonView` (revision 1) | `401 unauthorized`; `403 forbidden` (not an admin — creation is admin-only); `415`; `400 bad_request` (malformed body); `422 invalid` (bad id, neither email nor phone, preferences fail the YAML validation); `409 revision_conflict` (the id exists in the base or the overrides table — no `current`, a taken id is not retried at another revision) |
+//! | `POST /api/teams` `{id, members, lead?, oncall?, default_channels?}` | `201 TeamView` (revision 1) | `401`; `403 forbidden` (not an admin); `415`; `400`; `422 invalid` (bad id, bad shape, members/lead/on-call name unknown people, unknown channel, empty `default_channels`); `409 revision_conflict` (the id exists) |
 //! | `POST /api/replies` `{from, text}` (fake-gateway callback: `X-Beacon-Timestamp: <unix seconds>` within ±300 s of now, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, "<timestamp>." + raw_body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`, the alert of the newest sms/phone job `sent` to the number), `already_decided` (a repeated decision, or a repeated `ACK` whose newest sent page was already acked — it never advances to an older open alert), `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (missing/old/future timestamp, bad/missing signature) |
 //!
 //! Auth: beacon-api's session/CSRF middleware inserts `Extension(Actor("user:<id>"))` before
@@ -45,14 +47,24 @@
 //! that person and a team's is being its lead. The same widening authorizes the two PUTs:
 //! preferences are self-or-admin, a team is its-current-lead-or-admin (the CURRENT lead as
 //! the effective directory has it, which prevents self-promotion by a plain member).
+//! The two `POST`s CREATE ids the YAML base does not have — admin-ONLY (a missing or
+//! false `Admin` is a 403, unlike the self/lead rules above): one `directory_overrides`
+//! row at revision 1 whose body says `"created": true` and holds the whole object (a
+//! created person's name and contact included, so the preferences PUT can keep them
+//! when it rewrites the row; a created team's body is the full team plus `"created"`).
+//! The duplicate guard is the base directory plus the insert (`ON CONFLICT DO
+//! NOTHING`), so an id anyone already has — base, saved or created — is a
+//! `409 revision_conflict`; editing a created id then goes through the same PUTs, its
+//! row's revision (1 after creation) first.
 //! Every POST and PUT must say `Content-Type: application/json` (`415 unsupported_media_type`
 //! otherwise — media type only, and even when the body is empty: an empty body WITH the
 //! JSON content type is still accepted wherever the contract allows no body) — a
 //! cross-site `<form>` can neither send the header nor smuggle an empty body past it.
 //! Errors are `{error: {code, message, approval_id?, current?}}`; 500s are `internal` with
 //! details only in logs. Every mutation writes `audit_log` and bumps the alert version
-//! (`AlertOps::touch`) — the two config PUTs write `audit_log` too (actions
-//! `person.preferences_updated` / `team.updated`) but touch no alert.
+//! (`AlertOps::touch`) — the four config writes write `audit_log` too (actions
+//! `person.preferences_updated` / `team.updated`, and `person.created` / `team.created`
+//! for the POSTs) but touch no alert.
 //!
 //! `{expected_version?}` on the run route is accepted (shape-checked: an integer or null) but
 //! not enforced — the route table above lists no version-conflict error for it. The config
@@ -289,8 +301,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/runbooks", get(runbooks_handler))
         .route("/api/runbooks/{runbook_id}", get(runbook_detail_handler))
         .route("/api/people/directory", get(directory_handler))
-        .route("/api/people", get(people_handler))
-        .route("/api/teams", get(teams_handler))
+        .route(
+            "/api/people",
+            get(people_handler).post(create_person_handler),
+        )
+        .route("/api/teams", get(teams_handler).post(create_team_handler))
         .route(
             "/api/people/{personId}/preferences",
             put(save_preferences_handler),
@@ -1243,10 +1258,11 @@ async fn teams_handler(
 // ---------------------------------------------------------------------------------------------
 
 /// The compare-and-set write for one override row, in ONE statement. The insert is
-/// attempted only when it could possibly win: `expected_revision == 1` (the YAML
-/// base — the insert then writes revision 2 and `ON CONFLICT` makes it fail against a
-/// row that already exists, since the stored revision is always >= 2), or a row
-/// already at the expected revision (the `EXISTS` guard). Attempting the insert is what
+/// attempted only when it could possibly win: `expected_revision == 1` (the YAML base,
+/// or an id CREATED at runtime whose row also sits at revision 1 — the insert then
+/// writes revision 2, and `ON CONFLICT` fails it against a YAML-base row, whose stored
+/// revision is always >= 2, but UPDATES a created row at revision 1), or a row already
+/// at the expected revision (the `EXISTS` guard). Attempting the insert is what
 /// makes the `DO UPDATE` branch fire; its `WHERE directory_overrides.revision = $4`
 /// then requires the CURRENT revision to match. Zero rows returned means the expected
 /// revision was stale -> 409.
@@ -1347,7 +1363,17 @@ async fn save_preferences_handler(
     // over the base through the one YAML validator. A bad `preferences` value (not a
     // list, unknown channel, bad window, ...) is a 422 naming the person. Validating on
     // top of the APPLIED set means another stale override cannot block this save.
-    let stored = json!({ "preferences": preferences });
+    // A row created by `POST /api/people` is the whole person — name and contact
+    // included — so a preferences save must carry those keys over or the next rebuild
+    // would lose them (only the preferences are rewritten).
+    let mut stored = json!({ "preferences": preferences });
+    if let Some(existing) = snap.overrides.people.get(&person_raw) {
+        for key in ["created", "name", "contact"] {
+            if let Some(value) = existing.body.get(key) {
+                stored[key] = value.clone();
+            }
+        }
+    }
     let mut candidate = (*snap.applied).clone();
     candidate.people.insert(
         person_raw.clone(),
@@ -1474,13 +1500,20 @@ async fn save_team_handler(
     }
 
     // The full effective team after the save is what gets stored and re-applied; a body
-    // naming unknown people or channels is a 422 from the shared validator.
-    let stored = json!({
+    // naming unknown people or channels is a 422 from the shared validator. A team
+    // created by `POST /api/teams` must keep its marker: `"created": true` is what
+    // makes the row rebuild a team the YAML base does not have.
+    let mut stored = json!({
         "members": new_team.members,
         "lead": new_team.lead,
         "oncall": new_team.oncall,
         "default_channels": new_team.default_channels.clone().unwrap_or_default(),
     });
+    if let Some(existing) = snap.overrides.teams.get(&team_raw)
+        && let Some(created) = existing.body.get("created")
+    {
+        stored["created"] = created.clone();
+    }
     let mut candidate = (*snap.applied).clone();
     candidate.teams.insert(
         team_raw.clone(),
@@ -1537,6 +1570,275 @@ async fn save_team_handler(
         .ok_or_else(|| ApiError::internal("the candidate directory lost the team"))?;
     let view = team_view(&candidate, team, me, is_admin);
     Ok((StatusCode::OK, Json(view)).into_response())
+}
+
+// ---------------------------------------------------------------------------------------------
+// POST /api/people, POST /api/teams (admin-only creation)
+// ---------------------------------------------------------------------------------------------
+
+/// Whether a new person/team id is well-formed: one lowercase letter or digit, then up
+/// to 63 more of `[a-z0-9_-]` (the shape of the YAML file names and route segments the
+/// config already uses). Anything else is a `422 invalid`.
+fn new_id_ok(id: &str) -> bool {
+    let mut chars = id.chars();
+    let first = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
+    first
+        && id.chars().count() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// The body's `id` for a create: required, well-formed (else `422 invalid`).
+fn new_id(body: &Value) -> Result<String, ApiError> {
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| new_id_ok(id))
+        .ok_or_else(|| invalid("id is required and must match [a-z0-9][a-z0-9_-]{0,63}"))?;
+    Ok(id.to_string())
+}
+
+/// The create write, in ONE statement: revision 1, `ON CONFLICT DO NOTHING` so a
+/// concurrent create for the same id loses nothing — `false` = the id already had a row
+/// (-> 409). (The base itself is checked in code: a YAML id has no row to conflict with.)
+const CREATE_OVERRIDE_SQL: &str = "\
+    INSERT INTO directory_overrides (kind, id, body, revision, updated_by) \
+    VALUES ($1, $2, $3, 1, $4) \
+    ON CONFLICT (kind, id) DO NOTHING \
+    RETURNING revision";
+
+/// Run [`CREATE_OVERRIDE_SQL`]; `false` = the id already exists (-> 409).
+async fn create_override(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &str,
+    id: &str,
+    body: &Value,
+    actor: &str,
+) -> Result<bool, sqlx::Error> {
+    let inserted: Option<i64> = sqlx::query_scalar(CREATE_OVERRIDE_SQL)
+        .bind(kind)
+        .bind(id)
+        .bind(body)
+        .bind(actor)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(inserted.is_some())
+}
+
+/// `POST /api/people` `{id, name?, contact: {email?, phone?}, preferences?}` (runtime
+/// creation): admin only. The row lands in `directory_overrides` at revision 1 with
+/// `"created": true` and the whole person in its body — name and contact included, so
+/// the row alone rebuilds her and the preferences PUT can preserve them. The candidate
+/// directory is validated through the one YAML validator first (a bad `preferences`
+/// value is a 422 naming the person); an id the base or the table already has is a
+/// `409 revision_conflict` (the insert is the race-safe second check). `201` answers
+/// with the new `PersonView` as the actor sees it.
+async fn create_person_handler(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(effective): axum::Extension<Arc<overrides::EffectiveDirectory>>,
+    actor: Option<axum::Extension<Actor>>,
+    admin: Option<axum::Extension<Admin>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let Some(axum::Extension(Actor(actor))) = actor else {
+        return Err(unauthorized());
+    };
+    require_json_body(&headers)?;
+    let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
+    let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
+    if !is_admin {
+        return Err(forbidden("only an admin may create people"));
+    }
+
+    let body = parse_body(&body)?;
+    let id = new_id(&body)?;
+
+    let name = match body.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(invalid("name must be a string or null")),
+    };
+    // A person nobody can reach is useless: at least one address is required.
+    let contact = body.get("contact").cloned().unwrap_or(Value::Null);
+    if !matches!(contact, Value::Object(_) | Value::Null) {
+        return Err(invalid("contact must be an object"));
+    }
+    let address = |key: &str| -> Result<Option<String>, ApiError> {
+        match contact.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(invalid(format!("contact.{key} must be a string or null"))),
+        }
+    };
+    let email = address("email")?;
+    let phone = address("phone")?;
+    if email.is_none() && phone.is_none() {
+        return Err(invalid(
+            "a person needs at least one of contact.email or contact.phone",
+        ));
+    }
+    let preferences = body.get("preferences").cloned().unwrap_or(Value::Null);
+
+    let stored = json!({
+        "created": true,
+        "name": name,
+        "contact": { "email": email, "phone": phone },
+        "preferences": preferences,
+    });
+
+    let snap = effective.snapshot(&state.pool).await;
+    if state.dir.people.contains_key(&id) || snap.overrides.people.contains_key(&id) {
+        return Err(revision_conflict(format!("person {id} already exists")));
+    }
+    let mut candidate = (*snap.applied).clone();
+    candidate.people.insert(
+        id.clone(),
+        overrides::PersonOverride {
+            body: stored.clone(),
+            // The revision the row this create writes (and the response view reads).
+            revision: 1,
+        },
+    );
+    let new_dir = overrides::apply(&state.dir, &candidate).map_err(|e| invalid(e.to_string()))?;
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let created = create_override(&mut tx, overrides::KIND_PERSON, &id, &stored, &actor)
+        .await
+        .map_err(ApiError::internal)?;
+    if !created {
+        let _ = tx.rollback().await;
+        // A concurrent create won the race for this id.
+        return Err(revision_conflict(format!("person {id} already exists")));
+    }
+    audit::record(
+        &mut tx,
+        &actor,
+        "ui",
+        None,
+        "person.created",
+        &format!("created person {id} (revision 1)"),
+        json!({ "person_id": id }),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    let person = new_dir
+        .people
+        .get(&id)
+        .ok_or_else(|| ApiError::internal("the candidate directory lost the person"))?;
+    let view = person_view(&new_dir, &candidate, person, me, is_admin);
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// `POST /api/teams` `{id, members, lead?, oncall?, default_channels?}` (runtime
+/// creation): admin only, same checks as the person create. The stored body is the full
+/// team body a save writes plus `"created": true`, at revision 1; members, lead and
+/// on-call may name base OR created people — the one YAML validator rejects anyone
+/// else with a 422. `201` answers with the new `TeamView`.
+async fn create_team_handler(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(effective): axum::Extension<Arc<overrides::EffectiveDirectory>>,
+    actor: Option<axum::Extension<Actor>>,
+    admin: Option<axum::Extension<Admin>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let Some(axum::Extension(Actor(actor))) = actor else {
+        return Err(unauthorized());
+    };
+    require_json_body(&headers)?;
+    let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
+    let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
+    if !is_admin {
+        return Err(forbidden("only an admin may create teams"));
+    }
+
+    let body = parse_body(&body)?;
+    let id = new_id(&body)?;
+
+    // Members are required; the people they (and the lead / on-call) name are checked
+    // by the shared validator below, so a created team may name a created person.
+    let members = string_list(
+        body.get("members")
+            .ok_or_else(|| invalid("members must be an array of person ids"))?,
+        "members",
+    )?;
+    let lead = match body.get("lead") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(lead)) => Some(lead.clone()),
+        Some(_) => return Err(invalid("lead must be a person id or null")),
+    };
+    let mut oncall: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(rotations) = body.get("oncall") {
+        let rotations = rotations
+            .as_object()
+            .ok_or_else(|| invalid("oncall must be an object"))?;
+        for (schedule, rotation) in rotations {
+            oncall.insert(schedule.clone(), string_list(rotation, "oncall rotation")?);
+        }
+    }
+    let default_channels = match body.get("default_channels") {
+        None => None,
+        Some(list) => {
+            let list = string_list(list, "default_channels")?;
+            // Same rule as the YAML loader: an explicit default must name a channel.
+            if list.is_empty() {
+                return Err(invalid("default_channels must not be empty"));
+            }
+            Some(list)
+        }
+    };
+
+    let stored = json!({
+        "created": true,
+        "members": members,
+        "lead": lead,
+        "oncall": oncall,
+        "default_channels": default_channels.clone().unwrap_or_default(),
+    });
+
+    let snap = effective.snapshot(&state.pool).await;
+    if state.dir.teams.contains_key(&id) || snap.overrides.teams.contains_key(&id) {
+        return Err(revision_conflict(format!("team {id} already exists")));
+    }
+    let mut candidate = (*snap.applied).clone();
+    candidate.teams.insert(
+        id.clone(),
+        overrides::TeamOverride {
+            body: stored.clone(),
+            revision: 1,
+        },
+    );
+    let new_dir = overrides::apply(&state.dir, &candidate).map_err(|e| invalid(e.to_string()))?;
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let created = create_override(&mut tx, overrides::KIND_TEAM, &id, &stored, &actor)
+        .await
+        .map_err(ApiError::internal)?;
+    if !created {
+        let _ = tx.rollback().await;
+        return Err(revision_conflict(format!("team {id} already exists")));
+    }
+    audit::record(
+        &mut tx,
+        &actor,
+        "ui",
+        None,
+        "team.created",
+        &format!("created team {id} (revision 1)"),
+        json!({ "team_id": id }),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    let team = new_dir
+        .teams
+        .get(&id)
+        .ok_or_else(|| ApiError::internal("the candidate directory lost the team"))?;
+    let view = team_view(&candidate, team, me, is_admin);
+    Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
 // ---------------------------------------------------------------------------------------------
