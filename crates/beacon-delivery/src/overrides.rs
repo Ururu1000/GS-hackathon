@@ -35,6 +35,8 @@ use crate::config::{ConfigError, Directory, Person, Team};
 pub const KIND_PERSON: &str = "person";
 /// `directory_overrides.kind` for a team row.
 pub const KIND_TEAM: &str = "team";
+/// `directory_overrides.kind` for a runbook imported at runtime (`POST /api/runbooks`).
+pub const KIND_RUNBOOK: &str = "runbook";
 
 /// One saved person edit: the raw `{"preferences": [...]}` body plus its revision.
 #[derive(Debug, Clone)]
@@ -50,12 +52,21 @@ pub struct TeamOverride {
     pub revision: i64,
 }
 
+/// One runbook imported at runtime: the stored body plus its revision. The body shape and
+/// how it becomes a [`crate::runbook::Runbook`] are owned by [`apply_runbooks`].
+#[derive(Debug, Clone)]
+pub struct RunbookOverride {
+    pub body: Value,
+    pub revision: i64,
+}
+
 /// Every `directory_overrides` row, split by kind (the table is small; it is loaded
 /// whole whenever its stamp moved).
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub people: HashMap<String, PersonOverride>,
     pub teams: HashMap<String, TeamOverride>,
+    pub runbooks: HashMap<String, RunbookOverride>,
 }
 
 /// Every override row.
@@ -73,6 +84,9 @@ pub async fn load(pool: &PgPool) -> Result<Overrides, sqlx::Error> {
             KIND_TEAM => {
                 ov.teams.insert(id, TeamOverride { body, revision });
             }
+            KIND_RUNBOOK => {
+                ov.runbooks.insert(id, RunbookOverride { body, revision });
+            }
             other => warn!(kind = other, "unknown directory_overrides kind, ignoring"),
         }
     }
@@ -84,6 +98,7 @@ pub fn revision_of(ov: &Overrides, kind: &str, id: &str) -> i64 {
     match kind {
         KIND_PERSON => ov.people.get(id).map_or(1, |o| o.revision),
         KIND_TEAM => ov.teams.get(id).map_or(1, |o| o.revision),
+        KIND_RUNBOOK => ov.runbooks.get(id).map_or(1, |o| o.revision),
         _ => 1,
     }
 }
@@ -129,7 +144,19 @@ pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError>
     dir.delivery = base.delivery.clone();
     dir.rules = base.rules.clone();
     dir.runbooks = base.runbooks.clone();
+    apply_runbooks(&mut dir, &ov.runbooks)?;
     Ok(dir)
+}
+
+/// Add the runbooks imported at runtime to `dir.runbooks` (runtime runbook import).
+/// Placeholder: the import task fills this in (parse each body through the same
+/// validator `config/runbooks` files go through; an id that exists in the YAML base is
+/// an error). Until then imported rows are ignored.
+pub fn apply_runbooks(
+    _dir: &mut Directory,
+    _runbooks: &HashMap<String, RunbookOverride>,
+) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 /// Replace a team's fields from a saved body. Bodies the API writes carry every key; a
