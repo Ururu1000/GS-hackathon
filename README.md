@@ -143,9 +143,18 @@ Email alone sustained ~47–163 messages/s into Mailpit (1,000 emails over 8 wor
 
 ## Architecture
 
+**Sources.** HTTP webhooks need no config. Other sources are YAML files in `config/sources/`:
+- `type: kafka`: external topics, with optional TLS/SASL credentials taken from env vars.
+- `type: file`: tail a JSON-lines file (`path`, `start`, optional `checkpoint`). Rotation and truncation are handled, and bad lines are quarantined.
+- `type: poll`: GET an HTTP API every `interval`, with optional `items`, `id_path` and `token_env` (a bearer token from an env var). Each item is published once.
+
+The demo ships `file:applog` (`config/sources/applog.yaml`), which tails `/tmp/beacon/app.jsonl` in the container. The command to append a line is in that file.
+
 ```
 webhook :8090 ─┐
-Kafka sources ─┴─► events.raw ─► matcher ─► alerts.matches ─► aggregator ─► Postgres: alerts + outbox (one tx)
+Kafka sources ─┤
+file tail ─────┤
+HTTP poll ─────┴─► events.raw ─► matcher ─► alerts.matches ─► aggregator ─► Postgres: alerts + outbox (one tx)
                                  (rules reload live from Postgres)                 │
                                          relay ◄── alert_update ──────────────────┤
                                            ▼                                       └── notify ─► router ─► delivery_jobs

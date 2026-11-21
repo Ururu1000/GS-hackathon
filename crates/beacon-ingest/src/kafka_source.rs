@@ -1,4 +1,6 @@
-//! External Kafka topics as a source (spec §5.1).
+//! Configured sources (spec §5.1): external Kafka topics here, a tailed
+//! JSON-lines file in [`crate::file_source`], a polled HTTP API in
+//! [`crate::poll_source`]. HTTP webhooks need no config.
 //!
 //! A new source *instance* is a YAML file in `config/sources/`:
 //!
@@ -56,6 +58,27 @@ pub struct SourceSpec {
     pub start: String,
     #[serde(default)]
     pub security: Option<SecuritySpec>,
+    /// `type: file`: the JSON-lines file to tail.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// `type: file`: where to keep the read position across restarts (optional).
+    #[serde(default)]
+    pub checkpoint: Option<String>,
+    /// `type: poll`: the http(s) URL to GET.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// `type: poll`: how often, e.g. `30s` (default `30s`, at least `1s`).
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// `type: poll`: dot path to the array of items in the response (default: the whole body is one event).
+    #[serde(default)]
+    pub items: Option<String>,
+    /// `type: poll`: dot path to each item's own id, for stable event ids (default: a content hash).
+    #[serde(default)]
+    pub id_path: Option<String>,
+    /// `type: poll`: environment variable holding a bearer token (never the token itself).
+    #[serde(default)]
+    pub token_env: Option<String>,
 }
 
 /// TLS/SASL settings for an external broker. Credentials are named by
@@ -152,8 +175,20 @@ pub fn validate_sources(specs: &[SourceSpec]) -> Result<()> {
         if !ids.insert(s.id.as_str()) {
             bail!("source `{}` is defined twice", s.id);
         }
-        if s.kind != "kafka" {
-            bail!("source `{}`: unsupported type `{}` (M0 supports kafka; HTTP needs no config)", s.id, s.kind);
+        match s.kind.as_str() {
+            "kafka" => {}
+            "file" => {
+                crate::file_source::validate(s)?;
+                continue;
+            }
+            "poll" => {
+                crate::poll_source::validate(s)?;
+                continue;
+            }
+            other => bail!("source `{}`: unsupported type `{other}` (kafka, file or poll; HTTP webhooks need no config)", s.id),
+        }
+        if s.path.is_some() || s.checkpoint.is_some() || s.url.is_some() || s.interval.is_some() || s.items.is_some() || s.id_path.is_some() || s.token_env.is_some() {
+            bail!("source `{}`: file/poll settings on a kafka source", s.id);
         }
         if s.topics.is_empty() {
             bail!("source `{}`: `topics` must not be empty", s.id);
@@ -272,19 +307,32 @@ async fn forward(source_id: &str, publisher: &EventPublisher, msg: &rdkafka::mes
         .and_then(|p| serde_json::from_slice::<serde_json::Value>(p).map_err(|e| e.to_string()));
     // Undecodable or oversized payloads go to quarantine; either way the
     // upstream offset is stored only after the broker acknowledged a write.
+    publish_or_quarantine(publisher, source_id, id, parsed, msg.payload().unwrap_or_default(), &shutdown).await
+}
+
+/// Publish one parsed event, or quarantine `payload` when it doesn't parse or
+/// is too large, retrying transient broker errors. Returns false only when
+/// shutting down before it was written. Shared by the file and poll sources.
+pub(crate) async fn publish_or_quarantine(
+    publisher: &EventPublisher,
+    source_id: &str,
+    id: String,
+    parsed: Result<serde_json::Value, String>,
+    payload: &[u8],
+    shutdown: &watch::Receiver<bool>,
+) -> bool {
     let mut quarantine_reason: Option<String> = parsed.as_ref().err().cloned();
     let mut backoff = Duration::from_millis(100);
     loop {
         let res = match (&parsed, &quarantine_reason) {
-            (_, Some(reason)) => quarantine(publisher, &id, msg.payload().unwrap_or_default(), reason).await,
+            (_, Some(reason)) => quarantine(publisher, &id, payload, reason).await,
             (Ok(raw), None) => publisher.publish(&Event::new(id.clone(), source_id.to_string(), raw.clone())).await,
             (Err(_), None) => unreachable!("parse errors always set a quarantine reason"),
         };
         match res {
             Ok(()) => return true,
             Err(PublishError::TooLarge) if quarantine_reason.is_none() => {
-                let len = msg.payload().map_or(0, <[u8]>::len);
-                quarantine_reason = Some(format!("too large for events.raw ({len} bytes)"));
+                quarantine_reason = Some(format!("too large for events.raw ({} bytes)", payload.len()));
             }
             Err(e) => {
                 warn!(source = %source_id, error = %e, "publish failed, retrying");
@@ -338,7 +386,8 @@ mod tests {
     fn accepts_the_seed_sources() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/sources");
         let specs = load_sources(&dir).unwrap();
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 3);
+        assert!(specs.iter().any(|s| s.kind == "file"));
     }
 
     #[test]

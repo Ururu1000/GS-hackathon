@@ -7,7 +7,8 @@
 //!   a hint; a periodic check catches anything missed) and publishes it on a
 //!   `watch` channel. An invalid revision keeps the last good snapshot.
 //!
-//! Schema mappings are still read from `config/schemas` at startup.
+//! Schema mappings live in Postgres too (`schema_mappings`): seeded once from
+//! `config/schemas`, then edited through the API and reloaded the same way.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
