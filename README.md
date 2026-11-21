@@ -35,15 +35,15 @@ Roles (pass to `beacon --role`, comma-separated):
 | `gateway` | fake SMS/phone provider and the device simulator (`GATEWAY_ADDR`, default `127.0.0.1:8070`) |
 | `scheduler` | escalation steps |
 | `actions` | runbook actions; expires stale approvals |
-| `delivery-api` | dev-only standalone server for delivery's API on `127.0.0.1:8071` |
+| `delivery-api` | dev-only standalone server for delivery's API on `127.0.0.1:8071`. Not needed with `api`: the `api` role serves the same routes behind the session, and the device simulator when `gateway` runs in the same process |
 
 Required settings beyond `DATABASE_URL`:
 
 | Variable | Purpose |
 |---|---|
 | `GATEWAY_ADDR` | where the fake gateway listens; set `0.0.0.0:8070` inside a container |
-| `GATEWAY_TOKEN` | bearer token shared by `gateway` and `delivery`. Unset is dev mode: the gateway then only binds loopback |
-| `REPLY_SECRET` | HMAC key shared by `gateway` and `delivery-api` for signed SMS replies (`Y <code>`, `ACK`). Unset rejects every reply |
+| `GATEWAY_TOKEN` | bearer token shared by `gateway` and `delivery`; `api` adds it to the UI's simulator calls server-side. Unset is dev mode: the gateway then only binds loopback |
+| `REPLY_SECRET` | HMAC key shared by `gateway` and `api` (or `delivery-api`) for signed SMS replies (`Y <code>`, `ACK`). Unset rejects every reply. `docker compose up` sets demo values for both secrets |
 
 Demos, with `DATABASE_URL` set and infrastructure from `docker compose -f deploy/docker-compose.yml up -d`:
 

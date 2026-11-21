@@ -231,6 +231,7 @@ dependencies = [
  "anyhow",
  "axum",
  "beacon-core",
+ "beacon-delivery",
  "beacon-engine",
  "beacon-ingest",
  "chrono",

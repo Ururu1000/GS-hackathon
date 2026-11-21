@@ -31,4 +31,6 @@ USER beacon
 ENV BEACON_CONFIG_DIR=/app/config BEACON_UI_DIR=/app/ui/dist RUST_LOG=info,sqlx=warn,librdkafka=warn,rdkafka=warn
 EXPOSE 8080 8090
 ENTRYPOINT ["beacon"]
-CMD ["--migrate", "--role", "ingest,sources,matcher,aggregator,relay,api,router,delivery,gateway"]
+# api mounts delivery's routes and the device simulator; scheduler runs escalations,
+# actions runs runbook steps. The gateway stays on loopback inside the container.
+CMD ["--migrate", "--role", "ingest,sources,matcher,aggregator,relay,api,router,delivery,gateway,scheduler,actions"]

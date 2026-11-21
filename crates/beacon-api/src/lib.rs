@@ -9,6 +9,9 @@
 //! GET  /ready                           200 once the alerts.updates consumer is assigned
 //! ```
 //!
+//! With a [`DeliveryMount`] ([`router_full`]) the same origin also serves
+//! delivery's runbook/approval/people/teams routes and the device simulator.
+//!
 //! Every API replica consumes `alerts.updates` in its own consumer group and
 //! fans the records out to its SSE clients ([`feed`]).
 
@@ -52,11 +55,40 @@ pub fn router(state: ApiState, ui_dir: Option<PathBuf>) -> Router {
     router_with(state, ui_dir, None)
 }
 
+/// Delivery's routes, mounted on this origin behind the session (part b,
+/// `beacon_delivery::api` and `beacon_delivery::gateway::simulator_router`).
+pub struct DeliveryMount {
+    /// Runbook steps, approvals, runbooks, people/teams, `/api/replies`.
+    pub api: beacon_delivery::api::ApiState,
+    /// The device simulator (`/api/simulator/*`). Pass the SAME
+    /// `GatewayState` the gateway role serves: outages and the SSE broadcast
+    /// live in memory, so a second state would show nothing and switch nothing.
+    pub simulator: Option<SimulatorMount>,
+}
+
+pub struct SimulatorMount {
+    pub state: beacon_delivery::gateway::GatewayState,
+    /// `GATEWAY_TOKEN`: injected as `Authorization: Bearer` after the session
+    /// check, so the browser never holds it.
+    pub token: Option<String>,
+}
+
 /// Like [`router`], optionally mounting the webhook ingest routes
 /// (`/ingest/{source}[/batch]`) on the same origin for the UI's playground
 /// and sample replay. There they require the session's `X-CSRF-Token`, so a
 /// third-party page can't make a browser inject events.
 pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Router>) -> Router {
+    router_full(state, ui_dir, ingest, None)
+}
+
+/// Like [`router_with`], also mounting delivery's routes ([`DeliveryMount`]).
+///
+/// Delivery's handlers get `Extension(Actor("user:<id>"))` and
+/// `Extension(Admin(session.admin))` from the session, and every non-GET
+/// needs the session's `X-CSRF-Token` — except `POST /api/replies`, which the
+/// gateway calls server-to-server and which authenticates by its HMAC
+/// signature (`REPLY_SECRET`) instead.
+pub fn router_full(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Router>, delivery: Option<DeliveryMount>) -> Router {
     let session = state.session.clone();
     let mut api = Router::new()
         .route("/api/session", get(session::get_session))
@@ -82,17 +114,50 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state);
     if let Some(ingest) = ingest {
-        let gated = ingest.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
-            let session = session.clone();
-            async move {
-                if req.method() != axum::http::Method::GET
-                    && let Err(e) = session.check_csrf(req.headers()) {
+        api = api.merge(csrf_gated(ingest, session.clone()));
+    }
+    if let Some(d) = delivery {
+        let s = session.clone();
+        let routes = beacon_delivery::api::router(d.api).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let s = s.clone();
+                async move {
+                    if req.method() != axum::http::Method::GET
+                        && req.uri().path() != "/api/replies"
+                        && let Err(e) = s.check_csrf(req.headers())
+                    {
                         return axum::response::IntoResponse::into_response(e);
                     }
-                next.run(req).await
-            }
-        }));
-        api = api.merge(gated);
+                    req.extensions_mut().insert(beacon_delivery::api::Actor(s.actor()));
+                    req.extensions_mut().insert(beacon_delivery::api::Admin(s.admin));
+                    next.run(req).await
+                }
+            },
+        ));
+        api = api.merge(routes);
+        if let Some(sim) = d.simulator {
+            let bearer = sim
+                .token
+                .as_deref()
+                .map(|t| axum::http::HeaderValue::try_from(format!("Bearer {t}")))
+                .transpose()
+                .ok()
+                .flatten();
+            let routes = beacon_delivery::gateway::simulator_router(sim.state)
+                .layer(axum::middleware::from_fn(move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                    let bearer = bearer.clone();
+                    async move {
+                        // Never let a browser-supplied credential through: the
+                        // session (and CSRF, below) is what authorizes here.
+                        req.headers_mut().remove(axum::http::header::AUTHORIZATION);
+                        if let Some(b) = bearer {
+                            req.headers_mut().insert(axum::http::header::AUTHORIZATION, b);
+                        }
+                        next.run(req).await
+                    }
+                }));
+            api = api.merge(csrf_gated(routes, session.clone()));
+        }
     }
     let app = match ui_dir {
         // The built UI (ui/dist) is served from the same origin, so the
@@ -104,6 +169,21 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         None => api,
     };
     app.layer(axum::middleware::from_fn(security_headers))
+}
+
+/// Non-GET requests to `routes` need the session's `X-CSRF-Token`.
+fn csrf_gated(routes: Router, session: Arc<Session>) -> Router {
+    routes.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        let session = session.clone();
+        async move {
+            if req.method() != axum::http::Method::GET
+                && let Err(e) = session.check_csrf(req.headers())
+            {
+                return axum::response::IntoResponse::into_response(e);
+            }
+            next.run(req).await
+        }
+    }))
 }
 
 /// Baseline security headers; API responses are never cached (they carry
