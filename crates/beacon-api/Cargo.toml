@@ -1,0 +1,32 @@
+[package]
+name = "beacon-api"
+description = "REST + SSE API for the UI (SPEC §8, ui/contract/openapi.yaml)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+beacon-core = { path = "../beacon-core" }
+beacon-ingest = { path = "../beacon-ingest" }
+beacon-engine = { path = "../beacon-engine" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+tokio.workspace = true
+axum.workspace = true
+rdkafka.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+futures.workspace = true
+tracing.workspace = true
+hex.workspace = true
+rand.workspace = true
+form_urlencoded = "1.2"
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+tower = "0.5"
+http-body-util = "0.1"

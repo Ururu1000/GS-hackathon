@@ -9,6 +9,7 @@
 //! across rebalances) and matcher transactions.
 
 pub mod aggregator;
+pub mod alerts;
 pub mod feed;
 pub mod matcher;
 pub mod relay;

@@ -12,7 +12,7 @@ use crate::condition::{Condition, Op};
 use crate::config::ConfigSnapshot;
 use crate::event::Event;
 use crate::mapping::{Diagnostic, structural_signature};
-use crate::model::AlertField;
+use crate::model::{AlertField, MAX_NOTIFY_RAW, NotifyContext, NotifyEvent};
 use crate::path::Path;
 use crate::rule::{CompiledRule, RouteSpec};
 use crate::severity::Severity;
@@ -53,6 +53,12 @@ pub struct MatchRecord {
     pub ingested_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// Canonical event facts passed on to delivery in the notify payload.
+    #[serde(default)]
+    pub context: NotifyContext,
+    /// The event itself, only for fires of rules with a runbook (templates).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<NotifyEvent>,
 }
 
 /// Values copied from the event into a match (dedup key values, card fields)
@@ -61,19 +67,23 @@ pub const MAX_PROJECTED_VALUE: usize = 4096;
 
 /// Replace an oversized value with a truncated string preview.
 fn bounded(v: Value) -> Value {
+    bounded_to(v, MAX_PROJECTED_VALUE)
+}
+
+fn bounded_to(v: Value, max: usize) -> Value {
     let text = match &v {
-        Value::String(s) if s.len() <= MAX_PROJECTED_VALUE => return v,
+        Value::String(s) if s.len() <= max => return v,
         Value::String(s) => s.clone(),
         Value::Array(_) | Value::Object(_) => {
             let t = v.to_string();
-            if t.len() <= MAX_PROJECTED_VALUE {
+            if t.len() <= max {
                 return v;
             }
             t
         }
         _ => return v,
     };
-    let mut cut = MAX_PROJECTED_VALUE;
+    let mut cut = max;
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -322,8 +332,36 @@ impl ConfigSnapshot {
             schema: event.schema.clone(),
             ingested_at: event.ingested_at,
             diagnostics,
+            event: (kind == MatchKind::Fire && rule.spec.runbook.is_some()).then(|| NotifyEvent {
+                fields: event.fields.clone(),
+                raw: bounded_to(event.raw.clone(), MAX_NOTIFY_RAW),
+            }),
+            context: NotifyContext {
+                service: field_str(event, "service"),
+                environment: field_str(event, "environment"),
+                event_type: field_str(event, "type"),
+                source: Some(event.source.clone()),
+                schema: Some(event.schema.clone()),
+            },
         }
     }
+}
+
+/// Canonical facts are short identifiers; anything longer is cut at 256 bytes.
+fn field_str(event: &Event, name: &str) -> Option<String> {
+    let mut s = event.fields.get(name).and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
+        _ => None,
+    })?;
+    if s.len() > 256 {
+        let mut cut = 256;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+    Some(s)
 }
 
 /// Incident identity: rule id + dedup key values. When a key field is missing
