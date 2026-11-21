@@ -53,6 +53,8 @@ pub enum WriteError {
     /// Someone saved first (or the rule exists / is gone). Carries the current row.
     Conflict(Option<StoredRule>),
     NotFound,
+    /// Existing rule (including soft-deleted) belongs to a team not visible to the caller.
+    Forbidden,
 }
 
 /// The one validator for API writes, YAML seeds and the rule test panel.
@@ -187,12 +189,6 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<StoredRule>> {
     Ok(current(&mut c, id, false).await?.filter(|r| !r.deleted))
 }
 
-/// Including soft-deleted rows (recreate checks).
-pub async fn get_any(pool: &PgPool, id: &str) -> Result<Option<StoredRule>> {
-    let mut c = pool.acquire().await?;
-    current(&mut c, id, false).await
-}
-
 pub async fn list(pool: &PgPool) -> Result<Vec<StoredRule>> {
     let rows = sqlx::query("SELECT spec, revision, deleted, updated_at, updated_by FROM rules WHERE NOT deleted ORDER BY id")
         .fetch_all(pool)
@@ -200,9 +196,28 @@ pub async fn list(pool: &PgPool) -> Result<Vec<StoredRule>> {
     rows.iter().map(row).collect()
 }
 
+fn team_visible(spec: &Value, visible_teams: Option<&[String]>) -> bool {
+    let Some(allowed) = visible_teams else {
+        return true;
+    };
+    let team = spec.get("team").and_then(Value::as_str).unwrap_or("");
+    allowed.iter().any(|t| t == team)
+}
+
 /// Create a rule. An existing live rule with the same id is a conflict; a
 /// deleted one is replaced with a higher revision.
 pub async fn create(pool: &PgPool, spec: &Value, actor: &str) -> Result<Result<StoredRule, WriteError>> {
+    create_scoped(pool, spec, actor, None).await
+}
+
+/// Like [`create`], checking ownership of any existing (live or soft-deleted)
+/// row atomically under the ruleset lock when `visible_teams` is provided.
+pub async fn create_scoped(
+    pool: &PgPool,
+    spec: &Value,
+    actor: &str,
+    visible_teams: Option<&[String]>,
+) -> Result<Result<StoredRule, WriteError>> {
     let rule = match validate(spec) {
         Ok(r) => r,
         Err(p) => return Ok(Err(WriteError::Invalid(p))),
@@ -210,8 +225,20 @@ pub async fn create(pool: &PgPool, spec: &Value, actor: &str) -> Result<Result<S
     let mut tx = pool.begin().await?;
     lock_rules(&mut tx).await?;
     let existing = current(&mut tx, &rule.id, true).await?;
-    if let Some(e) = existing.as_ref().filter(|e| !e.deleted) {
-        return Ok(Err(WriteError::Conflict(Some(e.clone()))));
+    if let Some(e) = existing.as_ref() {
+        if !e.deleted {
+            let visible = team_visible(&e.spec, visible_teams).then(|| e.clone());
+            return Ok(Err(WriteError::Conflict(visible)));
+        }
+        if !team_visible(&e.spec, visible_teams) {
+            return Ok(Err(WriteError::Forbidden));
+        }
+        if e.spec.get("team").and_then(Value::as_str).unwrap_or("") != rule.team {
+            return Ok(Err(WriteError::Invalid(vec![Invalid {
+                path: "team".into(),
+                message: "team cannot be changed when recreating a rule id".into(),
+            }])));
+        }
     }
     let revision = existing.map_or(1, |e| e.revision + 1);
     write(&mut tx, &rule.id, spec, revision, actor).await?;
@@ -222,6 +249,20 @@ pub async fn create(pool: &PgPool, spec: &Value, actor: &str) -> Result<Result<S
 
 /// Compare-and-set update.
 pub async fn update(pool: &PgPool, id: &str, spec: &Value, expected_revision: i64, actor: &str) -> Result<Result<StoredRule, WriteError>> {
+    update_scoped(pool, id, spec, expected_revision, actor, None).await
+}
+
+/// Like [`update`], verifying team ownership of the existing row atomically
+/// under the ruleset lock (returning `NotFound` for invisible teams to avoid
+/// leaking hidden rule ids or team names).
+pub async fn update_scoped(
+    pool: &PgPool,
+    id: &str,
+    spec: &Value,
+    expected_revision: i64,
+    actor: &str,
+    visible_teams: Option<&[String]>,
+) -> Result<Result<StoredRule, WriteError>> {
     let rule = match validate(spec) {
         Ok(r) => r,
         Err(p) => return Ok(Err(WriteError::Invalid(p))),
@@ -234,6 +275,15 @@ pub async fn update(pool: &PgPool, id: &str, spec: &Value, expected_revision: i6
     let Some(existing) = current(&mut tx, id, true).await?.filter(|e| !e.deleted) else {
         return Ok(Err(WriteError::NotFound));
     };
+    if !team_visible(&existing.spec, visible_teams) {
+        return Ok(Err(WriteError::NotFound));
+    }
+    if existing.spec.get("team").and_then(Value::as_str).unwrap_or("") != rule.team {
+        return Ok(Err(WriteError::Invalid(vec![Invalid {
+            path: "team".into(),
+            message: "team cannot be changed on an existing rule".into(),
+        }])));
+    }
     if existing.revision != expected_revision {
         return Ok(Err(WriteError::Conflict(Some(existing))));
     }
@@ -244,11 +294,25 @@ pub async fn update(pool: &PgPool, id: &str, spec: &Value, expected_revision: i6
 }
 
 pub async fn delete(pool: &PgPool, id: &str, expected_revision: i64, actor: &str) -> Result<Result<(), WriteError>> {
+    delete_scoped(pool, id, expected_revision, actor, None).await
+}
+
+/// Like [`delete`], verifying team ownership atomically under the ruleset lock.
+pub async fn delete_scoped(
+    pool: &PgPool,
+    id: &str,
+    expected_revision: i64,
+    actor: &str,
+    visible_teams: Option<&[String]>,
+) -> Result<Result<(), WriteError>> {
     let mut tx = pool.begin().await?;
     lock_rules(&mut tx).await?;
     let Some(existing) = current(&mut tx, id, true).await?.filter(|e| !e.deleted) else {
         return Ok(Err(WriteError::NotFound));
     };
+    if !team_visible(&existing.spec, visible_teams) {
+        return Ok(Err(WriteError::NotFound));
+    }
     if existing.revision != expected_revision {
         return Ok(Err(WriteError::Conflict(Some(existing))));
     }
@@ -279,10 +343,28 @@ async fn write(tx: &mut PgConnection, id: &str, spec: &Value, revision: i64, act
 }
 
 /// Import `config/rules/*.yaml` once, when the rules table is empty. Invalid
-/// seed rules are reported and skipped.
+/// seed rules are reported and skipped. On existing databases, also migrates
+/// the legacy shipped `oncall:settlements` route to `oncall:settlements-primary`.
 pub async fn seed_from_yaml(pool: &PgPool, config_dir: &Path) -> Result<usize> {
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM rules").fetch_one(pool).await?;
     if n > 0 {
+        let mut tx = pool.begin().await?;
+        lock_rules(&mut tx).await?;
+        if let Some(mut r) = current(&mut tx, "settlements-workflow-failed", true).await?.filter(|r| !r.deleted) {
+            let mut changed = false;
+            if let Some(routes) = r.spec.get_mut("route").and_then(Value::as_array_mut) {
+                for entry in routes {
+                    if entry.get("to").and_then(Value::as_str) == Some("oncall:settlements") {
+                        entry["to"] = Value::String("oncall:settlements-primary".into());
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                write(&mut tx, "settlements-workflow-failed", &r.spec, r.revision + 1, "config").await?;
+            }
+        }
+        tx.commit().await?;
         return Ok(0);
     }
     let specs: Vec<Value> = load_yaml_files(&config_dir.join("rules"))?;

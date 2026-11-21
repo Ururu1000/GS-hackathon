@@ -66,12 +66,22 @@ struct Ctx<'a> {
 }
 
 pub fn context(event: &Event) -> JValue {
+    context_from(&event.raw, &event.fields, &event.schema, &event.source, &event.id)
+}
+
+pub fn context_from(
+    raw: &serde_json::Value,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    schema: &str,
+    source: &str,
+    id: &str,
+) -> JValue {
     JValue::from_serialize(Ctx {
-        raw: &event.raw,
-        fields: &event.fields,
-        schema: &event.schema,
-        source: &event.source,
-        id: &event.id,
+        raw,
+        fields,
+        schema,
+        source,
+        id,
     })
 }
 

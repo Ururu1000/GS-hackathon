@@ -63,11 +63,10 @@ impl RecentIds {
     }
 
     /// True if `id` was seen within the window (and records it otherwise).
-    /// Only ids that can legitimately repeat are tracked: client-supplied
-    /// `Idempotency-Key` ids (`http:...`) and Kafka-source ids (`kafka:...`).
-    /// Server-generated UUIDs never repeat, which keeps the window small.
+    /// Server-generated HTTP UUIDs never repeat, so only non-UUID ids (HTTP
+    /// `Idempotency-Key` and Kafka-source ids) are tracked.
     pub fn seen(&mut self, id: &str) -> bool {
-        if !(id.starts_with("http:") || id.starts_with("kafka:")) {
+        if uuid::Uuid::parse_str(id).is_ok() {
             return false;
         }
         let now = Instant::now();
@@ -318,7 +317,7 @@ impl SampleSink {
             let mut since_prune = 0usize;
             while let Some(e) = rx.recv().await {
                 let raw = beacon_core::matcher::bounded_to(beacon_core::matcher::redact(e.raw), beacon_core::model::MAX_NOTIFY_RAW);
-                let fields = beacon_core::matcher::bounded_to(serde_json::Value::Object(e.fields), 4096);
+                let fields = beacon_core::matcher::bounded_to(beacon_core::matcher::redact(serde_json::Value::Object(e.fields)), 4096);
                 let res = sqlx::query(
                     "INSERT INTO event_samples (event_id, source, schema, received_at, fields, raw) VALUES ($1, $2, $3, $4, $5, $6)",
                 )
@@ -449,10 +448,12 @@ mod tests {
         let mut r = RecentIds::new(Duration::from_secs(60), 3);
         assert!(!r.seen("http:a"));
         assert!(r.seen("http:a"));
-        for id in ["http:b", "http:c", "kafka:d", "kafka:e"] {
+        for id in ["http:b", "http:c", "orders:topic:0:1", "kafka:e"] {
             assert!(!r.seen(id));
         }
+        assert!(r.seen("orders:topic:0:1"), "custom Kafka source ids without kafka: prefix are still tracked");
         assert!(!r.seen("http:a"), "evicted past the cap");
-        assert!(!r.seen("0196-uuid") && !r.seen("0196-uuid"), "server ids are not tracked");
+        let uuid = uuid::Uuid::now_v7().to_string();
+        assert!(!r.seen(&uuid) && !r.seen(&uuid), "server UUIDs are not tracked");
     }
 }

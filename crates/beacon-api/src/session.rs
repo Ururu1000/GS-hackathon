@@ -1,6 +1,7 @@
 //! M0 demo session: one fixed user who sees every configured team. Writes
 //! must echo the CSRF token from `GET /api/session` in `X-CSRF-Token`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use axum::Json;
@@ -26,6 +27,9 @@ pub struct Session {
     /// Admins see every team and the cross-team views (recent events,
     /// discovered schemas). Others see only teams they belong to or lead.
     pub admin: bool,
+    /// Map of configured on-call schedule id → owning team id (from `config/teams`).
+    #[serde(skip)]
+    pub oncall_owners: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +48,8 @@ struct TeamFile {
     members: Vec<String>,
     #[serde(default)]
     lead: Option<String>,
+    #[serde(default)]
+    oncall: HashMap<String, Vec<String>>,
 }
 
 fn title_case(id: &str) -> String {
@@ -69,6 +75,12 @@ impl Session {
             .find(|p| p.user == user_id)
             .map(|p| Named { name: p.name.unwrap_or_else(|| title_case(&p.user)), id: p.user })
             .unwrap_or_else(|| Named { id: user_id.to_string(), name: title_case(user_id) });
+        let mut oncall_owners = HashMap::new();
+        for t in &teams {
+            for sched in t.oncall.keys() {
+                oncall_owners.insert(sched.clone(), t.team.clone());
+            }
+        }
         let mut teams: Vec<Named> = teams
             .into_iter()
             .filter(|t| admin || t.members.iter().any(|m| m == user_id) || t.lead.as_deref() == Some(user_id))
@@ -76,7 +88,7 @@ impl Session {
             .collect();
         teams.sort_by(|a, b| a.id.cmp(&b.id));
         let csrf_token = hex::encode(rand::rng().random::<[u8; 16]>());
-        Ok(Session { user, teams, csrf_token, admin })
+        Ok(Session { user, teams, csrf_token, admin, oncall_owners })
     }
 
     pub fn actor(&self) -> String {
@@ -85,6 +97,12 @@ impl Session {
 
     pub fn can_see(&self, team: &str) -> bool {
         self.teams.iter().any(|t| t.id == team)
+    }
+
+    /// True if `schedule` is a configured on-call schedule belonging to a team
+    /// visible to this session.
+    pub fn can_see_schedule(&self, schedule: &str) -> bool {
+        self.oncall_owners.get(schedule).is_some_and(|owner| self.can_see(owner))
     }
 
     pub fn check_csrf(&self, headers: &HeaderMap) -> Result<(), ApiError> {

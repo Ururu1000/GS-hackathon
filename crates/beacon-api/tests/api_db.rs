@@ -411,7 +411,7 @@ async fn hardening_headers_scoping_and_masking(pool: PgPool) {
     let csrf = session.csrf_token.clone();
     let (updates, _) = broadcast::channel(8);
     let (_r, ready) = watch::channel(true);
-    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let state = ApiState { pool: pool.clone(), updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
     let app = router(state, None);
     assert_eq!(get(&app, "/api/events/recent").await.0, StatusCode::FORBIDDEN);
     assert_eq!(get(&app, "/api/schemas/discovered").await.0, StatusCode::FORBIDDEN);
@@ -421,4 +421,61 @@ async fn hardening_headers_scoping_and_masking(pool: PgPool) {
         "route": [{"to": "team:rates"}], "present": {"title": "t"}});
     let (s, e) = send(&app, "POST", "/api/rules", &csrf, Some(json!({"rule": rule}))).await;
     assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")), "can't page another team");
+
+    // Non-admins also cannot route to another team's on-call schedule or another user directly.
+    let oncall_rule = json!({"id": "sneaky-oc", "team": "payments", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "oncall:settlements-primary"}], "present": {"title": "t"}});
+    assert_eq!(send(&app, "POST", "/api/rules", &csrf, Some(json!({"rule": oncall_rule}))).await.0, StatusCode::FORBIDDEN);
+    let user_rule = json!({"id": "sneaky-u", "team": "payments", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "user:bob"}], "present": {"title": "t"}});
+    assert_eq!(send(&app, "POST", "/api/rules", &csrf, Some(json!({"rule": user_rule}))).await.0, StatusCode::FORBIDDEN);
+
+    // A non-admin member of settlements CAN route to settlements' configured schedule (settlements-primary).
+    let settlements_session = Session::demo_with(&root().join("config"), "bob", false).unwrap();
+    assert!(settlements_session.can_see_schedule("settlements-primary"));
+    assert!(!settlements_session.can_see_schedule("payments"));
+
+    // Updating or deleting another team's rule returns 404 without leaking its team name.
+    let rates_rule = json!({"id": "rates-secret", "team": "rates", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "team:rates"}], "present": {"title": "t"}});
+    let created = beacon_engine::config_store::create(&pool, &rates_rule, "user:bob").await.unwrap().unwrap();
+    let (s, e) = send(&app, "DELETE", &format!("/api/rules/rates-secret?expected_revision={}", created.revision), &csrf, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(!e.to_string().contains("rates"), "must not leak hidden team name: {e}");
+    let take_rule = json!({"id": "rates-secret", "team": "payments", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "team:payments"}], "present": {"title": "t"}});
+    let (s, e) = send(&app, "PUT", "/api/rules/rates-secret", &csrf, Some(json!({"rule": take_rule, "expected_revision": created.revision}))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(!e.to_string().contains("rates"));
+
+    // Soft-deleted cross-team rule id cannot be recreated and does not leak its team name.
+    beacon_engine::config_store::delete(&pool, "rates-secret", created.revision, "user:bob").await.unwrap().unwrap();
+    let (s, e) = send(&app, "POST", "/api/rules", &csrf, Some(json!({"rule": take_rule}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(!e.to_string().contains("rates"));
+
+    // Even an admin cannot recreate a soft-deleted rule under a different team (keeps rule_id -> team invariant).
+    let (s, e) = send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": take_rule}))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(e["error"]["details"][0]["path"], json!("team"));
+
+    // Existing DB seed rule with legacy oncall:settlements is migrated by seed_from_yaml
+    // (only route[].to changes, revision increments, conditions stay intact).
+    let legacy_seed = json!({"id": "settlements-workflow-failed", "team": "settlements",
+        "when": {"path": "raw.x", "op": "eq", "value": "oncall:settlements"}, "route": [{"to": "oncall:settlements"}], "present": {"title": "t"}});
+    beacon_engine::config_store::create(&pool, &legacy_seed, "config").await.unwrap().unwrap();
+    beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
+    let migrated = beacon_engine::config_store::get(&pool, "settlements-workflow-failed").await.unwrap().unwrap();
+    assert_eq!(migrated.revision, 2);
+    assert_eq!(migrated.spec["route"][0]["to"], json!("oncall:settlements-primary"));
+    assert_eq!(migrated.spec["when"]["value"], json!("oncall:settlements"));
+
+    // Oversized transition body (> 32 KiB) is rejected during extraction.
+    let big_ack = json!({"expected_version": 1, "note": "x".repeat(40_000)});
+    assert_eq!(send(&app, "POST", &format!("/api/alerts/{id}/ack"), &csrf, Some(big_ack)).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // SSE stream carries no-store as well as no-cache.
+    let sse_res = app.clone().oneshot(Request::get("/api/stream").body(Body::empty()).unwrap()).await.unwrap();
+    let cc = sse_res.headers()["cache-control"].to_str().unwrap();
+    assert!(cc.contains("no-cache") && cc.contains("no-store"), "got {cc}");
 }

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -55,21 +55,43 @@ fn team_of(spec: &Value) -> String {
     spec.get("team").and_then(Value::as_str).unwrap_or("").to_string()
 }
 
-/// Stats from the alerts table: fires = matching events folded into alerts
-/// whose last activity falls in the window (an approximation per hour).
-async fn stats(state: &ApiState) -> Result<HashMap<String, Value>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT rule_id,
-                COALESCE(sum(count) FILTER (WHERE last_seen > now() - interval '24 hours'), 0)::bigint AS fires_24h,
-                count(*) FILTER (WHERE status IN ('open', 'acked')) AS open_alerts,
-                max(last_seen) AS last_fired_at,
-                array_agg(count) FILTER (WHERE last_seen > now() - interval '24 hours') AS counts,
-                array_agg(floor(extract(epoch FROM (now() - last_seen)) / 3600)::int)
-                    FILTER (WHERE last_seen > now() - interval '24 hours') AS hours_ago
-         FROM alerts GROUP BY rule_id",
-    )
-    .fetch_all(&state.pool)
-    .await?;
+/// Stats from the alerts table, scoped to visible teams (and optionally one
+/// rule) so callers never aggregate hidden teams' alerts.
+async fn stats(state: &ApiState, rule_id: Option<&str>) -> Result<HashMap<String, Value>, ApiError> {
+    let visible: Vec<String> = state.session.teams.iter().map(|t| t.id.clone()).collect();
+    let rows = match rule_id {
+        Some(rid) => {
+            sqlx::query(
+                "SELECT rule_id,
+                        COALESCE(sum(count) FILTER (WHERE last_seen > now() - interval '24 hours'), 0)::bigint AS fires_24h,
+                        count(*) FILTER (WHERE status IN ('open', 'acked')) AS open_alerts,
+                        max(last_seen) AS last_fired_at,
+                        array_agg(count) FILTER (WHERE last_seen > now() - interval '24 hours') AS counts,
+                        array_agg(floor(extract(epoch FROM (now() - last_seen)) / 3600)::int)
+                            FILTER (WHERE last_seen > now() - interval '24 hours') AS hours_ago
+                 FROM alerts WHERE team = ANY($1) AND rule_id = $2 GROUP BY rule_id",
+            )
+            .bind(&visible)
+            .bind(rid)
+            .fetch_all(&state.pool)
+            .await?
+        }
+        None => {
+            sqlx::query(
+                "SELECT rule_id,
+                        COALESCE(sum(count) FILTER (WHERE last_seen > now() - interval '24 hours'), 0)::bigint AS fires_24h,
+                        count(*) FILTER (WHERE status IN ('open', 'acked')) AS open_alerts,
+                        max(last_seen) AS last_fired_at,
+                        array_agg(count) FILTER (WHERE last_seen > now() - interval '24 hours') AS counts,
+                        array_agg(floor(extract(epoch FROM (now() - last_seen)) / 3600)::int)
+                            FILTER (WHERE last_seen > now() - interval '24 hours') AS hours_ago
+                 FROM alerts WHERE team = ANY($1) GROUP BY rule_id",
+            )
+            .bind(&visible)
+            .fetch_all(&state.pool)
+            .await?
+        }
+    };
     let mut out = HashMap::new();
     for r in rows {
         let mut hourly = [0i64; 24];
@@ -110,7 +132,7 @@ pub async fn list(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Res
         && !state.session.can_see(t) {
             return Err(ApiError::forbidden(format!("team `{t}` is not visible to this session")));
         }
-    let stats = stats(&state).await?;
+    let stats = stats(&state, None).await?;
     let items: Vec<Value> = config_store::list(&state.pool)
         .await?
         .iter()
@@ -128,7 +150,7 @@ pub async fn get(State(state): State<ApiState>, Path(id): Path<String>) -> Resul
     if !state.session.can_see(&team_of(&r.spec)) {
         return Err(rule_not_found());
     }
-    let stats = stats(&state).await?;
+    let stats = stats(&state, Some(&id)).await?;
     Ok(Json(item(&state, &r, stats.get(&id))))
 }
 
@@ -148,7 +170,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes, what: &str) -> Resul
 }
 
 /// Writers must be able to see (own) the rule's team, before and after, and
-/// may only route to teams they can see (no paging other teams' rotations).
+/// may only route to teams/schedules they can see (or themselves).
 fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
     let t = team_of(spec);
     if !(t.is_empty() || state.session.can_see(&t)) {
@@ -156,23 +178,37 @@ fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
     }
     if let Some(routes) = spec.get("route").and_then(Value::as_array) {
         for r in routes {
-            if let Some(target) = r.get("to").and_then(Value::as_str).and_then(|to| to.strip_prefix("team:"))
-                && !state.session.can_see(target) {
-                    return Err(ApiError::forbidden(format!("you can't route to team `{target}`")));
-                }
+            let Some(to) = r.get("to").and_then(Value::as_str) else { continue };
+            if let Some(target) = to.strip_prefix("team:")
+                && !state.session.can_see(target)
+            {
+                return Err(ApiError::forbidden(format!("you can't route to team `{target}`")));
+            }
+            if let Some(target) = to.strip_prefix("oncall:")
+                && !state.session.can_see_schedule(target)
+            {
+                return Err(ApiError::forbidden(format!("you can't route to on-call schedule `{target}`")));
+            }
+            if let Some(target) = to.strip_prefix("user:")
+                && !state.session.admin
+                && target != state.session.user.id
+            {
+                return Err(ApiError::forbidden(format!("you can't route directly to user `{target}`")));
+            }
         }
     }
     Ok(())
 }
 
-/// Rule writes are small; anything bigger is refused before parsing.
+/// Rule writes are small; anything bigger is refused during extraction.
 const MAX_WRITE_BODY: usize = 128 * 1024;
+/// Bound concurrent blocking rule-test evaluations per replica.
+static TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
-fn check_body(body: &Bytes) -> Result<(), ApiError> {
-    if body.len() > MAX_WRITE_BODY {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_WRITE_BODY} bytes")));
-    }
-    Ok(())
+async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
+    axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {limit} bytes")))
 }
 
 fn require_admin(state: &ApiState) -> Result<(), ApiError> {
@@ -185,7 +221,7 @@ fn require_admin(state: &ApiState) -> Result<(), ApiError> {
 
 async fn item_with_stats(state: &ApiState, r: &StoredRule) -> Result<Value, ApiError> {
     let id = r.spec.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-    let stats = stats(state).await?;
+    let stats = stats(state, Some(&id)).await?;
     Ok(item(state, r, stats.get(&id)))
 }
 
@@ -193,6 +229,7 @@ async fn map_write(state: &ApiState, e: WriteError) -> ApiError {
     match e {
         WriteError::Invalid(d) => invalid(d),
         WriteError::NotFound => rule_not_found(),
+        WriteError::Forbidden => ApiError::forbidden("rule belongs to another team"),
         WriteError::Conflict(current) => {
             // Only show the current rule to someone allowed to see its team.
             let visible = current.filter(|c| state.session.can_see(&team_of(&c.spec)));
@@ -205,32 +242,30 @@ async fn map_write(state: &ApiState, e: WriteError) -> ApiError {
     }
 }
 
-pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+fn visible_teams(state: &ApiState) -> Vec<String> {
+    state.session.teams.iter().map(|t| t.id.clone()).collect()
+}
+
+pub async fn create(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Response, ApiError> {
     state.session.check_csrf(&headers)?;
-    check_body(&body)?;
+    let body = read_body(body, MAX_WRITE_BODY).await?;
     let b: WriteBody = parse_body(&body, "{\"rule\": {...}}")?;
     check_team(&state, &b.rule)?;
-    // Recreating a deleted id must not take over another team's rule history.
-    if let Some(id) = b.rule.get("id").and_then(Value::as_str)
-        && let Some(prev) = config_store::get_any(&state.pool, id).await? {
-            check_team(&state, &prev.spec)?;
-        }
-    match config_store::create(&state.pool, &b.rule, &state.session.actor()).await? {
+    let visible = visible_teams(&state);
+    match config_store::create_scoped(&state.pool, &b.rule, &state.session.actor(), Some(&visible)).await? {
         Ok(r) => Ok((StatusCode::CREATED, Json(item_with_stats(&state, &r).await?)).into_response()),
         Err(e) => Err(map_write(&state, e).await),
     }
 }
 
-pub async fn update(State(state): State<ApiState>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> Result<Json<Value>, ApiError> {
+pub async fn update(State(state): State<ApiState>, headers: HeaderMap, Path(id): Path<String>, body: Body) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
-    check_body(&body)?;
+    let body = read_body(body, MAX_WRITE_BODY).await?;
     let b: WriteBody = parse_body(&body, "{\"rule\": {...}, \"expected_revision\": <int>}")?;
     let expected = b.expected_revision.ok_or_else(|| ApiError::bad_request("expected_revision is required"))?;
-    if let Some(existing) = config_store::get(&state.pool, &id).await? {
-        check_team(&state, &existing.spec)?;
-    }
     check_team(&state, &b.rule)?;
-    match config_store::update(&state.pool, &id, &b.rule, expected, &state.session.actor()).await? {
+    let visible = visible_teams(&state);
+    match config_store::update_scoped(&state.pool, &id, &b.rule, expected, &state.session.actor(), Some(&visible)).await? {
         Ok(r) => Ok(Json(item_with_stats(&state, &r).await?)),
         Err(e) => Err(map_write(&state, e).await),
     }
@@ -241,9 +276,8 @@ pub async fn delete(State(state): State<ApiState>, headers: HeaderMap, Path(id):
     let expected: i64 = query_param(raw.as_deref(), "expected_revision")
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| ApiError::bad_request("expected_revision query parameter is required"))?;
-    let existing = config_store::get(&state.pool, &id).await?.ok_or_else(rule_not_found)?;
-    check_team(&state, &existing.spec)?;
-    match config_store::delete(&state.pool, &id, expected, &state.session.actor()).await? {
+    let visible = visible_teams(&state);
+    match config_store::delete_scoped(&state.pool, &id, expected, &state.session.actor(), Some(&visible)).await? {
         Ok(()) => Ok(Json(json!({"deleted": id}))),
         Err(e) => Err(map_write(&state, e).await),
     }
@@ -258,15 +292,20 @@ struct TestBody {
 }
 
 /// Dry run: the same compiler and matcher as production, zero writes.
-pub async fn test(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+pub async fn test(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
-    if body.len() > MAX_TEST_BODY {
-        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_TEST_BODY} bytes")));
-    }
+    let body = read_body(body, MAX_TEST_BODY).await?;
     let b: TestBody = parse_body(&body, "{\"rule\": {...}, \"event\": {...}}")?;
-    // Compiling and evaluating is CPU work: keep it off the async workers.
+    let Ok(slot) = TEST_SLOTS.try_acquire() else {
+        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "too_many_tests", "too many rule tests in flight, retry"));
+    };
+    // Compiling and evaluating is CPU work: keep it off the async workers, and
+    // hold the concurrency permit inside the blocking task even if the request cancels.
     let schemas = state.schemas.clone();
-    let out = tokio::task::spawn_blocking(move || run_test(&schemas, b.rule, b.event, b.source))
+    let out = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        run_test(&schemas, b.rule, b.event, b.source)
+    })
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!("rule test task failed: {e}")))?;
     Ok(Json(out))
@@ -345,7 +384,7 @@ pub async fn recent_events(State(state): State<ApiState>, RawQuery(raw): RawQuer
                 "source": r.try_get::<String, _>("source")?,
                 "schema": r.try_get::<String, _>("schema")?,
                 "received_at": ts(r.try_get("received_at")?),
-                "raw": r.try_get::<Value, _>("raw")?,
+                "raw": beacon_core::matcher::redact(r.try_get::<Value, _>("raw")?),
             }))
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -378,7 +417,7 @@ pub async fn discovered(State(state): State<ApiState>) -> Result<Json<Value>, Ap
                 "count": r.try_get::<i64, _>("count")?,
                 "first_seen": ts(r.try_get("first_seen")?),
                 "last_seen": ts(r.try_get("last_seen")?),
-                "sample": r.try_get::<Value, _>("raw")?,
+                "sample": beacon_core::matcher::redact(r.try_get::<Value, _>("raw")?),
             }))
         })
         .collect::<Result<_, sqlx::Error>>()?;

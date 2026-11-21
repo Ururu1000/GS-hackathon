@@ -1,7 +1,7 @@
 //! Feed, detail and status transitions.
 
 use axum::Json;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use beacon_core::FeedAlert;
@@ -20,16 +20,31 @@ use crate::session::Session;
 pub const DEFAULT_LIMIT: i64 = 500;
 pub const MAX_LIMIT: i64 = 5000;
 
-/// The contract's `FeedAlert` JSON: field values are rendered strings, and
+/// The contract's `FeedAlert` JSON: field values are rendered strings,
+/// secrets/contacts are masked on read (covering pre-existing rows), and
 /// internal bookkeeping (`last_event_id`) is not exposed.
 pub fn api_alert(a: &FeedAlert) -> Value {
     let mut v = serde_json::to_value(a).expect("FeedAlert serializes");
     if let Some(o) = v.as_object_mut() {
         o.remove("last_event_id");
+        for k in ["title", "body"] {
+            if let Some(Value::String(s)) = o.get_mut(k) {
+                *s = beacon_core::matcher::redact_str(s);
+            }
+        }
         if let Some(Value::Array(fields)) = o.get_mut("fields") {
             for f in fields {
+                let secret_path = f
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(beacon_core::matcher::is_secret_path_str);
                 if let Some(val) = f.get_mut("value") {
-                    *val = Value::String(render_value(val));
+                    *val = if secret_path {
+                        Value::String("[redacted]".into())
+                    } else {
+                        let redacted = beacon_core::matcher::redact(val.take());
+                        Value::String(render_value(&redacted))
+                    };
                 }
             }
         }
@@ -52,19 +67,26 @@ pub fn mask_address(a: &str) -> String {
     "***".into()
 }
 
-/// Provider errors can quote addresses; mask emails and cap the length.
-fn scrub_error(e: &str) -> String {
-    let masked: Vec<String> = e.split_whitespace().map(|w| if w.contains('@') { mask_address(w.trim_matches(|c: char| "<>,;:()\"'".contains(c))) } else { w.to_string() }).collect();
-    let mut s = masked.join(" ");
-    if s.len() > 200 {
-        let mut cut = 200;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
-        s.push('…');
+/// Map free-form provider error strings to a safe status/category summary so
+/// provider text (addresses, phone numbers, query-string credentials) never
+/// leaves the database in API responses.
+fn safe_error_summary(status: &str, class: Option<&str>, raw: &str) -> String {
+    if status == "cancelled" {
+        return "delivery cancelled".into();
     }
-    s
+    if let Some(code) = raw.split_whitespace().find_map(|w| {
+        let d = w.trim_matches(|c: char| !c.is_ascii_digit());
+        (d.len() == 3)
+            .then(|| d.parse::<u16>().ok())
+            .flatten()
+            .filter(|c| (400..=599).contains(c))
+    }) {
+        return format!("delivery failed ({code})");
+    }
+    if let Some(cls) = class {
+        return format!("delivery failed ({cls})");
+    }
+    "delivery failed".into()
 }
 
 fn render_value(v: &Value) -> String {
@@ -92,6 +114,8 @@ pub struct FeedQuery {
 
 const STATUSES: &[&str] = &["open", "acked", "resolved"];
 const SEVERITIES: &[&str] = &["critical", "error", "warning", "info"];
+const MAX_RULE_FILTERS: usize = 64;
+const MAX_TRANSITION_BODY: usize = 32 * 1024;
 
 impl FeedQuery {
     pub fn parse(raw: Option<&str>) -> Result<FeedQuery, ApiError> {
@@ -101,11 +125,26 @@ impl FeedQuery {
             match k.as_ref() {
                 "team" if q.team.is_some() => return Err(ApiError::bad_request("team may be given once")),
                 "team" if !v.is_empty() => q.team = Some(v),
-                "status" if STATUSES.contains(&v.as_str()) => q.status.push(v),
+                "status" if STATUSES.contains(&v.as_str()) => {
+                    if q.status.len() >= STATUSES.len() * 2 {
+                        return Err(ApiError::bad_request("too many status filters"));
+                    }
+                    q.status.push(v);
+                }
                 "status" => return Err(ApiError::bad_request(format!("unknown status `{v}`"))),
-                "severity" if SEVERITIES.contains(&v.as_str()) => q.severity.push(v),
+                "severity" if SEVERITIES.contains(&v.as_str()) => {
+                    if q.severity.len() >= SEVERITIES.len() * 2 {
+                        return Err(ApiError::bad_request("too many severity filters"));
+                    }
+                    q.severity.push(v);
+                }
                 "severity" => return Err(ApiError::bad_request(format!("unknown severity `{v}`"))),
-                "rule" => q.rule.push(v),
+                "rule" => {
+                    if q.rule.len() >= MAX_RULE_FILTERS {
+                        return Err(ApiError::bad_request(format!("at most {MAX_RULE_FILTERS} rule filters")));
+                    }
+                    q.rule.push(v);
+                }
                 "limit" => {
                     q.limit = v
                         .parse::<i64>()
@@ -132,12 +171,12 @@ pub fn decode_cursor(s: &str) -> Option<(DateTime<Utc>, Uuid)> {
     Some((DateTime::parse_from_rfc3339(t).ok()?.with_timezone(&Utc), id.parse().ok()?))
 }
 
-/// One feed page (shared by `GET /api/alerts` and the stream snapshot).
-pub async fn feed_page(pool: &PgPool, session: &Session, q: &FeedQuery) -> Result<(Vec<FeedAlert>, Option<String>), ApiError> {
+fn build_feed_query(session: &Session, q: &FeedQuery) -> Result<QueryBuilder<'static, Postgres>, ApiError> {
     if let Some(t) = &q.team
-        && !session.can_see(t) {
-            return Err(ApiError::forbidden(format!("team `{t}` is not visible to this session")));
-        }
+        && !session.can_see(t)
+    {
+        return Err(ApiError::forbidden(format!("team `{t}` is not visible to this session")));
+    }
     let visible: Vec<String> = session.teams.iter().map(|t| t.id.clone()).collect();
     let mut b: QueryBuilder<Postgres> = QueryBuilder::new(format!("SELECT {FEED_COLUMNS} FROM alerts WHERE team = ANY("));
     b.push_bind(visible).push(")");
@@ -157,6 +196,12 @@ pub async fn feed_page(pool: &PgPool, session: &Session, q: &FeedQuery) -> Resul
         b.push(" AND (first_seen, id) < (").push_bind(t).push(", ").push_bind(id).push(")");
     }
     b.push(" ORDER BY first_seen DESC, id DESC LIMIT ").push_bind(q.limit + 1);
+    Ok(b)
+}
+
+/// One feed page (`GET /api/alerts`).
+pub async fn feed_page(pool: &PgPool, session: &Session, q: &FeedQuery) -> Result<(Vec<FeedAlert>, Option<String>), ApiError> {
+    let mut b = build_feed_query(session, q)?;
     let rows = b.build().fetch_all(pool).await?;
     let mut items: Vec<FeedAlert> = rows.iter().map(row_to_feed).collect::<anyhow::Result<_>>()?;
     let next = if items.len() as i64 > q.limit {
@@ -166,6 +211,43 @@ pub async fn feed_page(pool: &PgPool, session: &Session, q: &FeedQuery) -> Resul
         None
     };
     Ok((items, next))
+}
+
+/// Stream a feed page row-by-row, stopping once serialized alerts reach
+/// `max_bytes` so SSE snapshots bound peak allocation during DB fetch.
+pub async fn feed_page_budgeted(
+    pool: &PgPool,
+    session: &Session,
+    q: &FeedQuery,
+    max_bytes: usize,
+) -> Result<(Vec<Value>, std::collections::HashMap<Uuid, i64>, Option<String>), ApiError> {
+    use futures::TryStreamExt;
+    let mut b = build_feed_query(session, q)?;
+    let mut stream = b.build().fetch(pool);
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashMap::new();
+    let mut bytes = 0usize;
+    let mut last_cursor = None;
+    let mut has_more = false;
+    while let Some(row) = stream.try_next().await? {
+        if items.len() as i64 >= q.limit {
+            has_more = true;
+            break;
+        }
+        let a = row_to_feed(&row)?;
+        let v = api_alert(&a);
+        let sz = v.to_string().len();
+        if !items.is_empty() && bytes + sz > max_bytes {
+            has_more = true;
+            break;
+        }
+        bytes += sz;
+        seen.insert(a.id, a.version);
+        last_cursor = Some((a.first_seen, a.id));
+        items.push(v);
+    }
+    let next = has_more.then_some(last_cursor).flatten().map(|(t, id)| encode_cursor(t, id));
+    Ok((items, seen, next))
 }
 
 pub async fn list(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
@@ -196,7 +278,7 @@ pub async fn detail(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     let id = parse_id(&id)?;
     let a = load_alert(&state.pool, &state.session, id).await?;
     let jobs = sqlx::query(
-        "SELECT id, recipient_id, channel, address, status, attempts, last_error, sent_at, updated_at
+        "SELECT id, recipient_id, channel, address, status, attempts, last_error, last_error_class, sent_at, updated_at
          FROM delivery_jobs WHERE alert_id = $1 ORDER BY created_at, id",
     )
     .bind(id)
@@ -207,6 +289,8 @@ pub async fn detail(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     for j in &jobs {
         let recipient = format!("user:{}", j.try_get::<String, _>("recipient_id")?);
         let channel: String = j.try_get("channel")?;
+        let status: String = j.try_get("status")?;
+        let error_class: Option<String> = j.try_get("last_error_class")?;
         let sent_at: Option<DateTime<Utc>> = j.try_get("sent_at")?;
         if let Some(at) = sent_at {
             timeline.push(json!({"at": ts(at), "actor": "system", "kind": "notified",
@@ -217,9 +301,9 @@ pub async fn detail(State(state): State<ApiState>, Path(id): Path<String>) -> Re
             "recipient": recipient,
             "channel": channel,
             "address": mask_address(&j.try_get::<String, _>("address")?),
-            "state": j.try_get::<String, _>("status")?,
+            "state": status,
             "attempts": j.try_get::<i32, _>("attempts")?,
-            "last_error": j.try_get::<Option<String>, _>("last_error")?.map(|e| scrub_error(&e)),
+            "last_error": j.try_get::<Option<String>, _>("last_error")?.map(|e| safe_error_summary(&status, error_class.as_deref(), &e)),
             "sent_at": sent_at.map(ts),
             "updated_at": ts(j.try_get("updated_at")?),
         }));
@@ -266,24 +350,33 @@ pub enum Transition {
     Resolve,
 }
 
-pub async fn ack(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Bytes) -> Result<Json<Value>, ApiError> {
+pub async fn ack(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Body) -> Result<Json<Value>, ApiError> {
     transition(state, headers, id, body, Transition::Ack).await
 }
 
-pub async fn resolve(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Bytes) -> Result<Json<Value>, ApiError> {
+pub async fn resolve(state: State<ApiState>, headers: HeaderMap, id: Path<String>, body: Body) -> Result<Json<Value>, ApiError> {
     transition(state, headers, id, body, Transition::Resolve).await
 }
 
-/// CSRF is checked before the body is parsed, and every body problem is an
-/// `ApiError` (the contract's error shape), not a framework rejection.
+/// CSRF is checked before the body is extracted or parsed, and every body
+/// problem is an `ApiError` (the contract's error shape), not a framework rejection.
 async fn transition(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: Bytes,
+    body: Body,
     t: Transition,
 ) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
+    let body = axum::body::to_bytes(body, MAX_TRANSITION_BODY)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!("body exceeds {MAX_TRANSITION_BODY} bytes"),
+            )
+        })?;
     let req: TransitionRequest =
         serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("body must be {{\"expected_version\": <int>}}: {e}")))?;
     if req.note.as_ref().is_some_and(|n| n.chars().count() > 2000) {
@@ -329,7 +422,21 @@ mod tests {
     fn masks_contact_details() {
         assert_eq!(mask_address("anna@example.test"), "a***@example.test");
         assert_eq!(mask_address("+44 7700 900123"), "+44 *** 123");
-        assert_eq!(scrub_error("550 rejected <bob@example.test> unknown"), "550 rejected b***@example.test unknown");
+        assert_eq!(
+            safe_error_summary("pending", Some("permanent"), "550 rejected <bob@example.test> ?token=xyz 07700900123"),
+            "delivery failed (550)"
+        );
+        assert_eq!(
+            safe_error_summary("pending", Some("transient"), "timeout dialing 07700900123"),
+            "delivery failed (transient)"
+        );
+        assert_eq!(safe_error_summary("cancelled", None, "alert acked"), "delivery cancelled");
+    }
+
+    #[test]
+    fn caps_repeated_filter_params() {
+        let many: String = (0..65).map(|i| format!("rule=r{i}")).collect::<Vec<_>>().join("&");
+        assert!(FeedQuery::parse(Some(&many)).is_err());
     }
 
     #[test]
@@ -359,7 +466,12 @@ mod tests {
             "id": Uuid::nil(), "team": "rates", "version": 1,
             "rule": {"id": "r", "revision": 1, "name": "R"}, "status": "open", "severity": "warning",
             "color": "amber", "title": "t", "body": "", "count": 1,
-            "fields": [{"path": "raw.n", "label": "N", "value": 25000000}, {"path": "raw.s", "label": "S", "value": "x"}],
+            "fields": [
+                {"path": "raw.n", "label": "N", "value": 25000000},
+                {"path": "raw.s", "label": "S", "value": "x"},
+                {"path": "raw.meta", "label": "Meta", "value": {"password": "secret", "ok": 1}},
+                {"path": "raw.legacy", "label": "Legacy", "value": "{\"authorization\":[\"raw-secret\"]…"}
+            ],
             "first_seen": "2026-10-23T09:14:02.331Z", "last_seen": "2026-10-23T09:14:02.331Z",
             "source": "s", "schema": "x", "acked_by": null, "acked_at": null, "resolved_by": null,
             "resolved_at": null, "resolved_reason": null, "last_event_id": "e1"
@@ -368,6 +480,8 @@ mod tests {
         let v = api_alert(&a);
         assert_eq!(v["fields"][0]["value"], json!("25000000"));
         assert_eq!(v["fields"][1]["value"], json!("x"));
+        assert!(!v["fields"][2]["value"].as_str().unwrap().contains("secret"), "legacy object field must be redacted before stringify");
+        assert_eq!(v["fields"][3]["value"], json!("[truncated]"), "legacy truncated JSON previews must be suppressed");
         assert!(v.get("last_event_id").is_none());
         assert_eq!(v["first_seen"], json!("2026-10-23T09:14:02.331Z"));
     }

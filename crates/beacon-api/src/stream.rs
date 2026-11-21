@@ -22,12 +22,14 @@ use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::ApiState;
-use crate::alerts::{FeedQuery, api_alert, feed_page};
+use crate::alerts::{FeedQuery, api_alert, feed_page_budgeted};
 use crate::error::ApiError;
 
 const READY_WAIT: Duration = Duration::from_secs(10);
 /// Alerts tracked per stream before it closes for a resync.
 const MAX_TRACKED: usize = 20_000;
+/// Cap per-stream snapshot payload size so concurrent connects cannot spike memory.
+const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 
 pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let q = FeedQuery::parse(raw.as_deref())?;
@@ -46,12 +48,11 @@ pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> R
 
     // 1. Subscribe first, so nothing published during the snapshot read is missed.
     let rx = state.updates.subscribe();
-    // 2. Snapshot from Postgres.
-    let (items, next) = feed_page(&state.pool, &state.session, &q).await?;
-    let seen: HashMap<Uuid, i64> = items.iter().map(|a| (a.id, a.version)).collect();
+    // 2. Snapshot from Postgres, streamed with MAX_SNAPSHOT_BYTES budget.
+    let (snap_items, seen, next) = feed_page_budgeted(&state.pool, &state.session, &q, MAX_SNAPSHOT_BYTES).await?;
     let snapshot = json!({
         "team": q.team,
-        "items": items.iter().map(api_alert).collect::<Vec<_>>(),
+        "items": snap_items,
         "next_cursor": next,
         "server_time": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     });
@@ -72,7 +73,7 @@ pub async fn stream(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> R
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
         .into_response();
     let h = resp.headers_mut();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store"));
     h.insert("x-accel-buffering", HeaderValue::from_static("no"));
     Ok(resp)
 }

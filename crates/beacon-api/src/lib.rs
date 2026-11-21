@@ -91,8 +91,7 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         }));
         api = api.merge(gated);
     }
-    let api = api.layer(axum::middleware::from_fn(security_headers));
-    match ui_dir {
+    let app = match ui_dir {
         // The built UI (ui/dist) is served from the same origin, so the
         // session cookie and EventSource work without CORS.
         Some(dir) => {
@@ -100,7 +99,8 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
             api.fallback_service(tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(index)))
         }
         None => api,
-    }
+    };
+    app.layer(axum::middleware::from_fn(security_headers))
 }
 
 /// Baseline security headers; API responses are never cached (they carry
