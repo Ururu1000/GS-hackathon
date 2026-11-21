@@ -211,11 +211,11 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
 
 /** "Open 17s ago · 6 times" in one line. */
 function OccurrenceChart({ series }: { series: Occurrences }) {
-  const buckets = series.counts.slice(-24)
-  if (!buckets.length) return null
-  const offset = series.counts.length - buckets.length
-  const from = Date.parse(series.from) + offset * series.bucket_seconds * 1000
+  const buckets = series.counts.slice(-24).map((count) => (typeof count === 'number' && Number.isFinite(count) && count > 0 ? count : 0))
   const step = series.bucket_seconds * 1000
+  const offset = series.counts.length - buckets.length
+  const from = Date.parse(series.from) + offset * step
+  if (!buckets.length || !Number.isFinite(from) || !Number.isFinite(step) || step <= 0) return null
   const high = Math.max(1, ...buckets)
   const total = buckets.reduce((sum, count) => sum + count, 0)
   return (

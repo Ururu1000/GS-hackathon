@@ -14,6 +14,7 @@ import type {
   Scalar,
   Severity,
 } from '../src/api/types.ts'
+import { redactText, redactValue } from '../src/lib/redact.ts'
 import { parseRuleStructure } from '../src/rules/structure.ts'
 
 const SEVERITIES: readonly Severity[] = ['critical', 'error', 'warning', 'info']
@@ -155,6 +156,7 @@ export const isLeaf = (c: Condition): c is Leaf => typeof (c as Leaf).op === 'st
 const MAX_REGEX_LEN = 256
 const MAX_REGEX_INPUT = 4096
 const NESTED_QUANTIFIER_RE = /\((?:[^()\\]|\\.)*[+*?](?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,?\d*\})/
+const QUANTIFIED_ALT_RE = /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,?\d*\})/
 const BACKREF_RE = /\\[1-9]/
 
 /** Compile a regex with basic ReDoS guards (production engine uses linear-time RE2/Rust regex). */
@@ -162,6 +164,7 @@ export function compileSafeRegex(pattern: string): { ok: true; re: RegExp } | { 
   if (pattern.length > MAX_REGEX_LEN) return { ok: false, error: `regex too long (max ${MAX_REGEX_LEN} chars)` }
   if (BACKREF_RE.test(pattern)) return { ok: false, error: 'backreferences are not allowed in regex' }
   if (NESTED_QUANTIFIER_RE.test(pattern)) return { ok: false, error: 'nested quantifiers are not allowed (ReDoS risk)' }
+  if (QUANTIFIED_ALT_RE.test(pattern)) return { ok: false, error: 'quantified alternation is not allowed (ReDoS risk)' }
   try {
     return { ok: true, re: new RegExp(pattern) }
   } catch (e) {
@@ -430,17 +433,22 @@ export interface Applied {
 }
 
 function present(rule: RuleSpec, ctx: Ctx, warnings: string[]): Applied {
-  const title = render(rule.present.title, ctx, warnings)
-  const body = render(rule.present.body ?? '', ctx, warnings)
+  const safeCtx: Ctx = {
+    ...ctx,
+    raw: redactValue(ctx.raw),
+    fields: redactValue(ctx.fields) as Record<string, unknown>,
+  }
+  const title = redactText(render(rule.present.title, safeCtx, warnings), 300)
+  const body = redactText(render(rule.present.body ?? '', safeCtx, warnings), 2000)
   const fields = fieldSpecs(rule).map(({ path, label }) => {
-    const v = getPath(ctx, path)
+    const v = getPath(safeCtx, path)
     if (v === MISSING) warnings.push(`field "${label}": ${path} is missing in this event`)
-    return { path, label, value: v === MISSING ? '—' : show(v) }
+    return { path, label, value: v === MISSING ? '—' : redactText(show(v), 500) }
   })
   const dedup_key = (rule.dedup?.key ?? []).map((p) => {
-    const v = getPath(ctx, p)
+    const v = getPath(safeCtx, p)
     if (v === MISSING) warnings.push(`dedup key ${p} is missing: such events would not merge into one alert`)
-    return v === MISSING ? '∅' : show(v)
+    return v === MISSING ? '∅' : redactText(show(v), 200)
   })
   const fsev = ctx.fields.severity as Severity
   const severity = rule.severity ?? (SEVERITIES.includes(fsev) ? fsev : 'warning')

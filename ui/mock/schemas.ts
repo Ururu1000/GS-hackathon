@@ -1,19 +1,54 @@
 import { isDeepStrictEqual } from 'node:util'
 import type { SchemaField, SchemaPreview, SchemaSpec } from '../src/api/screens.ts'
 import { COND_OPS, type Condition, type Scalar } from '../src/api/types.ts'
+import { FORBIDDEN_KEYS, hasForbiddenKey, isSensitivePath, redactValue } from '../src/lib/redact.ts'
 import { builtInMappings, evaluate, MISSING, unknownSignature, validateRule, type Ctx } from './engine.ts'
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value)
 const pathPattern = /^(?:\/[\S]*|[^.\s]+(?:\.[^.\s]+)*)$/
-const unsafeKeys = new Set(['__proto__', 'constructor', 'prototype'])
+const MAX_PATH_LEN = 256
+const MAX_PATH_SEGMENTS = 16
+const MAX_COND_NODES = 100
+const MAX_VALUE_DEPTH = 8
+const MAX_VALUE_JSON = 4_096
+const MAX_CONVERTED_STR = 2_048
 const severityRank: Record<string, number> = { info: 1, warning: 2, error: 3, critical: 4 }
 const isoTime = (value: number) => Number.isFinite(value) && Math.abs(value) <= 8.64e15 ? new Date(value).toISOString() : undefined
 
-function read(raw: unknown, path: string): unknown {
-  const parts = path.startsWith('/')
+function pathParts(path: string): string[] {
+  return path.startsWith('/')
     ? path.slice(1).split('/').map((part) => part.replaceAll('~1', '/').replaceAll('~0', '~'))
     : path.split('.')
+}
+
+function validPath(path: unknown): path is string {
+  if (typeof path !== 'string' || path.length > MAX_PATH_LEN || !pathPattern.test(path)) return false
+  const parts = pathParts(path)
+  return parts.length <= MAX_PATH_SEGMENTS && !parts.some((part) => FORBIDDEN_KEYS.has(part))
+}
+
+function validBoundedValue(value: unknown, depth = 0): boolean {
+  if (depth > MAX_VALUE_DEPTH) return false
+  if (value === undefined || value === null || typeof value !== 'object') return true
+  if (Array.isArray(value)) return value.length <= 50 && value.every((item) => validBoundedValue(item, depth + 1))
+  const entries = Object.entries(value as Record<string, unknown>)
+  return entries.length <= 50 && entries.every(([k, v]) => !FORBIDDEN_KEYS.has(k) && validBoundedValue(v, depth + 1))
+}
+
+function safeStaticValue(value: unknown): boolean {
+  if (value === undefined) return true
+  if (!validBoundedValue(value)) return false
+  try {
+    return (JSON.stringify(value)?.length ?? 0) <= MAX_VALUE_JSON
+  } catch {
+    return false
+  }
+}
+
+function read(raw: unknown, path: string): unknown {
+  const parts = pathParts(path)
+  if (parts.length > MAX_PATH_SEGMENTS) return MISSING
   let value = raw
   for (const part of parts) {
     if (!value || typeof value !== 'object' || !Object.hasOwn(value, part)) return MISSING
@@ -22,13 +57,13 @@ function read(raw: unknown, path: string): unknown {
   return value
 }
 
-function checkedCondition(value: unknown, depth = 0): Condition | null {
-  if (depth > 12 || !isRecord(value)) return null
+function checkedCondition(value: unknown, depth = 0, budget = { count: 0 }): Condition | null {
+  if (depth > 12 || ++budget.count > MAX_COND_NODES || !isRecord(value)) return null
   const variants = ['all', 'any', 'not', 'path'].filter((key) => Object.hasOwn(value, key))
   if (variants.length !== 1) return null
   const kind = variants[0]
   if (kind === 'not') {
-    const child = checkedCondition(value.not, depth + 1)
+    const child = checkedCondition(value.not, depth + 1, budget)
     return child ? { not: child } : null
   }
   if (kind === 'all' || kind === 'any') {
@@ -36,18 +71,19 @@ function checkedCondition(value: unknown, depth = 0): Condition | null {
     if (!Array.isArray(items) || !items.length || items.length > 50) return null
     const children: Condition[] = []
     for (const item of items) {
-      const child = checkedCondition(item, depth + 1)
+      const child = checkedCondition(item, depth + 1, budget)
       if (!child) return null
       children.push(child)
     }
     return kind === 'all' ? { all: children } : { any: children }
   }
-  if (typeof value.path !== 'string' || !pathPattern.test(value.path)) return null
+  if (!validPath(value.path)) return null
   const op = COND_OPS.find((candidate) => candidate === value.op)
   if (!op) return null
   const scalar = (v: unknown): v is Scalar => v === null || ['string', 'boolean', 'number'].includes(typeof v)
   const argument = value.value
-  const valid = op === 'exists' || op === 'not_exists' || scalar(argument) || (Array.isArray(argument) && argument.every(scalar))
+  const valid = op === 'exists' || op === 'not_exists' || scalar(argument) ||
+    (Array.isArray(argument) && argument.length <= 100 && argument.every(scalar))
   if (!valid) return null
   const leaf = {
     path: value.path, op,
@@ -58,6 +94,8 @@ function checkedCondition(value: unknown, depth = 0): Condition | null {
 }
 
 export function parseMapping(input: unknown): { spec: SchemaSpec } | { error: string } {
+  const forbidden = hasForbiddenKey(input)
+  if (forbidden) return { error: `Forbidden key "${forbidden}" in schema mapping` }
   if (!isRecord(input) || typeof input.schema !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(input.schema))
     return { error: 'Enter a schema name using letters, numbers, dots, dashes, or underscores' }
   const priority = input.priority ?? 0
@@ -66,17 +104,19 @@ export function parseMapping(input: unknown): { spec: SchemaSpec } | { error: st
   const detector = checkedCondition(input.detect)
   if (!detector || !isRecord(input.detect)) return { error: 'Add a valid detect condition with payload-relative paths' }
   const source = input.detect.source
-  if (source !== undefined && (typeof source !== 'string' || !/^[a-z0-9_-]+:[a-z0-9._-]+$/i.test(source)))
+  if (source !== undefined && (typeof source !== 'string' || source.length > 64 || !/^[a-z0-9_-]+:[a-z0-9._-]+$/i.test(source)))
     return { error: 'Detect source must identify a source, such as http:playground' }
   const fields = input.fields ?? {}
   if (!isRecord(fields) || Object.keys(fields).length > 50) return { error: 'Fields must contain up to 50 named mappings' }
   const mapped: [string, SchemaField][] = []
   for (const [name, value] of Object.entries(fields)) {
-    if (unsafeKeys.has(name) || !/^[a-zA-Z_][\w-]*$/.test(name) || !isRecord(value))
+    if (FORBIDDEN_KEYS.has(name) || !/^[a-zA-Z_][\w-]{0,63}$/.test(name) || !isRecord(value))
       return { error: `Invalid field: ${name}` }
     const { path, transform, enum: kind, as, equals } = value
     if ((path === undefined && !Object.hasOwn(value, 'value')) ||
-        (path !== undefined && (typeof path !== 'string' || !pathPattern.test(path))) ||
+        (path !== undefined && !validPath(path)) ||
+        !safeStaticValue(value.value) ||
+        !safeStaticValue(equals) ||
         (transform !== undefined && transform !== 'lower' && transform !== 'upper' && transform !== 'trim') ||
         (kind !== undefined && kind !== 'severity') ||
         (as !== undefined && as !== 'string' && as !== 'number' && as !== 'bool' && as !== 'rfc3339' && as !== 'epoch_ms' && as !== 'epoch_s'))
@@ -113,7 +153,10 @@ function convert(value: unknown, field: SchemaField): unknown {
     return Object.hasOwn(severityRank, severity) ? severity : undefined
   }
   switch (field.as) {
-    case 'string': return typeof value === 'string' ? value : value === undefined ? undefined : JSON.stringify(value)
+    case 'string': {
+      const str = typeof value === 'string' ? value : value === undefined ? undefined : JSON.stringify(value)
+      return str === undefined ? undefined : str.slice(0, MAX_CONVERTED_STR)
+    }
     case 'number': {
       const numeric = typeof value === 'string' && value.trim() ? Number(value) : value
       return typeof numeric === 'number' && Number.isFinite(numeric) ? numeric : undefined
@@ -130,11 +173,17 @@ export function previewMapping(spec: SchemaSpec, event: unknown, source: string)
   const mapped: [string, unknown][] = []
   const warnings: string[] = []
   for (const [name, field] of Object.entries(spec.fields)) {
+    const sensitiveSource = field.path !== undefined && isSensitivePath(field.path)
     const extracted = field.path === undefined ? MISSING : read(event, field.path)
+    if (sensitiveSource && extracted !== MISSING) {
+      mapped.push([name, '[REDACTED]'])
+      warnings.push(`${name}: sensitive source path redacted`)
+      continue
+    }
     const raw = extracted === MISSING ? field.value : extracted
     const value = raw === undefined ? undefined : convert(raw, field)
     if (value === undefined) warnings.push(`${name}: missing value or failed conversion`)
-    else mapped.push([name, value])
+    else mapped.push([name, redactValue(value)])
   }
   const fields = Object.fromEntries(mapped)
   if (typeof fields.severity === 'string' && Object.hasOwn(severityRank, fields.severity))

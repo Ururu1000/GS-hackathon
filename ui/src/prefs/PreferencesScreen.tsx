@@ -202,7 +202,7 @@ function PersonEditor({ person, me, teams, onSaved, onToast }: { person: PersonV
     lines: prefs.filter((p): p is Line => 'match' in p),
     fallback: (prefs.find((p) => 'default' in p) as { default: string[] } | undefined)?.default ?? null,
   })
-  const readOnly = person.can_edit === false || (person.can_edit === undefined && me !== null && person.id !== me)
+  const readOnly = person.can_edit === false || (person.can_edit === undefined && (me === null || person.id !== me))
   const initial = split(person.preferences)
   const [lines, setLines] = useState<Line[]>(initial.lines)
   const [fallback, setFallback] = useState<string[] | null>(initial.fallback)

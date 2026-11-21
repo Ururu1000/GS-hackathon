@@ -3,14 +3,39 @@
 const SENSITIVE_KEY =
   /(?:^|[_-])(pass(?:word|wd)?|pwd|secret|token|api[-_]?key|auth(?:orization)?|cookie|cred(?:ential)?s?|private[-_]?key|access[-_]?key|session|ssn|tax[-_]?id|iban|account[-_]?num(?:ber)?|card[-_]?num(?:ber)?|cvv|cvc|pin|sms[-_]?code|otp|email|e[-_]?mail|phone|mobile|tel(?:ephone)?)(?:$|[_-])/i
 
-const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+export const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+export function hasForbiddenKey(value: unknown, maxDepth = 20, depth = 0): string | null {
+  if (depth > maxDepth || value === null || typeof value !== 'object') return null
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const bad = hasForbiddenKey(item, maxDepth, depth + 1)
+      if (bad) return bad
+    }
+    return null
+  }
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (FORBIDDEN_KEYS.has(key)) return key
+    const bad = hasForbiddenKey((value as Record<string, unknown>)[key], maxDepth, depth + 1)
+    if (bad) return bad
+  }
+  return null
+}
+
+/** True if any segment of a dot-separated or JSON Pointer path names a sensitive key. */
+export function isSensitivePath(path: string): boolean {
+  const parts = path.startsWith('/')
+    ? path.slice(1).split('/').map((part) => part.replaceAll('~1', '/').replaceAll('~0', '~'))
+    : path.split('.')
+  return parts.some((part) => part !== '' && isSensitiveKey(part))
+}
 
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g
 const KV_SECRET_RE =
   /\b(password|passwd|secret|token|api[_-]?key|authorization|cookie)\s*([=:])\s*([^\s,;'"`]+)/gi
 const EMAIL_RE = /\b([A-Za-z0-9._%+-])([A-Za-z0-9._%+-]*)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g
-const PHONE_RE = /(?<!\w)(\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?){2,}\d{3,4}(?!\w)/g
+const PHONE_RE = /(?<![\w-])(\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?){2,}\d{3,4}(?![\w-])/g
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g
 
 export const isSensitiveKey = (key: string): boolean => SENSITIVE_KEY.test(key)

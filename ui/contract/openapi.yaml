@@ -359,6 +359,7 @@ paths:
   /api/schemas:
     get:
       operationId: listSchemaMappings
+      summary: Published schema mappings visible to the session
       responses:
         '200':
           description: Published schema mappings
@@ -367,7 +368,7 @@ paths:
               schema: { type: array, items: { $ref: '#/components/schemas/SchemaMapping' } }
     post:
       operationId: publishSchemaMapping
-      summary: Create or publish a new revision of a schema mapping
+      summary: Create or publish a new revision of a schema mapping (requires team membership; sensitive source paths are redacted)
       parameters: [ { $ref: '#/components/parameters/Csrf' } ]
       requestBody:
         required: true
@@ -471,7 +472,7 @@ paths:
   /api/simulator/messages:
     get:
       operationId: listSimulatorMessages
-      summary: SMS and phone receipts from the development gateway
+      summary: SMS and phone receipts from the development gateway (dev/demo only; approval challenges restricted to team members)
       parameters:
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -483,8 +484,8 @@ paths:
   /api/simulator/stream:
     get:
       operationId: streamSimulatorMessages
-      summary: Live SMS and phone receipts
-      description: SSE emits a snapshot with a SimulatorPage followed by simulator.message events with a SimulatorMessage.
+      summary: Live SMS and phone receipts (dev/demo only; Cache-Control no-store)
+      description: SSE emits a snapshot with a SimulatorPage followed by simulator.message events with a SimulatorMessage. Must not be exposed in production deployments.
       responses:
         '200':
           description: Event stream
@@ -494,8 +495,8 @@ paths:
   /api/simulator/reply:
     post:
       operationId: replyFromSimulator
-      summary: Send an approval reply from a simulated device
-      description: The gateway forwards a reply from the SMS recipient to the signed delivery callback. The service applies the approval's eligibility, expiry, and attempt limit.
+      summary: Send an approval reply from a simulated device (dev/demo only; rate-limited and team-scoped)
+      description: Development/demo gateway only (must not be exposed in production). The gateway forwards a reply from the SMS recipient to the signed delivery callback. The service applies team authorization, approval eligibility, expiry, constant-time code verification, and attempt limits.
       parameters: [ { $ref: '#/components/parameters/Csrf' } ]
       requestBody:
         required: true

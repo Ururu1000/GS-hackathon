@@ -18,12 +18,13 @@ interface Props {
 
 const FORMAT_LABEL: Record<string, string> = { yaml: 'Steps', markdown: 'Checklist', link: 'Wiki page', text: 'Notes' }
 
-/** Only http(s) links are followed; anything else is shown as text. */
+/** Only http(s) links without embedded credentials are followed; anything else is shown as text. */
 export function safeUrl(u: string | null): string | null {
-  if (!u) return null
+  if (!u || u.length > 2048 || /[\x00-\x1f\x7f]/.test(u)) return null
   try {
     const url = new URL(u)
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null
+    if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return null
+    return url.href
   } catch {
     return null
   }

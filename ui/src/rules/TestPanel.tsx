@@ -22,6 +22,7 @@ interface Props {
 
 const DEBOUNCE_MS = 300
 const MAX_EVENT_CHARS = 64 * 1024
+const SOURCE_RE = /^[a-z0-9_-]+:[a-z0-9._-]+$/i
 const ALLOWED_SOURCES = [...new Set([...SAMPLES.map((s) => s.source), 'http:playground'])]
 
 export function TestPanel({ rule, team, initialSample, initialEvent, mockTransports = false, onResult, onToast }: Props) {
@@ -29,7 +30,9 @@ export function TestPanel({ rule, team, initialSample, initialEvent, mockTranspo
   const available = discovered ? [discovered, ...SAMPLES] : SAMPLES
   const first = discovered ?? SAMPLES.find((s) => s.id === initialSample) ?? SAMPLES[0]!
   const replaySources = mockTransports ? ALLOWED_SOURCES : ALLOWED_SOURCES.filter((source) => source.startsWith('http:'))
-  const allowedSources = [...new Set([...replaySources, ...(initialEvent && (mockTransports || initialEvent.source.startsWith('http:')) ? [initialEvent.source] : [])])]
+  const validInitialSource = initialEvent && initialEvent.source.length <= 64 && SOURCE_RE.test(initialEvent.source) &&
+    (mockTransports || initialEvent.source.startsWith('http:'))
+  const allowedSources = [...new Set([...replaySources, ...(validInitialSource ? [initialEvent.source] : [])])]
   const [text, setText] = useState(() => JSON.stringify(first.event, null, 2))
   const [source, setSource] = useState(first.source)
   const [picked, setPicked] = useState(`sample:${first.id}`)

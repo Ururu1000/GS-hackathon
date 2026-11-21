@@ -239,5 +239,9 @@ export const decideApproval = (id: string, op: 'approve' | 'reject', note?: stri
   post<{ execution_id?: string }>(`/api/approvals/${enc(id)}/${op}`, note ? { note } : {})
 
 /** Ingest a raw event on a source, as an external system would. */
-export const ingest = (source: string, raw: unknown) =>
-  post<{ id: string; matched_alerts?: string[] }>(`/ingest/${enc(source.replace(/^http:/, ''))}`, raw)
+export const ingest = (source: string, raw: unknown) => {
+  const slug = source.replace(/^http:/, '')
+  if (!slug || slug === '.' || slug === '..' || slug.length > 64 || !/^[a-z0-9_.:-]+$/i.test(slug))
+    return Promise.reject(new Error('Invalid ingest source'))
+  return post<{ id: string; matched_alerts?: string[] }>(`/ingest/${enc(slug)}`, raw)
+}

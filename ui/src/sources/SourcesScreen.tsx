@@ -5,13 +5,18 @@ import {
   listDiscoveredSchemas, listSchemaMappings, listSources, previewSchemaMapping, saveSchemaMapping,
   type DiscoveredSchema, type SchemaMapping, type SchemaPreview, type SourceView,
 } from '../api/screens'
+import { FORBIDDEN_KEYS, hasForbiddenKey, isSensitivePath, redactValue } from '../lib/redact'
 import { absTime } from '../lib/time'
 import { flattenPaths, slugify } from '../rules/draft'
 
+const MAX_INPUT_CHARS = 64 * 1024
 const keyFor = (item: DiscoveredSchema) => JSON.stringify([item.schema, item.source])
 
 function mappingTemplate(sample: DiscoveredSchema | null) {
-  const path = sample ? flattenPaths('', sample.sample)[0]?.path : undefined
+  const path = sample
+    ? flattenPaths('', sample.sample).find(({ path: p }) =>
+      !p.split('.').some((seg) => FORBIDDEN_KEYS.has(seg)) && !isSensitivePath(p))?.path
+    : undefined
   return stringify({
     schema: path ? `custom.${slugify(path) || 'event'}` : 'custom.event',
     priority: 50,
@@ -57,6 +62,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
     setBusy(true)
     setFeedback(null)
     try {
+      if (payload.length > MAX_INPUT_CHARS) throw new Error('Event JSON must be 64 KiB or smaller.')
       const raw: unknown = JSON.parse(payload)
       await ingest('http:playground', raw)
       await load()
@@ -81,9 +87,13 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
     setFeedback(null)
     try {
       setPreview(null)
+      if (mapping.text.length > MAX_INPUT_CHARS) throw new Error('Mapping YAML must be 64 KiB or smaller.')
       const doc = parseDocument(mapping.text, { uniqueKeys: true })
       if (doc.errors[0]) throw new Error(doc.errors[0].message)
       const spec: unknown = doc.toJS({ maxAliasCount: 20 })
+      JSON.stringify(spec)
+      const forbidden = hasForbiddenKey(spec)
+      if (forbidden) throw new Error(`Forbidden key "${forbidden}" in mapping YAML.`)
       if (save) {
         const saved = await saveSchemaMapping(spec, mapping.saved?.revision)
         editMapping(saved)
@@ -91,6 +101,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
         setFeedback({ kind: 'ok', text: `Saved ${saved.spec.schema} revision ${saved.revision}.` })
       } else {
         const selectedSample = previewFrom === 'discovered' ? sample : null
+        if (!selectedSample && payload.length > MAX_INPUT_CHARS) throw new Error('Event JSON must be 64 KiB or smaller.')
         const raw: unknown = selectedSample ? selectedSample.sample : JSON.parse(payload)
         setPreview(await previewSchemaMapping(spec, raw, selectedSample?.source ?? 'http:playground'))
       }
@@ -156,7 +167,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                   </label>
                   {sample && (
                     <>
-                      <pre className="feature-code">{JSON.stringify(sample.sample, null, 2)}</pre>
+                      <pre className="feature-code">{JSON.stringify(redactValue(sample.sample), null, 2)}</pre>
                       <p className="hint">Last received {absTime(sample.last_seen)}</p>
                       <div className="inline wrap">
                         <button className="btn btn-primary" onClick={() => onCreateRule(sample)}>Create rule from this event</button>
@@ -171,7 +182,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
               <div className="card-head">
                 <div>
                   <h2>Send a sample</h2>
-                  <span className="hint">Ingests into the live feed on <code>http:playground</code>.</span>
+                  <span className="hint">Ingests into the live feed on <code>http:playground</code>. Avoid pasting real secrets or personal data.</span>
                 </div>
               </div>
               <label className="form-field">
@@ -219,7 +230,7 @@ export function SourcesScreen({ onCreateRule }: { onCreateRule: (sample: Discove
                 {preview && (
                   <div className={preview.matched ? 'notice' : 'notice notice-warn'}>
                     <p role="status"><strong>{preview.matched ? 'The detector matches this sample.' : 'The detector does not match this sample.'}</strong></p>
-                    <pre className="feature-code">{JSON.stringify(preview.fields, null, 2)}</pre>
+                    <pre className="feature-code">{JSON.stringify(redactValue(preview.fields), null, 2)}</pre>
                     {preview.warnings.length > 0 && <ul>{preview.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
                   </div>
                 )}

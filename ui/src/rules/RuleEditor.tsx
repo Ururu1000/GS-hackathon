@@ -7,6 +7,7 @@ import { createRule, deleteRule, errorText, getRule, HttpError, isConflict, list
 import type { DiscoveredSchema } from '../api/screens'
 import { SEVERITIES, type NodeDiagnostic, type PersonDirectoryEntry, type RuleItem, type RuleSpec, type RuleTestResult, type RunbookSummary, type TeamView } from '../api/types'
 import { SEVERITY_LABEL } from '../alert/badges'
+import { FORBIDDEN_KEYS, isSensitivePath } from '../lib/redact'
 import { relTime } from '../lib/time'
 import { ConditionBuilder } from './ConditionBuilder'
 import { flattenPaths, fromYaml, ruleEquals, slugify, TEMPLATES, toYaml } from './draft'
@@ -380,10 +381,10 @@ function guessSample(r: RuleSpec): string {
 function eventRule(sample: DiscoveredSchema, team: string): RuleSpec {
   const fields = flattenPaths('raw', sample.sample)
     .filter(({ path }) => {
-      if (!/^raw(?:\.[^.\s]+)+$/.test(path)) return false
+      if (!/^raw(?:\.[^.\s]+)+$/.test(path) || isSensitivePath(path)) return false
       let value = sample.sample
       for (const segment of path.split('.').slice(1)) {
-        if (value === null || typeof value !== 'object' || !Object.hasOwn(value, segment)) return false
+        if (FORBIDDEN_KEYS.has(segment) || value === null || typeof value !== 'object' || !Object.hasOwn(value, segment)) return false
         value = (value as Record<string, unknown>)[segment]
       }
       return true

@@ -44,7 +44,11 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
     }
     try {
       const content = await file.text()
-      change({ content, title: draft.title || file.name.replace(/\.[^.]+$/, '') })
+      if (content.length > 64 * 1024) {
+        setProblem('The file must be 64 KiB or smaller.')
+        return
+      }
+      change({ content, title: draft.title || file.name.replace(/\.[^.]+$/, '').slice(0, 120) })
     } catch (e) {
       setProblem(errorText(e))
     }
@@ -116,7 +120,7 @@ export function RunbooksScreen({ teams, team, canImport }: { teams: Session['tea
           <label className="form-field">
             <span className="label">{draft.format === 'link' ? 'Runbook URL' : 'Runbook content'}</span>
             {draft.format === 'link'
-              ? <input className="input mono" type="url" value={draft.content} disabled={busy} onChange={(e) => change({ content: e.target.value })} placeholder="https://wiki.example/runbook" />
+              ? <input className="input mono" type="url" maxLength={2048} value={draft.content} disabled={busy} onChange={(e) => change({ content: e.target.value })} placeholder="https://wiki.example/runbook" />
               : <textarea className="input mono feature-textarea" rows={10} value={draft.content} maxLength={64 * 1024} disabled={busy} onChange={(e) => change({ content: e.target.value })} />}
           </label>
           <div className="inline wrap">

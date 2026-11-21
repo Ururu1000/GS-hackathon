@@ -17,7 +17,7 @@
 //                          (default: retries fail, so "retry fails twice →
 //                          escalate" can be shown); also POST /api/__mock/workflow-engine?ok=1
 
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type {
   AlertDetail,
@@ -46,7 +46,7 @@ import type {
   TransitionRequest,
 } from '../src/api/types.ts'
 import type { DiscoveredSchema, SchemaMapping, SourceView } from '../src/api/screens.ts'
-import { createSimulator } from './simulator.ts'
+import { createSimulator, type DeviceRecord } from './simulator.ts'
 import { importRunbook, prepareRunbook } from './import-runbook.ts'
 import { mappedContext, parseMapping, previewMapping } from './schemas.ts'
 import { internationalPhone } from '../src/lib/phone.ts'
@@ -99,9 +99,28 @@ const MAX_BODY_BYTES = 256 * 1024
 const MAX_BURST = 5_000
 const INGEST_WINDOW_MS = 60_000
 const INGEST_MAX_PER_WINDOW = 120
+const REPLY_WINDOW_MS = 60_000
+const REPLY_MAX_PER_WINDOW = 30
+const MAX_SSE_CLIENTS = 100
 const SOURCE_RE = /^[a-z0-9_-]+:[a-z0-9._-]+$/i
+const RECIPIENT_RE = /^[a-z0-9_-]{1,64}$/i
 const HOUR = 3_600_000
 const clone = <T>(v: T): T => structuredClone(v)
+
+function verifySmsCode(code: string | undefined, expectedHash: string | null | undefined): boolean {
+  if (!code || !expectedHash) return false
+  const actual = createHash('sha256').update(code).digest()
+  const expected = Buffer.from(expectedHash, 'hex')
+  return actual.length === expected.length && timingSafeEqual(actual, expected)
+}
+
+function decodeCursor(cursor: string): [string, string] | null {
+  if (cursor.length > 256 || !/^[A-Za-z0-9_-]+$/.test(cursor)) return null
+  const decoded = Buffer.from(cursor, 'base64url').toString()
+  const parts = decoded.split('|')
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null
+  return [parts[0], parts[1]]
+}
 
 function safeDecode(s: string): string | null {
   try {
@@ -150,6 +169,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   const eventContext = (event: unknown, source: string) =>
     mappedContext(event, source, Array.from(schemas.values(), (item) => item.spec))
   const ingestHits: number[] = []
+  const replyHits: number[] = []
 
   const allowedVisibleTeams = (): Set<string> => {
     const raw = process.env.MOCK_TEAMS?.trim()
@@ -159,7 +179,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   const canSeeTeam = (teamId: string | null) => teamId === null || allowedVisibleTeams().has(teamId)
   const isTeamMember = (teamId: string) => teams.get(teamId)?.members.includes(ME_ID) ?? false
   const isTeamLead = (teamId: string) => teams.get(teamId)?.lead === ME_ID
-  const simulator = createSimulator(canSeeTeam)
+  const simulator = createSimulator(canSeeTeam, isTeamMember)
   const pendingDeviceAlerts = new Set<string>()
   const canEditPerson = (personId: string) => personId === ME_ID
   let idSeq = 0
@@ -470,8 +490,11 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       .sort((x, y) => (x.first_seen < y.first_seen ? 1 : x.first_seen > y.first_seen ? -1 : x.id < y.id ? 1 : -1))
     const cursor = q?.get('cursor')
     if (cursor) {
-      const [fs, id] = Buffer.from(cursor, 'base64url').toString().split('|')
-      items = items.filter((a) => a.first_seen < fs! || (a.first_seen === fs && a.id < id!))
+      const pair = decodeCursor(cursor)
+      if (pair) {
+        const [fs, id] = pair
+        items = items.filter((a) => a.first_seen < fs || (a.first_seen === fs && a.id < id))
+      }
     }
     const limit = Math.min(Number(q?.get('limit') ?? SNAPSHOT_LIMIT) || SNAPSHOT_LIMIT, SNAPSHOT_LIMIT)
     const slice = items.slice(0, limit)
@@ -483,14 +506,17 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   function openStream(req: IncomingMessage, res: ServerResponse, url: URL) {
     const team = url.searchParams.get('team') || null
     if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team')
+    const recipient = url.searchParams.get('recipient') || null
+    if (recipient !== null && !RECIPIENT_RE.test(recipient)) return err(res, 400, 'bad_request', 'Invalid recipient filter')
+    if (clients.size >= MAX_SSE_CLIENTS) return err(res, 503, 'service_unavailable', 'Too many open streams')
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-store',
+      'X-Content-Type-Options': 'nosniff',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
     res.write('retry: 1500\n\n')
-    const recipient = url.searchParams.get('recipient') || null
     const client: Client = { res, team, recipient }
     // Subscribe first, then snapshot (trivially consistent here: one thread).
     clients.add(client)
@@ -582,7 +608,11 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
   // ---- HTTP ----------------------------------------------------------------
 
   function json(res: ServerResponse, status: number, body: unknown) {
-    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+    res.writeHead(status, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    })
     res.end(JSON.stringify(body))
   }
   const err = (res: ServerResponse, status: number, code: string, message: string, extra: Partial<ApiError['error']> = {}) =>
@@ -667,26 +697,68 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     }
     if (path === '/api/simulator/reply' && method === 'POST') {
       return write(req, res, (b: { from?: string; text?: string; receipt_id?: string }) => {
+        const now = Date.now()
+        while (replyHits.length && now - replyHits[0]! > REPLY_WINDOW_MS) replyHits.shift()
+        if (replyHits.length >= REPLY_MAX_PER_WINDOW)
+          return err(res, 429, 'rate_limited', 'Too many SMS reply attempts; try again shortly')
+        replyHits.push(now)
         const from = typeof b.from === 'string' && internationalPhone(b.from)
         if (!from || typeof b.text !== 'string' || !b.text.trim() || b.text.length > 160 ||
-            (b.receipt_id !== undefined && typeof b.receipt_id !== 'string'))
+            (b.receipt_id !== undefined && (typeof b.receipt_id !== 'string' || b.receipt_id.length > 128)))
           return err(res, 400, 'bad_request', 'A phone number and an SMS reply are required')
         const answer = b.text.trim().match(/^([YN])\s+(\d{4})$/i)
-        const entry = simulator.approvalSms(from, answer?.[2], b.receipt_id)
-        if (!entry?.approval) return json(res, 200, { outcome: 'unknown' })
-        const a = alerts.get(entry.message.alert_id)
-        const step = entry.approval.step
-        const approval = a?.runbook.get(step)?.approvals.find((request) => request.id === entry.approval?.id)
-        if (!a || !approval || !approval.eligible.includes(entry.message.recipient) || approval.requested_by === entry.message.recipient)
+        const resolveApproval = (entry: DeviceRecord) => {
+          if (!entry.approval) return null
+          const alert = alerts.get(entry.message.alert_id)
+          const step = entry.approval.step
+          const approval = alert?.runbook.get(step)?.approvals.find((request) => request.id === entry.approval?.id)
+          if (!alert || !approval) return null
+          return { alert, step, approval }
+        }
+        const isPending = (entry: DeviceRecord) => {
+          const found = resolveApproval(entry)
+          return Boolean(
+            found &&
+            found.alert.feed.status !== 'resolved' &&
+            found.approval.state === 'pending' &&
+            Date.parse(found.approval.expires_at) > now &&
+            found.approval.eligible.includes(entry.message.recipient) &&
+            found.approval.requested_by !== entry.message.recipient,
+          )
+        }
+        const codeMatches = (entry: DeviceRecord) => {
+          const found = resolveApproval(entry)
+          return Boolean(found && verifySmsCode(answer?.[2], found.approval.sms_code_hash))
+        }
+        const lookup = simulator.approvalSms(from, isPending, codeMatches, b.receipt_id)
+        if (lookup.kind === 'none' || lookup.kind === 'ambiguous') return json(res, 200, { outcome: 'unknown' })
+        if (lookup.kind === 'mismatch') {
+          let anyActive = false
+          for (const candidate of lookup.pending) {
+            const found = resolveApproval(candidate)
+            if (!found) continue
+            const attempts = found.approval.sms_attempts ?? 0
+            if (attempts < 5) {
+              found.approval.sms_attempts = attempts + 1
+              anyActive = true
+            }
+          }
+          return json(res, 200, { outcome: anyActive ? 'wrong_code' : 'too_many_attempts' })
+        }
+        const entry = lookup.record
+        const found = resolveApproval(entry)
+        if (!found || !found.approval.eligible.includes(entry.message.recipient) || found.approval.requested_by === entry.message.recipient)
           return json(res, 200, { outcome: 'unknown' })
-        if (a.feed.status === 'resolved' || approval.state !== 'pending' || Date.parse(approval.expires_at) <= Date.now())
+        const { alert: a, step, approval } = found
+        if (a.feed.status === 'resolved' || approval.state !== 'pending' || Date.parse(approval.expires_at) <= now)
           return json(res, 200, { outcome: 'already_decided' })
-        if (entry.approval.attempts >= 5) return json(res, 200, { outcome: 'too_many_attempts' })
-        if (!answer?.[2] || createHash('sha256').update(answer[2]).digest('hex') !== approval.sms_code_hash) {
-          entry.approval.attempts++
+        const attempts = approval.sms_attempts ?? 0
+        if (attempts >= 5) return json(res, 200, { outcome: 'too_many_attempts' })
+        if (!verifySmsCode(answer?.[2], approval.sms_code_hash)) {
+          approval.sms_attempts = attempts + 1
           return json(res, 200, { outcome: 'wrong_code' })
         }
-        const decision = answer[1]?.toUpperCase() === 'Y' ? 'approve' : 'reject'
+        const decision = answer![1]!.toUpperCase() === 'Y' ? 'approve' : 'reject'
         const result = completeApproval(a, step, approval, decision, entry.message.recipient, 'SMS reply')
         json(res, 200, { outcome: result.state, approval_id: approval.id, execution_id: result.execution_id })
       })
@@ -695,6 +767,12 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     if (path === '/api/alerts' && method === 'GET') {
       const team = url.searchParams.get('team') || null
       if (!canSeeTeam(team)) return err(res, 403, 'forbidden', 'You do not have access to this team'), true
+      const recipient = url.searchParams.get('recipient') || null
+      if (recipient !== null && !RECIPIENT_RE.test(recipient))
+        return err(res, 400, 'bad_request', 'Invalid recipient filter'), true
+      const cursor = url.searchParams.get('cursor')
+      if (cursor !== null && !decodeCursor(cursor))
+        return err(res, 400, 'bad_request', 'Invalid cursor'), true
       return json(res, 200, page(team, url.searchParams)), true
     }
 
@@ -776,6 +854,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
             can_decide: false,
             sms_sent: eligible.length > 0,
             sms_code_hash: createHash('sha256').update(rawCode).digest('hex'),
+            sms_attempts: 0,
             decided_by: null,
             decided_at: null,
             note: null,
@@ -789,7 +868,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
               receipt_id: uid('sms'), job_id: request.id, alert_id: a.feed.id, channel: 'sms',
               recipient, to, text: `Approve “${d.action.label}” on ${redactText(a.feed.title, 160)}? Reply Y ${rawCode} or N ${rawCode}.`,
               approval_challenge: `Y ${rawCode}`, duplicates: 0, received_at: request.requested_at,
-            }, { id: request.id, step, attempts: 0 })
+            }, { id: request.id, step }, to)
           }
           note(a, 'approval', ME, `Asked for approval to run “${d.action.label}” (${redactText(view.text, 160)})`)
           touch(a)
@@ -844,9 +923,11 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     if (path === '/api/schemas' && method === 'GET') return json(res, 200, [...schemas.values()]), true
     if (path === '/api/schemas/preview' && method === 'POST') {
       return write(req, res, (b: { spec: unknown; event: unknown; source?: string }) => {
+        if (b.source !== undefined && (typeof b.source !== 'string' || b.source.length > 64 || !SOURCE_RE.test(b.source)))
+          return err(res, 422, 'invalid', 'Invalid source name')
         const parsed = parseMapping(b.spec)
         if ('error' in parsed) return err(res, 422, 'invalid', parsed.error)
-        const source = typeof b.source === 'string' ? b.source : 'http:playground'
+        const source = b.source ?? 'http:playground'
         const result = previewMapping(parsed.spec, b.event, source)
         json(res, 200, { ...result, fields: redactValue(result.fields) })
       })
@@ -940,6 +1021,12 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     }
     if (path === '/api/runbooks/import' && method === 'POST') {
       return write(req, res, (input: unknown) => {
+        const rawTeam = input && typeof input === 'object' && !Array.isArray(input)
+          ? (input as Record<string, unknown>).team
+          : undefined
+        const requestedTeam = typeof rawTeam === 'string' ? rawTeam.trim() : ''
+        if (requestedTeam && (!canSeeTeam(requestedTeam) || !isTeamMember(requestedTeam)))
+          return err(res, 403, 'forbidden', 'Only team members can import runbooks for that team')
         try {
           const { draft, preview } = prepareRunbook(input)
           if (!canSeeTeam(draft.team) || !isTeamMember(draft.team)) return err(res, 403, 'forbidden', 'Only team members can import runbooks for that team')
@@ -951,6 +1038,12 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     }
     if (path === '/api/runbooks' && method === 'POST') {
       return write(req, res, (input: unknown) => {
+        const rawTeam = input && typeof input === 'object' && !Array.isArray(input)
+          ? (input as Record<string, unknown>).team
+          : undefined
+        const requestedTeam = typeof rawTeam === 'string' ? rawTeam.trim() : ''
+        if (requestedTeam && (!canSeeTeam(requestedTeam) || !isTeamMember(requestedTeam)))
+          return err(res, 403, 'forbidden', 'Only team members can import runbooks for that team')
         try {
           const book = importRunbook(input)
           if (book.team === null || !canSeeTeam(book.team) || !isTeamMember(book.team))
