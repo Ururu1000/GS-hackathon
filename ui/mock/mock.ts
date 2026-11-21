@@ -37,6 +37,7 @@ import type {
   RuleSpec,
   RuleTestRequest,
   RuleWrite,
+  RunbookDetail,
   RunbookSummary,
   Session,
   Severity,
@@ -54,7 +55,7 @@ import { redactText, redactValue } from '../src/lib/redact.ts'
 import { inWindow, parseWindow, resolveChannels } from '../src/prefs/resolve.ts'
 import { applyRule, dedupKey, parseDuration, recovers, testRule, validateRule, type Ctx } from './engine.ts'
 import { failedRuns, renderActionParams, runtimeOf, viewRunbook, type RunbookRuntime, type StoredApproval } from './runbooks.ts'
-import { deliveriesFor, PEOPLE, randomEvent, RULES, RUNBOOKS, TEAMS, type DeliveryPlan, type RunbookDef } from './scenario.ts'
+import { deliveriesFor, PEOPLE, randomEvent, reviseRunbook, RULES, RUNBOOKS, TEAMS, type DeliveryPlan, type RunbookDef } from './scenario.ts'
 
 interface MockAlert {
   feed: FeedAlert
@@ -64,6 +65,8 @@ interface MockAlert {
   plan: DeliveryPlan
   occurrences: Map<number, number>
   runbookId: string | null
+  /** The runbook as it was when the alert first notified (frozen per alert, like alert_runbooks). */
+  frozenRunbook: RunbookDef | null
   runbook: RunbookRuntime
   /** Version at the last status change; 409s compare against this. */
   statusVersion: number
@@ -326,6 +329,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         plan: plan(rule, ctx, m.severity, at),
         occurrences: new Map([[hour, 1]]),
         runbookId: rule.runbook ?? null,
+        frozenRunbook: rule.runbook ? runbooks.get(rule.runbook) ?? null : null,
         runbook: new Map(),
         statusVersion: 1,
         samples: [sample],
@@ -365,7 +369,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
 
   // ---- runbook actions: off the alert pipeline, async (spec §6.2) ---------
 
-  const def = (a: MockAlert) => a.runbookId ? runbooks.get(a.runbookId) ?? null : null
+  const def = (a: MockAlert) => a.frozenRunbook
   const stepDef = (a: MockAlert, step: string) => def(a)?.steps.find((s) => s.id === step) ?? null
 
   function actionOutcome(a: MockAlert, name: string, params: Record<string, string>): { ok: boolean; output: string } {
@@ -647,8 +651,25 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
     return true
   }
 
+  function runbookDetail(book: RunbookDef): RunbookDetail {
+    return {
+      id: book.id,
+      revision: book.revision ?? 1,
+      title: book.title,
+      format: book.format,
+      team: book.team,
+      steps: book.steps.map((d) => ({
+        id: d.id,
+        kind: d.kind,
+        text: d.text,
+        action: d.action ? { name: d.action.name, label: d.action.label } : null,
+        approval: d.approval === 'required' || d.action?.risk === 'high' ? 'required' : 'none',
+      })),
+    }
+  }
+
   function runbookSummary(book: RunbookDef): RunbookSummary {
-    return { id: book.id, title: book.title, format: book.format, team: book.team, steps: book.steps.length }
+    return { id: book.id, revision: book.revision ?? 1, title: book.title, format: book.format, team: book.team, steps: book.steps.length }
   }
 
   function detail(a: MockAlert): AlertDetail {
@@ -1043,6 +1064,11 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       const items = [...runbooks.values()].filter((r) => r.team === null || allowed.has(r.team)).map(runbookSummary)
       return json(res, 200, { items }), true
     }
+    if ((m = path.match(/^\/api\/runbooks\/([^/]+)$/)) && m[1] !== 'import' && method === 'GET') {
+      const book = runbooks.get(decodeURIComponent(m[1]!))
+      if (!book || (book.team !== null && !allowedVisibleTeams().has(book.team))) return err(res, 404, 'not_found', 'No such runbook'), true
+      return json(res, 200, runbookDetail(book)), true
+    }
     if (path === '/api/runbooks/import' && method === 'POST') {
       return write(req, res, (input: unknown) => {
         const rawTeam = input && typeof input === 'object' && !Array.isArray(input)
@@ -1288,6 +1314,12 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       const a = alerts.get(ids[Math.floor(Math.random() * ids.length)]!)
       if (a && t - Date.parse(a.feed.last_seen) > 300_000) transition(a, 'resolved', pickActor(), 'user', new Date(t))
     }
+  }
+  // Publish a newer revision of some runbooks: seeded alerts keep the copy they
+  // froze, so resolved ones show what changed since the incident.
+  for (const book of [...runbooks.values()]) {
+    const next = reviseRunbook(book)
+    if (next) runbooks.set(next.id, next)
   }
   // Age some of the history: older alerts are mostly acked or resolved.
   for (const a of alerts.values()) {

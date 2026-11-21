@@ -110,5 +110,5 @@ export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewe
       approval_request: last ? publicApproval(last, viewer) : null,
     }
   })
-  return { id: def.id, revision: 1, title: redactText(def.title, 120), format: def.format, url: def.url ?? null, text: def.text ? redactText(def.text) : null, steps }
+  return { id: def.id, revision: def.revision ?? 1, title: redactText(def.title, 120), format: def.format, url: def.url ?? null, text: def.text ? redactText(def.text) : null, steps }
 }

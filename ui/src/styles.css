@@ -1356,6 +1356,11 @@ input[type='checkbox'], input[type='radio'] { accent-color: var(--primary); }
 .diff-add .diff-op { color: var(--success-foreground); }
 .diff-del { background: var(--error-surface); }
 .diff-del .diff-op { color: var(--error-foreground); }
+.rb-diff { list-style: none; }
+.rb-diff .diff-line { white-space: pre-wrap; }
+.rb-diff-changed + li, li + .rb-diff-changed { margin-top: 4px; }
+.rb-done { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
+.rb-changes { display: flex; flex-direction: column; gap: 8px; }
 .diff-gap { color: var(--faint); font-style: italic; padding-left: 22px; font-family: var(--font-sans); }
 .diff-preview > summary { cursor: pointer; color: var(--muted-foreground); margin-bottom: 6px; }
 
