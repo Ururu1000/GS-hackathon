@@ -9,7 +9,7 @@ use std::time::Duration;
 use beacon_delivery::channel::gateway_client::{GatewayChannel, GatewayClientConfig, GatewayKind};
 use beacon_delivery::channel::{Channel, OutboundMessage, SendError};
 use beacon_delivery::gateway::{self, GatewayState, OutageMode, SimMessage};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -1196,4 +1196,207 @@ async fn open_simulator_stream_does_not_block_shutdown(pool: PgPool) {
         .expect("serve must return while a stream is open")
         .expect("serve task")
         .expect("serve");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 14. An approval prompt that lost its race with the decision lands masked (S11-9).
+// ---------------------------------------------------------------------------------------------
+
+/// One alert + pending approval + its prompt sms job, straight into the tables. Returns
+/// `(alert, approval, prompt job)`.
+async fn seed_prompt(pool: &PgPool, code: &str) -> (Uuid, Uuid, Uuid) {
+    let alert = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO alerts (id, rule_id, rule_revision, rule_name, team, fingerprint, \
+                             dedup_window_ms, status, severity, color, title, body, \
+                             first_seen, last_seen, source, schema, notify_seq) \
+         VALUES ($1, 'rates-rejected-trades', 1, 'Rates rejected trades', 'rates', $2, \
+                 600000, 'open', 'warning', 'amber', 'prompt race', '', \
+                 now(), now(), 'test', 'trade.rejected.v1', 1)",
+    )
+    .bind(alert)
+    .bind(format!("fp-{alert}"))
+    .execute(pool)
+    .await
+    .expect("alert");
+
+    let approval = Uuid::new_v4();
+    // The table never stores the code itself, only its hash; a stand-in is fine here.
+    sqlx::query(
+        "INSERT INTO approvals \
+             (id, alert_id, step_id, action, params, eligible, state, requested_by, \
+              expires_at, sms_code_hash) \
+         VALUES ($1, $2, 's3', 'restart-counterparty', '{}', '{user:anna}', 'pending', \
+                 'user:bob', now() + interval '15 minutes', $3)",
+    )
+    .bind(approval)
+    .bind(alert)
+    .bind(format!("sha256({approval}:{code})"))
+    .execute(pool)
+    .await
+    .expect("approval");
+
+    let job = Uuid::new_v4();
+    let route_info = json!({
+        "target": "approval",
+        "approval": {
+            "id": approval,
+            "code": code,
+            "step_id": "s3",
+            "action": "restart-counterparty",
+        },
+    });
+    sqlx::query(
+        "INSERT INTO delivery_jobs \
+             (id, alert_id, notify_seq, recipient_id, channel, address, route_info, \
+              escalation_step) \
+         VALUES ($1, $2, 1, 'anna', 'sms', '+15550001111', $3, 200)",
+    )
+    .bind(job)
+    .bind(alert)
+    .bind(&route_info)
+    .execute(pool)
+    .await
+    .expect("prompt job");
+    (alert, approval, job)
+}
+
+/// The prompt text the channel rendered before the race, naming the code twice.
+fn prompt_text(code: &str) -> String {
+    format!(
+        "Approve restart-counterparty for the alert? \
+         Reply \"Y {code}\" to approve, \"N {code}\" to reject."
+    )
+}
+
+async fn post_prompt(
+    http: &reqwest::Client,
+    base_url: &str,
+    job: Uuid,
+    alert: Uuid,
+    text: &str,
+    code: &str,
+) -> reqwest::Response {
+    http.post(format!("{base_url}/provider/sms"))
+        .header("Idempotency-Key", job.to_string())
+        .json(&json!({
+            "job_id": job,
+            "alert_id": alert,
+            "recipient": "user:anna",
+            "to": "+15550001111",
+            "text": text,
+            "approval_challenge": format!("Y {code}"),
+        }))
+        .send()
+        .await
+        .expect("POST provider prompt")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn decided_approval_prompt_lands_masked_without_its_code(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_gateway(pool.clone()).await;
+    let http = reqwest::Client::new();
+
+    // (a) The race: the channel rendered the prompt, the approval was decided (and the
+    // decide path scrubbed the job's code) while the SMS was in flight, and the provider
+    // accepts it only afterwards.
+    let (alert, approval, job) = seed_prompt(&pool, "4821").await;
+    sqlx::query(
+        "UPDATE approvals SET state = 'approved', decided_by = 'user:carol', \
+                decided_via = 'ui', decided_at = now(), updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(approval)
+    .execute(&pool)
+    .await
+    .expect("approve");
+    sqlx::query(
+        "UPDATE delivery_jobs SET route_info = route_info #- '{approval,code}' WHERE id = $1",
+    )
+    .bind(job)
+    .execute(&pool)
+    .await
+    .expect("scrub the job's code, like the decide path does");
+
+    // Subscribe before the send so the SSE broadcast is captured too.
+    let mut stream = http
+        .get(format!("{base_url}/api/simulator/stream"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("GET stream");
+    assert_eq!(stream.status().as_u16(), 200);
+    let events = read_sse_events(&mut stream, 1, Duration::from_secs(10)).await;
+    assert_eq!(events[0].0, "snapshot");
+
+    let resp = post_prompt(&http, &base_url, job, alert, &prompt_text("4821"), "4821").await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the provider still accepts the sms; only the code is dropped"
+    );
+    let accepted: Value = resp.json().await.expect("ProviderResponse JSON");
+    assert_eq!(accepted["duplicate"], Value::Bool(false));
+
+    // No plaintext code at rest: the challenge is gone and the text is masked.
+    let (challenge, receipt_text): (Option<String>, String) =
+        sqlx::query_as("SELECT approval_challenge, text FROM gateway_receipts WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .expect("receipt");
+    assert_eq!(
+        challenge, None,
+        "the challenge must not persist: {receipt_text:?}"
+    );
+    assert!(
+        receipt_text.contains("****"),
+        "the code must be masked: {receipt_text:?}"
+    );
+    assert!(
+        !receipt_text.contains("4821"),
+        "the code leaked: {receipt_text:?}"
+    );
+
+    // Nothing broadcast either: the SSE event carries the masked row.
+    let events = read_sse_events(&mut stream, 1, Duration::from_secs(10)).await;
+    assert_eq!(events[0].0, "simulator.message");
+    let live: SimMessage = serde_json::from_str(&events[0].1).expect("simulator.message JSON");
+    assert_eq!(live.job_id, job);
+    assert_eq!(
+        live.approval_challenge, None,
+        "the SSE event must not carry the code"
+    );
+    assert!(
+        !live.text.contains("4821"),
+        "the SSE text must be masked: {}",
+        live.text
+    );
+    assert!(live.text.contains("****"));
+
+    // (b) Control: a prompt whose approval is still pending lands with its code, exactly
+    // as before — the check must not over-mask.
+    let (alert_b, _approval_b, job_b) = seed_prompt(&pool, "0953").await;
+    let resp = post_prompt(
+        &http,
+        &base_url,
+        job_b,
+        alert_b,
+        &prompt_text("0953"),
+        "0953",
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let (challenge_b, text_b): (Option<String>, String) =
+        sqlx::query_as("SELECT approval_challenge, text FROM gateway_receipts WHERE job_id = $1")
+            .bind(job_b)
+            .fetch_one(&pool)
+            .await
+            .expect("receipt b");
+    assert_eq!(
+        challenge_b.as_deref(),
+        Some("Y 0953"),
+        "pending prompts keep their code"
+    );
+    assert!(text_b.contains("0953"));
 }

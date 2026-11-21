@@ -6,18 +6,30 @@
 //!   transaction, holding the bucket row lock (`SELECT ... FOR UPDATE`), so concurrent routers
 //!   serialize on a hot (rule, recipient) and never overshoot.
 //! - No token: the planned jobs are stored in `throttle_suppressed` instead (nothing is dropped).
-//! - Digest: `digest_once` finds (rule, recipient) pairs with undigested rows whose bucket has a
-//!   token again, takes it, and files ONE job per channel of the latest suppressed row (address
-//!   and `route_info` from that row) under that row's `alert_id`/`notify_seq` (its unique key is
-//!   free, the notification created no job for this recipient). `route_info` gets
-//!   `"target": "digest"` and `"digest": {"count", "rule_id", "alert_ids": [...]}` (all covered
-//!   rows, oldest first); `fallback` is removed. Covered rows get `digested_at = now()` and
-//!   `digest_alert`. All in one transaction per pair.
+//! - Digest: `digest_once` selects ELIGIBLE pairs in SQL first — undigested rows whose bucket
+//!   refills to >= 1 token at the database clock — and applies `limit` only to those (S11-5),
+//!   so a page of not-ready pairs cannot starve a ready one. The pair's own pass takes the
+//!   token and groups ALL covered rows by their frozen (channel, address) pairs, filing ONE
+//!   digest job per group (S11-6; the latest row's jobs alone used to decide the channels):
+//!   address and `route_info` from the group's latest row, filed under the latest covered
+//!   row's `alert_id`/`notify_seq` (its unique key is free, the notification created no job
+//!   for this recipient). Each job's `route_info` gets `"target": "digest"` and
+//!   `"digest": {"count", "rule_id", "alert_ids": [...]}` (that group's rows, oldest first);
+//!   `fallback` is removed. Covered rows get `digested_at = now()` and `digest_alert`. All in
+//!   one transaction per pair.
 //! - Critical escalations bypass the throttle (the scheduler simply doesn't call `take`).
-//! - Refill uses the database clock (`now()`) so all replicas agree.
+//! - Refill uses the database clock, sampled with `clock_timestamp()` by a SECOND
+//!   statement once the bucket row lock is held: `now()` would be the transaction's start,
+//!   stale by however long the lock wait took, and Postgres evaluates a `FOR UPDATE`
+//!   SELECT's projection (volatile functions included) BEFORE the lock is granted, so the
+//!   clock cannot ride in the locking statement itself (S11-7). The sampled instant
+//!   becomes the new `refilled_at`, kept monotonic with `GREATEST` so no refill credit is
+//!   lost or rewound.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -126,6 +138,18 @@ fn refilled_tokens(tokens: f64, capacity: u32, refill_per_sec: f64, elapsed_secs
     (tokens + elapsed * refill_per_sec).min(f64::from(capacity))
 }
 
+/// Seconds from `earlier` to `later`, in microseconds, negative when `earlier` is in the
+/// future. [`refilled_tokens`] clamps negatives, so a future `refilled_at` never drains.
+/// Absurd intervals (beyond ~292 k years) saturate by sign; `refilled_tokens` caps both
+/// ways anyway.
+fn micros_between(earlier: DateTime<Utc>, later: DateTime<Utc>) -> f64 {
+    match later.signed_duration_since(earlier).num_microseconds() {
+        Some(us) => us as f64 / 1_000_000.0,
+        None if later >= earlier => f64::INFINITY,
+        None => f64::NEG_INFINITY,
+    }
+}
+
 /// Debit one token for `(rule_id, recipient_id)`; `false` if the bucket is empty. Creates the
 /// bucket full on first use and updates `capacity`/`refill_per_sec` from `spec` (rule edits).
 pub async fn take(
@@ -151,26 +175,36 @@ pub async fn take(
     .execute(&mut **tx)
     .await?;
 
-    // Hold the row lock so concurrent routers serialize on a hot (rule, recipient).
-    // Elapsed time comes from the DB clock so all replicas agree.
-    let row: Option<(f64, f64)> = sqlx::query_as(
-        "SELECT tokens, extract(epoch from now() - refilled_at)::float8 \
-         FROM throttle_buckets WHERE rule_id = $1 AND recipient_id = $2 FOR UPDATE",
+    // Hold the row lock so concurrent routers serialize on a hot (rule, recipient). The
+    // refill clock is sampled by a SECOND statement, after the lock is held: Postgres
+    // evaluates a `FOR UPDATE` SELECT's projection — volatile functions included —
+    // BEFORE the row lock is acquired, so a clock sampled in the locking statement itself
+    // is stale by the whole lock wait (S11-7). The sample becomes the new `refilled_at` —
+    // kept monotonic with `GREATEST` — so no refill credit is lost between the sample
+    // and the write, and a refilled_at in the future (skewed clock, manual repair)
+    // never rewinds.
+    let row: Option<(f64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT tokens, refilled_at FROM throttle_buckets \
+         WHERE rule_id = $1 AND recipient_id = $2 FOR UPDATE",
     )
     .bind(rule_id)
     .bind(recipient_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((tokens, elapsed_secs)) = row else {
+    let Some((tokens, refilled_at)) = row else {
         // Unreachable: the insert above guarantees the row.
         return Ok(false);
     };
+    let sampled_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    let elapsed_secs = micros_between(refilled_at, sampled_at);
     let refilled = refilled_tokens(tokens, spec.max, refill, elapsed_secs);
     if refilled >= 1.0 {
         sqlx::query(
             "UPDATE throttle_buckets \
              SET tokens = $3, capacity = $4, refill_per_sec = $5, \
-                 refilled_at = now(), updated_at = now() \
+                 refilled_at = GREATEST(refilled_at, $6), updated_at = now() \
              WHERE rule_id = $1 AND recipient_id = $2",
         )
         .bind(rule_id)
@@ -178,6 +212,7 @@ pub async fn take(
         .bind(refilled - 1.0)
         .bind(capacity_i32)
         .bind(refill)
+        .bind(sampled_at)
         .execute(&mut **tx)
         .await?;
         Ok(true)
@@ -185,7 +220,7 @@ pub async fn take(
         sqlx::query(
             "UPDATE throttle_buckets \
              SET tokens = $3, capacity = $4, refill_per_sec = $5, \
-                 refilled_at = now(), updated_at = now() \
+                 refilled_at = GREATEST(refilled_at, $6), updated_at = now() \
              WHERE rule_id = $1 AND recipient_id = $2",
         )
         .bind(rule_id)
@@ -193,6 +228,7 @@ pub async fn take(
         .bind(refilled)
         .bind(capacity_i32)
         .bind(refill)
+        .bind(sampled_at)
         .execute(&mut **tx)
         .await?;
         Ok(false)
@@ -240,13 +276,37 @@ struct SuppressedRow {
     jobs: Value,
 }
 
-/// One pass over pairs with undigested rows (bounded by `limit` pairs, `FOR UPDATE SKIP LOCKED`
-/// on the bucket rows so router replicas don't collide).
+/// One frozen (channel, address) group across the covered rows of a pair (S11-6): the
+/// digest files exactly one job per group.
+struct DigestGroup {
+    channel: String,
+    address: String,
+    /// The latest covered row's `route_info` for this (channel, address); the digest job
+    /// is built from it (provenance frozen at routing time).
+    route_info: Value,
+    /// The alert ids of the group's covered rows, oldest first; its length is the digest
+    /// count the job carries.
+    alert_ids: Vec<String>,
+}
+
+/// One pass over ELIGIBLE pairs: undigested rows whose bucket refills to >= 1 token,
+/// computed in SQL with the database clock, and only then bounded by `limit` (S11-5). A
+/// pair with no token again would waste its slot and starve every ready pair behind it,
+/// so not-ready pairs are filtered out before the limit, not discovered after it. The
+/// bucket row lock (`FOR UPDATE SKIP LOCKED`) is taken per pair by [`digest_pair`], so
+/// router replicas and concurrent digest passes don't collide.
 pub async fn digest_once(pool: &PgPool, limit: i64) -> Result<DigestStats, sqlx::Error> {
     let pairs: Vec<(String, String)> = sqlx::query_as(
-        "SELECT rule_id, recipient_id FROM throttle_suppressed \
-         WHERE digested_at IS NULL \
-         GROUP BY rule_id, recipient_id ORDER BY rule_id, recipient_id LIMIT $1",
+        "SELECT s.rule_id, s.recipient_id \
+         FROM throttle_suppressed s \
+         JOIN throttle_buckets b \
+           ON b.rule_id = s.rule_id AND b.recipient_id = s.recipient_id \
+         WHERE s.digested_at IS NULL \
+           AND b.tokens + GREATEST( \
+                 extract(epoch FROM (clock_timestamp() - b.refilled_at))::float8, 0.0) \
+               * b.refill_per_sec >= 1.0 \
+         GROUP BY s.rule_id, s.recipient_id \
+         ORDER BY s.rule_id, s.recipient_id LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -266,7 +326,8 @@ pub async fn digest_once(pool: &PgPool, limit: i64) -> Result<DigestStats, sqlx:
 }
 
 /// Digest one (rule, recipient) pair. Returns `(jobs_inserted, rows_covered)` when a digest
-/// was filed, `None` when there was nothing to do (no rows, bucket locked, or no token).
+/// was filed, `None` when there was nothing to do (no rows, bucket locked, no token, or no
+/// addressable group).
 async fn digest_pair(
     pool: &PgPool,
     rule_id: &str,
@@ -274,10 +335,12 @@ async fn digest_pair(
 ) -> Result<Option<(u64, u64)>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    // Lock the bucket row without blocking: a concurrent digest owns this pair.
-    let bucket: Option<(f64, i32, f64, f64)> = sqlx::query_as(
-        "SELECT tokens, capacity, refill_per_sec, \
-                extract(epoch from now() - refilled_at)::float8 \
+    // Lock the bucket row without blocking: a concurrent digest owns this pair. Like
+    // `take`, the refill clock is sampled by a SECOND statement once the lock is held
+    // (S11-7) — a `FOR UPDATE` SELECT's projection is evaluated before the lock wait —
+    // and the sample becomes the new `refilled_at`, kept monotonic with `GREATEST`.
+    let bucket: Option<(f64, i32, f64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT tokens, capacity, refill_per_sec, refilled_at \
          FROM throttle_buckets WHERE rule_id = $1 AND recipient_id = $2 \
          FOR UPDATE SKIP LOCKED",
     )
@@ -285,10 +348,14 @@ async fn digest_pair(
     .bind(recipient_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((tokens, capacity, refill_per_sec, elapsed_secs)) = bucket else {
+    let Some((tokens, capacity, refill_per_sec, refilled_at)) = bucket else {
         tx.rollback().await?;
         return Ok(None);
     };
+    let sampled_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *tx)
+        .await?;
+    let elapsed_secs = micros_between(refilled_at, sampled_at);
 
     let rows: Vec<SuppressedRow> = sqlx::query_as(
         "SELECT id, alert_id, notify_seq, jobs FROM throttle_suppressed \
@@ -319,12 +386,14 @@ async fn digest_pair(
     if refilled < 1.0 {
         // No token yet: persist the refill progress and leave the rows parked.
         sqlx::query(
-            "UPDATE throttle_buckets SET tokens = $3, refilled_at = now(), updated_at = now() \
+            "UPDATE throttle_buckets SET tokens = $3, \
+                 refilled_at = GREATEST(refilled_at, $4), updated_at = now() \
              WHERE rule_id = $1 AND recipient_id = $2",
         )
         .bind(rule_id)
         .bind(recipient_id)
         .bind(refilled)
+        .bind(sampled_at)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -333,45 +402,83 @@ async fn digest_pair(
 
     // Take the token.
     sqlx::query(
-        "UPDATE throttle_buckets SET tokens = $3, refilled_at = now(), updated_at = now() \
+        "UPDATE throttle_buckets SET tokens = $3, \
+             refilled_at = GREATEST(refilled_at, $4), updated_at = now() \
          WHERE rule_id = $1 AND recipient_id = $2",
     )
     .bind(rule_id)
     .bind(recipient_id)
     .bind(refilled - 1.0)
+    .bind(sampled_at)
     .execute(&mut *tx)
     .await?;
 
+    // Group ALL covered rows by their frozen (channel, address) pairs and file ONE digest
+    // job per group (S11-6): the latest row's jobs alone used to decide the digest's
+    // channels, so a pair parked on different channels over time only ever digested the
+    // last row's. Each group carries its own count and alert ids (its rows, oldest
+    // first); its job reuses the route_info of the group's LATEST row, whose address and
+    // provenance were frozen at routing time.
     let latest = rows.last().expect("rows non-empty");
-    let planned: Vec<PlannedJob> = match serde_json::from_value(latest.jobs.clone()) {
-        Ok(jobs) => jobs,
-        Err(_) => {
-            tx.rollback().await?;
-            return Ok(None);
+    let mut groups: Vec<DigestGroup> = Vec::new();
+    for row in &rows {
+        let planned: Vec<PlannedJob> = match serde_json::from_value(row.jobs.clone()) {
+            Ok(jobs) => jobs,
+            Err(_) => {
+                // A poison row must not yield a wrong-count digest: drop the whole pass
+                // (the token goes back with the transaction), leave the rows parked.
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        };
+        let mut in_row: HashSet<(String, String)> = HashSet::new();
+        for job in planned {
+            if !in_row.insert((job.channel.clone(), job.address.clone())) {
+                continue; // a row counts once per (channel, address)
+            }
+            match groups
+                .iter_mut()
+                .find(|g| g.channel == job.channel && g.address == job.address)
+            {
+                Some(group) => {
+                    // A newer row joined the group: newer provenance for its job.
+                    group.route_info = job.route_info;
+                    group.alert_ids.push(row.alert_id.to_string());
+                }
+                None => groups.push(DigestGroup {
+                    channel: job.channel,
+                    address: job.address,
+                    route_info: job.route_info,
+                    alert_ids: vec![row.alert_id.to_string()],
+                }),
+            }
         }
-    };
-    if planned.is_empty() {
+    }
+    if groups.is_empty() {
+        // Nothing addressable was ever parked for these rows.
         tx.rollback().await?;
         return Ok(None);
     }
 
-    // All covered rows, oldest first.
-    let alert_ids: Vec<String> = rows.iter().map(|r| r.alert_id.to_string()).collect();
-    let count = rows.len();
-    let digest_value = serde_json::json!({
-        "count": count,
-        "rule_id": rule_id,
-        "alert_ids": alert_ids,
-    });
-    let digest_jobs: Vec<PlannedJob> = planned
-        .into_iter()
-        .map(|mut job| {
-            if let Some(obj) = job.route_info.as_object_mut() {
+    let digest_jobs: Vec<PlannedJob> = groups
+        .iter()
+        .map(|group| {
+            let digest_value = serde_json::json!({
+                "count": group.alert_ids.len(),
+                "rule_id": rule_id,
+                "alert_ids": group.alert_ids,
+            });
+            let mut route_info = group.route_info.clone();
+            if let Some(obj) = route_info.as_object_mut() {
                 obj.remove("fallback");
                 obj.insert("target".to_string(), Value::String("digest".to_string()));
-                obj.insert("digest".to_string(), digest_value.clone());
+                obj.insert("digest".to_string(), digest_value);
             }
-            job
+            PlannedJob {
+                channel: group.channel.clone(),
+                address: group.address.clone(),
+                route_info,
+            }
         })
         .collect();
 
@@ -385,6 +492,8 @@ async fn digest_pair(
     )
     .await?;
 
+    // Every covered row is digested by this pass, whichever group carried it.
+    let count = rows.len();
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     sqlx::query(
         "UPDATE throttle_suppressed SET digested_at = now(), digest_alert = $3 \

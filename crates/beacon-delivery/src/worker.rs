@@ -448,7 +448,22 @@ async fn process_job(
     // A throttle digest summarizes several alerts: it is never cancelled because the
     // latest alert was acked or resolved, but the alert row must still exist.
     let is_digest = job.route_info.get("digest").is_some_and(|v| v.is_object());
-    if !is_digest && !AlertStatus::parse(&status).is_some_and(AlertStatus::is_deliverable) {
+    // Only open alerts page people (SPEC §2.2) — with one exception: an acked alert is
+    // still being worked on, so its approval-prompt jobs (`route_info.target =
+    // "approval"`, frozen by `approvals::request`) stay deliverable; the approval stays
+    // decidable until the alert resolves. Everything else on an acked alert is cancelled
+    // as always, and a resolved alert cancels everything, prompts included.
+    let is_prompt = job
+        .route_info
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        == Some("approval");
+    let deliverable = match AlertStatus::parse(&status) {
+        Some(AlertStatus::Open) => true,
+        Some(AlertStatus::Acked) => is_prompt,
+        Some(AlertStatus::Resolved) | None => false,
+    };
+    if !is_digest && !deliverable {
         return finalize_cancelled_logged(pool, &job, token, &format!("alert {status}")).await;
     }
 

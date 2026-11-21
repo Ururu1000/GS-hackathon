@@ -510,13 +510,13 @@ async fn run_queues_a_step_and_conflicts_when_it_is_live(pool: PgPool) {
     )
     .await;
 
-    // The empty body and `{}` both mean "no expected_version".
-    for body in [json!({}), Value::Null] {
-        let _ = &body;
-    }
-    let (status, body) = post(
+    // The empty body — sent WITH the JSON content type — and `{}` both mean
+    // "no expected_version"; the empty form queues the step here, and the `{}` form is
+    // used for the repeat below.
+    let (status, body) = post_raw(
         &format!("{base}/api/alerts/{alert}/steps/s2/run"),
-        &json!({}),
+        String::new(),
+        &[],
     )
     .await;
     assert_eq!(status, 202, "{body}");
@@ -666,6 +666,58 @@ async fn run_on_an_approval_step_creates_the_approval_and_409s(pool: PgPool) {
         .await
         .expect("count approvals");
     assert_eq!(rows, 1);
+}
+
+/// Review fix (PR #11, S11-10): five concurrent `POST .../run` on an approval-required
+/// step all answer 409 `approval_required` with the SAME `approval_id` — one approval,
+/// one set of prompt jobs, and no 500 from the pending unique index.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_runs_on_an_approval_step_share_one_approval(pool: PgPool) {
+    let state = api_state(&pool, None);
+    let base = serve_api_as(state, "user:frank").await;
+    let alert =
+        insert_alert_with_runbook(&pool, "open", &[action_step("s3", "required", None)]).await;
+    let url = format!("{base}/api/alerts/{alert}/steps/s3/run");
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..5 {
+        let url = url.clone();
+        tasks.spawn(async move { post(&url, &json!({})).await });
+    }
+    let mut approval_ids = Vec::new();
+    while let Some(res) = tasks.join_next().await {
+        let (status, body) = res.expect("task");
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(error_code(&body), "approval_required", "{body}");
+        approval_ids.push(
+            body["error"]["approval_id"]
+                .as_str()
+                .expect("approval_id on the conflict")
+                .to_string(),
+        );
+    }
+    assert_eq!(approval_ids.len(), 5);
+    assert!(
+        approval_ids.iter().all(|id| *id == approval_ids[0]),
+        "every concurrent run names the same approval: {approval_ids:?}"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM approvals WHERE alert_id = $1")
+        .bind(alert)
+        .fetch_one(&pool)
+        .await
+        .expect("count approvals");
+    assert_eq!(rows, 1);
+    let prompts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM delivery_jobs \
+         WHERE alert_id = $1 AND channel = 'sms' AND route_info->>'target' = 'approval'",
+    )
+    .bind(alert)
+    .fetch_one(&pool)
+    .await
+    .expect("prompt count");
+    // Eligible with phones in `api_dir`: carol and bob.
+    assert_eq!(prompts, 2);
 }
 
 // ---------------------------------------------------------------------------------------------

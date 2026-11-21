@@ -967,12 +967,14 @@ async fn a_reply_from_an_unknown_number_is_unknown(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn ack_acks_the_latest_open_alert_paged_on_the_number(pool: PgPool) {
+async fn ack_acks_the_newest_sent_page_and_a_repeat_does_not_advance(pool: PgPool) {
     let dir = approvals_dir();
     let older = insert_alert(&pool, "open").await;
     let newer = insert_alert(&pool, "open").await;
     let acked = insert_alert(&pool, "acked").await;
 
+    // Sent pages to carol's number, newest first: only a job the provider accepted makes
+    // the number ackable, and the NEWEST one decides which alert that is.
     let mut tx = pool.begin().await.expect("tx");
     for (alert, recipient, offset) in [
         (older, "carol", "10 seconds"),
@@ -981,26 +983,26 @@ async fn ack_acks_the_latest_open_alert_paged_on_the_number(pool: PgPool) {
     ] {
         sqlx::query(
             "INSERT INTO delivery_jobs \
-                (alert_id, notify_seq, recipient_id, channel, address, created_at, updated_at) \
-             VALUES ($1, 1, $2, 'sms', '+44 7700 900125', \
-                     now() - ($3)::interval, now() - ($3)::interval)",
+                (alert_id, notify_seq, recipient_id, channel, address, status, sent_at, \
+                 created_at, updated_at) \
+             VALUES ($1, 1, $2, 'sms', '+44 7700 900125', 'sent', \
+                     now() - ($3)::interval, now() - ($3)::interval, now() - ($3)::interval)",
         )
         .bind(alert)
         .bind(recipient)
         .bind(offset)
         .execute(&mut *tx)
         .await
-        .expect("paging job");
+        .expect("sent paging job");
     }
     tx.commit().await.expect("commit");
 
+    // The first ACK acks the alert of the newest sent page.
     let outcome = approvals::handle_reply(&pool, &dir, &SqlAlertOps, "+447700900125", "ack")
         .await
         .expect("ack reply");
     assert_eq!(outcome, ReplyOutcome::Acked { alert_id: newer });
 
-    // The newest OPEN alert on that number was acked; the older and the already-acked
-    // ones are untouched.
     let (status, acked_by): (String, Option<String>) =
         sqlx::query_as("SELECT status, acked_by FROM alerts WHERE id = $1")
             .bind(newer)
@@ -1026,19 +1028,78 @@ async fn ack_acks_the_latest_open_alert_paged_on_the_number(pool: PgPool) {
         "missing the acked audit row"
     );
 
-    // The remaining open alert on that number is the older one: the next ACK takes it...
+    // A repeated ACK is stable: the newest paged alert is already acked, so the answer is
+    // already_decided — it does NOT advance to the older open alert.
     let outcome = approvals::handle_reply(&pool, &dir, &SqlAlertOps, "+44 7700 900125", "ACK")
         .await
         .expect("second ack");
-    assert_eq!(outcome, ReplyOutcome::Acked { alert_id: older });
-    // ...and with nothing open left, the third has nothing to ack.
+    assert_eq!(outcome, ReplyOutcome::AlreadyDecided);
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM alerts WHERE id = $1")
+        .bind(older)
+        .fetch_one(&pool)
+        .await
+        .expect("older alert");
+    assert_eq!(
+        status, "open",
+        "a repeated ACK must not ack the older alert"
+    );
+}
+
+/// Review fix (PR #11): `ACK` candidates come only from jobs that were actually `sent` to
+/// the number — an unsent page (pending, cancelled, dead) never rang the phone, so it
+/// never makes an alert ackable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unsent_page_never_makes_an_alert_ackable(pool: PgPool) {
+    let dir = approvals_dir();
+    let first = insert_alert(&pool, "open").await;
+    let second = insert_alert(&pool, "open").await;
+
+    // A pending (never sent) page and a cancelled one: the number never actually rang.
+    let mut tx = pool.begin().await.expect("tx");
+    for (alert, status) in [(first, "pending"), (second, "cancelled")] {
+        sqlx::query(
+            "INSERT INTO delivery_jobs \
+                (alert_id, notify_seq, recipient_id, channel, address, status, \
+                 created_at, updated_at) \
+             VALUES ($1, 1, 'carol', 'sms', '+44 7700 900125', $2, now(), now())",
+        )
+        .bind(alert)
+        .bind(status)
+        .execute(&mut *tx)
+        .await
+        .expect("unsent paging job");
+    }
+    tx.commit().await.expect("commit");
+
     let outcome = approvals::handle_reply(&pool, &dir, &SqlAlertOps, "+44 7700 900125", "ACK")
         .await
-        .expect("third ack");
+        .expect("ack reply");
     assert!(
         matches!(outcome, ReplyOutcome::Unknown(ref m) if m.contains("no open alert")),
         "{outcome:?}"
     );
+    for alert in [first, second] {
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM alerts WHERE id = $1")
+            .bind(alert)
+            .fetch_one(&pool)
+            .await
+            .expect("alert row");
+        assert_eq!(status, "open", "an unsent page acks nothing");
+    }
+
+    // Once the page really went out, the same reply acks its alert.
+    sqlx::query(
+        "UPDATE delivery_jobs SET status = 'sent', sent_at = now() \
+         WHERE alert_id = $1 AND recipient_id = 'carol' AND status = 'pending'",
+    )
+    .bind(first)
+    .execute(&pool)
+    .await
+    .expect("mark the page sent");
+    let outcome = approvals::handle_reply(&pool, &dir, &SqlAlertOps, "+44 7700 900125", "ack")
+        .await
+        .expect("ack after the send");
+    assert_eq!(outcome, ReplyOutcome::Acked { alert_id: first });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1483,4 +1544,72 @@ async fn expire_stale_expires_and_scrubs_only_lapsed_approvals(pool: PgPool) {
         approvals::expire_stale(&pool).await.expect("second sweep"),
         0
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fix (PR #11, S11-10): concurrent `request` calls for the same (alert, step)
+// ---------------------------------------------------------------------------------------------
+
+/// Ten concurrent `request` calls for the same (alert, step) — each in its own committed
+/// transaction — all return the same approval id: exactly one `pending` row exists, one
+/// prompt job per eligible person with a phone, and no call errors.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_requests_for_one_slot_share_a_single_approval(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(10));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..10 {
+        let pool = pool.clone();
+        let dir = dir.clone();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            let mut tx = pool.begin().await.expect("tx");
+            let id = approvals::request(
+                &mut tx,
+                &dir,
+                alert,
+                "s3",
+                "escalate",
+                &json!({ "team": "counterparty-support" }),
+                "user:anna",
+            )
+            .await
+            .expect("request approval");
+            tx.commit().await.expect("commit");
+            id
+        });
+    }
+    let mut ids = Vec::new();
+    while let Some(id) = tasks.join_next().await {
+        ids.push(id.expect("task"));
+    }
+    assert_eq!(ids.len(), 10);
+    assert!(
+        ids.iter().all(|id| *id == ids[0]),
+        "every concurrent request returns the winner's id: {ids:?}"
+    );
+
+    // Exactly one row for the slot.
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM approvals WHERE alert_id = $1 AND step_id = 's3'")
+            .bind(alert)
+            .fetch_one(&pool)
+            .await
+            .expect("count approvals");
+    assert_eq!(rows, 1);
+
+    // Exactly one prompt job per eligible person with a phone (carol, bob) — the losers
+    // sent no prompt SMS of their own.
+    let jobs = prompt_jobs(&pool, alert).await;
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    for recipient in ["carol", "bob"] {
+        let mine: Vec<_> = jobs
+            .iter()
+            .filter(|j| j.recipient_id == recipient)
+            .collect();
+        assert_eq!(mine.len(), 1, "one prompt job for {recipient}: {jobs:?}");
+    }
 }

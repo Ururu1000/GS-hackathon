@@ -1,5 +1,6 @@
 //! Security-audit regression suite (Agent A): gateway auth lockdown, signed SMS replies,
-//! SSE stream cap, bounded provider bodies, PII masking and SMTP TLS decisions.
+//! SSE stream cap, bounded provider bodies, PII masking, approval prompts that lost their
+//! race (S11-9) and SMTP TLS decisions.
 //!
 //! Needs Postgres (`DATABASE_URL`, sqlx creates a throwaway database per test).
 //!
@@ -594,4 +595,131 @@ async fn smtp_tls_decision_refuses_remote_plaintext() {
         EmailChannel::new(allowed).is_ok(),
         "STARTTLS transport must build"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7. A prompt accepted after its approval stopped being pending (S11-9): no code at rest.
+// ---------------------------------------------------------------------------------------------
+
+/// One alert, its prompt sms job, and (when `state` is `Some`) an approvals row in exactly
+/// that state whose id the job's `route_info.approval.id` names. `None` seeds a job that
+/// references an approval that does not exist. Returns `(alert, job)`.
+async fn seed_prompt_with_approval_state(
+    pool: &PgPool,
+    state: Option<&str>,
+    code: &str,
+) -> (Uuid, Uuid) {
+    let alert = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO alerts (id, rule_id, rule_revision, rule_name, team, fingerprint, \
+                             dedup_window_ms, status, severity, color, title, body, \
+                             first_seen, last_seen, source, schema, notify_seq) \
+         VALUES ($1, 'rates-rejected-trades', 1, 'Rates rejected trades', 'rates', $2, \
+                 600000, 'open', 'warning', 'amber', 'late prompt', '', \
+                 now(), now(), 'test', 'trade.rejected.v1', 1)",
+    )
+    .bind(alert)
+    .bind(format!("fp-{alert}"))
+    .execute(pool)
+    .await
+    .expect("alert");
+
+    let approval = Uuid::new_v4();
+    if let Some(state) = state {
+        // The table never stores the code itself, only its hash; a stand-in is fine here.
+        sqlx::query(
+            "INSERT INTO approvals \
+                 (id, alert_id, step_id, action, params, eligible, state, requested_by, \
+                  expires_at, sms_code_hash) \
+             VALUES ($1, $2, 's3', 'restart-counterparty', '{}', '{user:anna}', $3, \
+                     'user:bob', now() + interval '15 minutes', $4)",
+        )
+        .bind(approval)
+        .bind(alert)
+        .bind(state)
+        .bind(format!("sha256({approval}:{code})"))
+        .execute(pool)
+        .await
+        .expect("approval");
+    }
+
+    let job = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO delivery_jobs \
+             (id, alert_id, notify_seq, recipient_id, channel, address, route_info, \
+              escalation_step) \
+         VALUES ($1, $2, 1, 'anna', 'sms', '+15550001111', $3, 200)",
+    )
+    .bind(job)
+    .bind(alert)
+    .bind(json!({
+        "target": "approval",
+        "approval": {
+            "id": approval,
+            "code": code,
+            "step_id": "s3",
+            "action": "restart-counterparty",
+        },
+    }))
+    .execute(pool)
+    .await
+    .expect("prompt job");
+    (alert, job)
+}
+
+/// POST the prompt sms the channel rendered before the race; a `200` is expected either
+/// way (the provider still accepts the message, only the code is dropped).
+async fn post_prompt(http: &reqwest::Client, base_url: &str, job: Uuid, alert: Uuid, code: &str) {
+    let resp = http
+        .post(format!("{base_url}/provider/sms"))
+        .header("Idempotency-Key", job.to_string())
+        .json(&json!({
+            "job_id": job,
+            "alert_id": alert,
+            "recipient": "user:anna",
+            "to": "+15550001111",
+            "text": format!(
+                "Approve restart-counterparty? Reply \"Y {code}\" to approve, \
+                 \"N {code}\" to reject."
+            ),
+            "approval_challenge": format!("Y {code}"),
+        }))
+        .send()
+        .await
+        .expect("POST provider prompt");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the sms is still accepted; only the code is dropped"
+    );
+}
+
+/// The receipt for `job`: the challenge column is gone and no plaintext code remains.
+async fn assert_receipt_masked(pool: &PgPool, job: Uuid, code: &str) {
+    let (challenge, text): (Option<String>, String) =
+        sqlx::query_as("SELECT approval_challenge, text FROM gateway_receipts WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .expect("receipt");
+    assert_eq!(challenge, None, "the challenge must not persist: {text:?}");
+    assert!(text.contains("****"), "the code must be masked: {text:?}");
+    assert!(!text.contains(code), "the code leaked: {text:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn late_prompt_for_expired_or_unknown_approval_persists_no_code(pool: PgPool) {
+    let (base_url, _shutdown) = serve_state(GatewayState::new(pool.clone())).await;
+    let http = reqwest::Client::new();
+
+    // (a) Expired: the code is dead by TTL, a late provider retry must not revive it.
+    let (alert, job) = seed_prompt_with_approval_state(&pool, Some("expired"), "4821").await;
+    post_prompt(&http, &base_url, job, alert, "4821").await;
+    assert_receipt_masked(&pool, job, "4821").await;
+
+    // (b) Unknown: the job names an approval that does not exist — nothing authorizes the
+    // code either.
+    let (alert, job) = seed_prompt_with_approval_state(&pool, None, "0953").await;
+    post_prompt(&http, &base_url, job, alert, "0953").await;
+    assert_receipt_masked(&pool, job, "0953").await;
 }

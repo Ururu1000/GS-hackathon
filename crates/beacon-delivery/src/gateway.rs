@@ -25,6 +25,10 @@
 //! - `POST /provider/sms`, `POST /provider/phone`: body `ProviderRequest`, header
 //!   `Idempotency-Key: <job_id>`. Insert `ON CONFLICT (job_id) DO UPDATE SET duplicates =
 //!   duplicates + 1, last_seen_at = now()`; reply `200 ProviderResponse{receipt_id, duplicate}`.
+//!   An approval prompt whose approval is no longer `pending` — decided, expired or unknown,
+//!   checked against the job's `route_info.approval.id` in the same tx (S11-9) — is
+//!   persisted with `approval_challenge = NULL` and every 4-digit run in `text` masked to
+//!   `****`, like `approvals::scrub_code` does; the SSE broadcast carries that masked row.
 //!   During an outage of that channel: mode `down` → `503` + `Retry-After: <OUTAGE_RETRY_AFTER_S>`
 //!   without persisting; mode `lose_response` → persist as above, then reply `504`.
 //!
@@ -609,15 +613,46 @@ async fn provider_handler(
 
 /// The single upsert statement owned by the provider side. Returns the row and whether this
 /// `job_id` had already been accepted (`xmax <> 0` is true only for the `DO UPDATE` path).
+///
+/// S11-9: an approval prompt whose approval was already decided (approved, rejected,
+/// expired — or no approval found) must not land with its plaintext code. The check runs in
+/// the SAME transaction as the persist, locking the approval row the job's
+/// `route_info.approval.id` names (`FOR SHARE`): a concurrent decide either committed
+/// before us — the read sees a non-pending state and the receipt is persisted masked — or
+/// blocks on our lock, and its `scrub_code` masks this receipt after we commit. Masked =
+/// `approval_challenge = NULL` and every 4-digit run in `text` replaced with `****`, the
+/// same treatment `approvals::scrub_code` gives older receipts; the returned (and SSE
+/// broadcast) `SimMessage` then carries no code either. Ordinary messages (no
+/// `approval_challenge`) are untouched.
 async fn persist_receipt(
     pool: &PgPool,
     channel: &str,
     req: &ProviderRequest,
 ) -> Result<(SimMessage, bool), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Only a challenge-bearing sms is a prompt; anything else persists as sent.
+    let prompt_decided: bool = match req.approval_challenge {
+        Some(_) => {
+            let pending: Option<bool> = sqlx::query_scalar(
+                "SELECT (a.state = 'pending') FROM approvals a \
+                 WHERE a.id::text = (SELECT route_info->'approval'->>'id' \
+                                     FROM delivery_jobs WHERE id = $1) \
+                 FOR SHARE",
+            )
+            .bind(req.job_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            // No approval row / no job / decided: nothing still pending authorizes the code.
+            pending != Some(true)
+        }
+        None => false,
+    };
     let row: PgRow = sqlx::query(
         "INSERT INTO gateway_receipts \
             (job_id, alert_id, channel, recipient, to_address, text, approval_challenge) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         VALUES ($1, $2, $3, $4, $5, \
+                 CASE WHEN $8 THEN regexp_replace($6, '\\d{4}', '****', 'g') ELSE $6 END, \
+                 CASE WHEN $8 THEN NULL ELSE $7 END) \
          ON CONFLICT (job_id) DO UPDATE SET \
             duplicates = gateway_receipts.duplicates + 1, last_seen_at = now() \
          RETURNING id, receipt_id, job_id, alert_id, channel, recipient, to_address, text, \
@@ -630,8 +665,10 @@ async fn persist_receipt(
     .bind(&req.to)
     .bind(&req.text)
     .bind(req.approval_challenge.as_deref())
-    .fetch_one(pool)
+    .bind(prompt_decided)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     let duplicate: bool = row.try_get("duplicate")?;
     Ok((row_to_message(&row)?, duplicate))
 }

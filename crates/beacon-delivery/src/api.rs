@@ -7,7 +7,7 @@
 //! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `403 forbidden` (team); `400 bad_request` (not a manual step); `404` |
 //! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden` (not eligible, or the requester — nobody approves their own request); `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
 //! | `GET /api/runbooks` | `200 {items}` | |
-//! | `POST /api/replies` `{from, text}` (fake-gateway callback: `X-Beacon-Timestamp: <unix seconds>` within ±300 s of now, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, "<timestamp>." + raw_body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`), `already_decided`, `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (missing/old/future timestamp, bad/missing signature) |
+//! | `POST /api/replies` `{from, text}` (fake-gateway callback: `X-Beacon-Timestamp: <unix seconds>` within ±300 s of now, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, "<timestamp>." + raw_body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`, the alert of the newest sms/phone job `sent` to the number), `already_decided` (a repeated decision, or a repeated `ACK` whose newest sent page was already acked — it never advances to an older open alert), `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (missing/old/future timestamp, bad/missing signature) |
 //!
 //! Auth: beacon-api's session/CSRF middleware inserts `Extension(Actor("user:<id>"))` before
 //! these handlers; without it every route except `/api/replies` returns `401 unauthorized`.
@@ -16,9 +16,11 @@
 //! `run` and `check` additionally require the actor to be on the alert's team — a member, the
 //! lead, or anyone in one of the team's on-call rotations (Directory) — else `403 forbidden`
 //! (audit #11; `GET /api/runbooks` stays open to any authenticated user).
-//! POST bodies must be `application/json` (`415 unsupported_media_type` otherwise; an empty
-//! body is accepted wherever the contract allows one) — a cross-site `<form>` can never post
-//! one. Errors are `{error: {code, message, approval_id?}}`; 500s are `internal` with details
+//! Every POST must say `Content-Type: application/json` (`415 unsupported_media_type`
+//! otherwise — media type only, and even when the body is empty: an empty body WITH the
+//! JSON content type is still accepted wherever the contract allows no body) — a
+//! cross-site `<form>` can neither send the header nor smuggle an empty body past it.
+//! Errors are `{error: {code, message, approval_id?}}`; 500s are `internal` with details
 //! only in logs. Every mutation writes `audit_log` and bumps the alert version
 //! (`AlertOps::touch`).
 //!
@@ -139,14 +141,12 @@ fn unsupported_media_type() -> ApiError {
     )
 }
 
-/// Audit #11 (CSRF): a POST body that is not empty and not `application/json` (media type
-/// only — parameters like `charset` are ignored) is rejected before it is parsed, so a
-/// cross-site `<form>` (which can at best send `text/plain` or form encodings) can never
-/// reach a handler. Empty bodies stay allowed wherever the contract allows them.
-fn require_json_body(headers: &axum::http::HeaderMap, body: &[u8]) -> Result<(), ApiError> {
-    if body.is_empty() {
-        return Ok(());
-    }
+/// Audit #11 (CSRF): every POST must say `Content-Type: application/json` (media type
+/// only — parameters like `charset` are ignored), even when its body is empty. A
+/// cross-site `<form>` can at best send `text/plain` or form encodings and can never set
+/// this header, so it cannot reach a handler — with a body or without one. An empty body
+/// WITH the JSON content type still means "no body" wherever the contract allows one.
+fn require_json_body(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -265,7 +265,7 @@ async fn run_step_handler(
     let Some(axum::Extension(Actor(actor))) = actor else {
         return Err(unauthorized());
     };
-    require_json_body(&headers, &body)?;
+    require_json_body(&headers)?;
     let alert_id = parse_id(&alert_raw)?;
 
     // The body is optional; `expected_version` is shape-checked but not enforced (module doc).
@@ -397,7 +397,7 @@ async fn check_step_handler(
     let Some(axum::Extension(Actor(actor))) = actor else {
         return Err(unauthorized());
     };
-    require_json_body(&headers, &body)?;
+    require_json_body(&headers)?;
     let alert_id = parse_id(&alert_raw)?;
 
     let body = parse_body(&body)?;
@@ -479,7 +479,7 @@ async fn approve_handler(
     actor: Option<axum::Extension<Actor>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    require_json_body(&headers, &body)?;
+    require_json_body(&headers)?;
     decide_http(state, id_raw, actor, body, Decision::Approve).await
 }
 
@@ -490,7 +490,7 @@ async fn reject_handler(
     actor: Option<axum::Extension<Actor>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    require_json_body(&headers, &body)?;
+    require_json_body(&headers)?;
     decide_http(state, id_raw, actor, body, Decision::Reject).await
 }
 
@@ -594,7 +594,7 @@ async fn replies_handler(
 ) -> Result<Response, ApiError> {
     // A cross-site form can never satisfy this (audit #11), and the signature below
     // authenticates the caller (the gateway), not a session: no Actor here.
-    require_json_body(&headers, &body)?;
+    require_json_body(&headers)?;
     let Some(secret) = state.reply_secret.as_deref() else {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,

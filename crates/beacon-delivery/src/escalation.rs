@@ -17,7 +17,11 @@
 //!   `last_note = 'alert <status>'`. Else take `chain[step]`: unknown person → skip it (note).
 //!   Channels = step.channels, else `prefs::resolve_channels` (severity, team, rule_id from
 //!   the alert row; service, environment from the first notification); if that yields no
-//!   job channel (UI only), use the distinct channels of this alert's existing jobs for
+//!   job channel (UI only), use the timer's frozen `planned_channels` — the channels the
+//!   notification that started the clock actually planned, throttle-parked rows included
+//!   (S11-8), so later jobs on other channels (fallback jobs, digests, prompts) cannot
+//!   change a step's channels. Timers written before that column (NULL) keep the
+//!   historical behaviour: the distinct channels of this alert's existing jobs for
 //!   `notify_seq`. Insert jobs (`notify_seq` = the
 //!   timer's, `escalation_step = step + 1`, route_info `{"target": "escalation", "via",
 //!   "step", "rule_id", "decision", "decided_at", "fallback"?}`, `ON CONFLICT DO NOTHING`).
@@ -186,7 +190,9 @@ fn push_step(
 /// Insert the timer (no-op if one exists for the alert). Returns `true` if inserted.
 /// An empty chain inserts nothing (module doc: "Empty chain → no timer"); the router only
 /// calls this with a non-empty chain. `interval` is clamped up to 1 ms because the table
-/// requires `interval_ms > 0`.
+/// requires `interval_ms > 0`. `planned_channels` freezes the channels the notification
+/// planned — parked throttle rows included — for the fire path's fallback (S11-8); an empty
+/// list is stored as NULL (nothing was planned; the fire falls back like old timers do).
 pub async fn schedule(
     tx: &mut Transaction<'_, Postgres>,
     alert_id: Uuid,
@@ -194,6 +200,7 @@ pub async fn schedule(
     ctx: &RoutingContext,
     chain: &[ChainStep],
     interval: Duration,
+    planned_channels: &[String],
 ) -> Result<bool, sqlx::Error> {
     if chain.is_empty() {
         return Ok(false);
@@ -201,10 +208,14 @@ pub async fn schedule(
     let interval_ms = i64::try_from(interval.as_millis())
         .unwrap_or(i64::MAX)
         .max(1);
+    let planned: Option<Vec<String>> =
+        (!planned_channels.is_empty()).then(|| planned_channels.to_vec());
     let res = sqlx::query(
         "INSERT INTO escalation_timers \
-              (alert_id, notify_seq, rule_id, service, environment, chain, interval_ms, due_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::float8)) \
+              (alert_id, notify_seq, rule_id, service, environment, chain, interval_ms, \
+               due_at, planned_channels) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                 now() + make_interval(secs => $8::float8), $9) \
          ON CONFLICT (alert_id) DO NOTHING",
     )
     .bind(alert_id)
@@ -215,6 +226,7 @@ pub async fn schedule(
     .bind(serde_json::to_value(chain).expect("chain serializes"))
     .bind(interval_ms)
     .bind(interval.as_secs_f64())
+    .bind(&planned)
     .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected() == 1)
@@ -248,6 +260,10 @@ pub struct ClaimedTimer {
     pub chain: Vec<ChainStep>,
     pub step: i32,
     pub interval: Duration,
+    /// The channels the notification that started the clock planned, frozen by
+    /// [`schedule`] (S11-8); `None` on timers written before the column existed — those
+    /// keep the historical fallback of reading the alert's existing job channels.
+    pub planned_channels: Option<Vec<String>>,
     /// The lease this claim took: the fire's finalize is fenced by it.
     pub lease_token: Uuid,
 }
@@ -292,6 +308,7 @@ pub async fn claim_due(
         serde_json::Value,
         i32,
         i64,
+        Option<Vec<String>>,
         Uuid,
     );
     let rows: Vec<Row> = sqlx::query_as(
@@ -308,7 +325,7 @@ pub async fn claim_due(
              lease_token = gen_random_uuid(), updated_at = now() \
          FROM c WHERE t.alert_id = c.alert_id \
          RETURNING t.alert_id, t.notify_seq, t.rule_id, t.service, t.environment, t.chain, \
-                   t.step, t.interval_ms, t.lease_token",
+                   t.step, t.interval_ms, t.planned_channels, t.lease_token",
     )
     .bind(cfg.batch_size)
     .bind(&cfg.worker_id)
@@ -326,6 +343,7 @@ pub async fn claim_due(
         raw,
         step,
         interval_ms,
+        planned_channels,
         lease_token,
     ) in rows
     {
@@ -339,6 +357,7 @@ pub async fn claim_due(
                 chain,
                 step,
                 interval: Duration::from_millis(u64::try_from(interval_ms).unwrap_or(0)),
+                planned_channels,
                 lease_token,
             }),
             Err(err) => {
@@ -439,21 +458,34 @@ pub async fn fire_claimed(
             channels.push(channel.clone());
         }
     }
-    // UI only (or nothing sendable): fall back to the distinct channels this notification
-    // already created jobs for (module doc).
+    // UI only (or nothing sendable): fall back to the timer's frozen `planned_channels`
+    // (S11-8) — the channels the notification that started the clock actually planned,
+    // parked throttle rows included — so later jobs on other channels (fallback jobs,
+    // digests, prompts) cannot change the step's channels. Timers written before the
+    // column existed (NULL) keep the historical behaviour: the distinct channels this
+    // alert's existing jobs already used for `notify_seq`.
     if channels.is_empty() {
-        let existing: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT channel FROM delivery_jobs \
-             WHERE alert_id = $1 AND notify_seq = $2 ORDER BY channel",
-        )
-        .bind(claimed.alert_id)
-        .bind(claimed.notify_seq)
-        .fetch_all(&mut *tx)
-        .await?;
-        channels = existing
-            .into_iter()
-            .filter(|c| SUPPORTED_JOB_CHANNELS.contains(&c.as_str()))
-            .collect();
+        channels = match &claimed.planned_channels {
+            Some(planned) => planned
+                .iter()
+                .filter(|c| SUPPORTED_JOB_CHANNELS.contains(&c.as_str()))
+                .cloned()
+                .collect(),
+            None => {
+                let existing: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT channel FROM delivery_jobs \
+                     WHERE alert_id = $1 AND notify_seq = $2 ORDER BY channel",
+                )
+                .bind(claimed.alert_id)
+                .bind(claimed.notify_seq)
+                .fetch_all(&mut *tx)
+                .await?;
+                existing
+                    .into_iter()
+                    .filter(|c| SUPPORTED_JOB_CHANNELS.contains(&c.as_str()))
+                    .collect()
+            }
+        };
     }
 
     let decided_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);

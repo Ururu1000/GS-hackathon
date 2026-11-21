@@ -1,7 +1,10 @@
 //! Runbook actions (SPEC §6.2): a registry of `Action`s, the `action_executions` queue and the
 //! `actions` role worker. Execution happens off the alert pipeline: the API inserts a `queued`
 //! row and returns 202; workers lease it (`FOR UPDATE SKIP LOCKED`, `locked_until`, fresh
-//! `lease_token`; expired `running` leases are reclaimable, at most `max_attempts` = 3), run it
+//! `lease_token`; expired `running` leases are reclaimable, at most `max_attempts` = 3 — and
+//! the lease is refreshed and re-verified against the token immediately before each execution
+//! runs, so a slow predecessor in the same claimed batch cannot let a later lease lapse and
+//! be reclaimed under it), run it
 //! with a timeout, and finalize fenced by the token: `ok`/`failed` (output = short, redacted
 //! text) or `uncertain` (timeout / crash against a non-idempotent target). Each finalize writes
 //! an `audit_log` row (`kind = "step_run"`, message like `retry_workflow failed: HTTP 500`) and
@@ -553,6 +556,26 @@ pub async fn run_once(
     //    terminal state + `finished_at` + output (300 chars), audit `step_run`, touch, and a
     //    `resolves: true` transition when the frozen step says so.
     for c in &claimed {
+        // The whole batch was leased at once but actions run sequentially: a slow first
+        // action can push a later execution past its claim-time lease, and another worker
+        // would then reclaim and run it concurrently. Refresh and re-verify the lease
+        // immediately before each execution (the token must still be ours) and skip the
+        // execution entirely when it is not.
+        let renewed: Option<(Uuid,)> = sqlx::query_as(
+            "UPDATE action_executions \
+              SET locked_until = now() + make_interval(secs => $3::float8), updated_at = now() \
+             WHERE id = $1 AND lease_token = $2 AND state = 'running' RETURNING id",
+        )
+        .bind(c.id)
+        .bind(c.lease_token)
+        .bind(cfg.lease.as_secs_f64())
+        .fetch_optional(pool)
+        .await?;
+        if renewed.is_none() {
+            // Another worker reclaimed the lease while this execution waited in the batch.
+            stats.lost_lease += 1;
+            continue;
+        }
         let outcome = match registry.get(&c.action) {
             Some(action) => {
                 let params = c.params.as_object().cloned().unwrap_or_default();

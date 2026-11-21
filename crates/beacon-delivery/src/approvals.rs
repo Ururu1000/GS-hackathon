@@ -10,7 +10,12 @@
 //!   never eligible; if that leaves nobody at all, `request` fails with
 //!   `RequestError::NoEligibleApprover`. `expires_at = now() + 15 min`, a random 4-digit code
 //!   (`0000`–`9999`) stored only
-//!   as `sms_code_hash = hex(sha256(id || ":" || code))`. The draw is collision-safe: inside the
+//!   as `sms_code_hash = hex(sha256(id || ":" || code))`. Race-safe per (alert, step):
+//!   inside the same tx, first take `pg_advisory_xact_lock` on the request key
+//!   (`'approval-req:' || alert || ':' || step`), then re-check for a pending row — the
+//!   loser returns the winner's id and sends no prompt SMS (one global lock order:
+//!   request lock, then the person locks below, so concurrent requests cannot deadlock).
+//!   The draw is collision-safe: inside the
 //!   same tx, take `pg_advisory_xact_lock(hashtext('approval-code:' || person))` per eligible
 //!   person (persons sorted, so concurrent requests lock in one order and cannot deadlock),
 //!   load the pending, unexpired approvals whose `eligible` overlaps this one's
@@ -42,8 +47,11 @@
 //! - **SMS reply** (`handle_reply`): `from` (E.164, compare digits only) → the person in the
 //!   Directory with that phone; unknown → `Unknown`. Text, trimmed, case-insensitive:
 //!   `Y <code>` | `YES <code>` | `APPROVE <code>` → approve; `N <code>` | `NO <code>` |
-//!   `REJECT <code>` → reject; `ACK` → ack the most recent `open` alert that sent an sms/phone job
-//!   to that number (`AlertOps::transition(Ack)`, audit `acked` via sms). For a code: find the
+//!   `REJECT <code>` → reject; `ACK` → ack the alert of the newest sms/phone job `sent` to
+//!   that number — an unsent (pending/cancelled/dead) page never counts, the phone never
+//!   rang (`AlertOps::transition(Ack)`, audit `acked` via sms). A repeated `ACK` is stable:
+//!   when the newest paged alert is already acked it answers `AlreadyDecided` instead of
+//!   advancing to an older open alert. For a code: find the
 //!   pending approvals where that person is eligible; match `sha256(id:code)` against each;
 //!   exactly one match decides via the same path as the UI (`via = sms`); more than one match
 //!   (only rows inserted by hand can force it — the collision-safe draw above refuses to
@@ -291,6 +299,17 @@ pub async fn request(
     params: &Value,
     requested_by: &str,
 ) -> Result<Uuid, RequestError> {
+    // Race-safe per (alert, step): serialize concurrent requests for the same slot FIRST,
+    // before the per-person code locks below (global lock order: request lock, then the
+    // person locks sorted) so two callers can never both decide "no pending approval
+    // exists" and race on the insert. The check below is the re-check under the lock; the
+    // loser returns the winner's id and sends no prompt SMS of its own.
+    let lock_key = format!("approval-req:{alert_id}:{step_id}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&lock_key)
+        .execute(&mut **tx)
+        .await?;
+
     // Idempotent per (alert, step): the pending request is returned as-is, no new SMS.
     if let Some((existing,)) = sqlx::query_as(
         "SELECT id FROM approvals WHERE alert_id = $1 AND step_id = $2 AND state = 'pending'",
@@ -350,12 +369,17 @@ pub async fn request(
     let code = draw_unique_code(&taken).ok_or(RequestError::NoFreeCode)?;
     let hash = code_hash(id, &code);
 
-    sqlx::query(
+    // The per-(alert, step) advisory lock above makes this insert race-free; the
+    // `ON CONFLICT DO NOTHING` belt-and-braces below covers any path that ever elides
+    // the lock (the partial unique index only fires on `pending` rows, so a conflict
+    // can only be the winner's row -- return it instead of failing the call).
+    let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO approvals \
             (id, alert_id, step_id, action, params, eligible, state, requested_by, \
              expires_at, sms_code_hash) \
          VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, \
-                 now() + make_interval(secs => $8), $9)",
+                 now() + make_interval(secs => $8), $9) \
+         ON CONFLICT (alert_id, step_id) WHERE state = 'pending' DO NOTHING RETURNING id",
     )
     .bind(id)
     .bind(alert_id)
@@ -366,8 +390,23 @@ pub async fn request(
     .bind(requested_by)
     .bind(APPROVAL_TTL.as_secs() as i64)
     .bind(&hash)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    if inserted.is_none() {
+        // Lost the race after all: return the winner's id, send no prompt SMS.
+        if let Some((existing,)) = sqlx::query_as(
+            "SELECT id FROM approvals \
+             WHERE alert_id = $1 AND step_id = $2 AND state = 'pending'",
+        )
+        .bind(alert_id)
+        .bind(step_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        {
+            return Ok(existing);
+        }
+        return Err(sqlx::Error::RowNotFound.into());
+    }
 
     // The SMS prompt: one sms job per eligible person with a phone (the requester is not in
     // `eligible`, so they are never prompted for their own request). The code travels in the
@@ -850,8 +889,16 @@ async fn code_decision(
     }
 }
 
-/// `ACK` from a known number: ack the most recent `open` alert that sent an sms/phone job to
-/// that number, audit `acked` via sms.
+/// `ACK` from a known number: ack the alert of the newest sms/phone job actually `sent` to
+/// that number (an unsent page — pending, cancelled or dead — never rang the phone, so it
+/// never makes an alert ackable), newest `sent_at` first; audit `acked` via sms.
+///
+/// Repeated callbacks are stable: the newest sent page decides the answer, so a repeat
+/// whose newest paged alert is already acked answers [`ReplyOutcome::AlreadyDecided`]
+/// (idempotent, no side effects) instead of advancing to an older open alert the sender
+/// may not even have seen. A newest page whose alert is no longer open at all (resolved,
+/// or a status this version does not know) has nothing left to ack and is reported as
+/// `Unknown`.
 async fn ack_latest(
     pool: &PgPool,
     alert_ops: &dyn AlertOps,
@@ -859,21 +906,29 @@ async fn ack_latest(
     from: &str,
 ) -> Result<ReplyOutcome, sqlx::Error> {
     let digits = digits_only(from);
-    let latest: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT a.id FROM alerts a \
+    let latest: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT a.id, a.status FROM alerts a \
          JOIN delivery_jobs j ON j.alert_id = a.id \
-         WHERE a.status = 'open' AND j.channel IN ('sms', 'phone') \
+         WHERE j.channel IN ('sms', 'phone') AND j.status = 'sent' \
            AND regexp_replace(j.address, '[^0-9]', '', 'g') = $1 \
-         ORDER BY j.created_at DESC, j.id DESC LIMIT 1",
+         ORDER BY j.sent_at DESC NULLS LAST, j.id DESC LIMIT 1",
     )
     .bind(&digits)
     .fetch_optional(pool)
     .await?;
-    let Some((alert_id,)) = latest else {
+    let Some((alert_id, status)) = latest else {
         return Ok(ReplyOutcome::Unknown(
             "no open alert has paged this number".into(),
         ));
     };
+    if status == "acked" {
+        return Ok(ReplyOutcome::AlreadyDecided);
+    }
+    if status != "open" {
+        return Ok(ReplyOutcome::Unknown(format!(
+            "the newest alert paged on this number is {status}"
+        )));
+    }
 
     let mut tx = pool.begin().await?;
     match alert_ops

@@ -1043,3 +1043,146 @@ async fn set_mock_mode_authed(http: &reqwest::Client, base_url: &str, target: &s
         .error_for_status()
         .expect("mock mode status");
 }
+
+// ---------------------------------------------------------------------------------------------
+// 10. Review fix (PR #11): the whole claimed batch shares one lease but actions run
+//     sequentially — the lease is refreshed and re-verified (token match) immediately
+//     before each execution, so a slow first action cannot get a later execution re-run by
+//     another worker while it waits.
+// ---------------------------------------------------------------------------------------------
+
+/// A worker config with a controllable lease for the concurrency tests.
+fn batch_cfg(worker_id: &str, lease: Duration) -> ActionsWorkerConfig {
+    ActionsWorkerConfig {
+        worker_id: worker_id.to_string(),
+        poll_interval: Duration::from_millis(10),
+        batch_size: 10,
+        lease,
+        timeout: Duration::from_secs(20),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_slow_first_action_does_not_get_the_second_execution_run_twice(pool: PgPool) {
+    // Two local targets: /slow takes 3 s (longer than the lease below), /count counts hits.
+    let slow_hits = Arc::new(AtomicUsize::new(0));
+    let count_hits = Arc::new(AtomicUsize::new(0));
+    let slow_srv = slow_hits.clone();
+    let count_srv = count_hits.clone();
+    let app = axum::Router::new()
+        .route(
+            "/slow",
+            axum::routing::get(move || {
+                let slow_srv = slow_srv.clone();
+                async move {
+                    slow_srv.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    (axum::http::StatusCode::OK, axum::Json(json!({"ok": true})))
+                }
+            }),
+        )
+        .route(
+            "/count",
+            axum::routing::get(move || {
+                let count_srv = count_srv.clone();
+                async move {
+                    count_srv.fetch_add(1, Ordering::SeqCst);
+                    (axum::http::StatusCode::OK, axum::Json(json!({"ok": true})))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind target server");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("target server");
+    });
+
+    let registry = ActionRegistry::builtin(ActionsConfig {
+        gateway_url: base.clone(),
+        http_targets: HashMap::from([
+            ("slow".to_string(), format!("{base}/slow")),
+            ("count".to_string(), format!("{base}/count")),
+        ]),
+        timeout: Duration::from_secs(20),
+    });
+    let dir = empty_dir();
+
+    // A short lease: the slow first action (3 s) outlasts it, so a claim-once batch lease
+    // would let the second execution's lease expire while it waits behind the first.
+    let lease = Duration::from_secs(2);
+    let alert = common::insert_alert(&pool, "open", "batch lease test").await;
+    let _slow_id = queue_exec(
+        &pool,
+        alert,
+        "s1",
+        "http_get",
+        // A path the alias base ends with, so the mapped URL is exactly {base}/slow.
+        json!({"url": "http://slow/slow"}),
+    )
+    .await
+    .expect("queue the slow execution");
+    let count_id = queue_exec(
+        &pool,
+        alert,
+        "s2",
+        "http_get",
+        json!({"url": "http://count/count"}),
+    )
+    .await
+    .expect("queue the counted execution");
+
+    // Worker A claims the batch (slow first) and grinds on the slow action.
+    let worker_a = {
+        let (pool, registry, dir) = (pool.clone(), registry.clone(), dir.clone());
+        let cfg = batch_cfg("w-batch-a", lease);
+        tokio::spawn(
+            async move { actions::run_once(&pool, &dir, &registry, &SqlAlertOps, &cfg).await },
+        )
+    };
+
+    // Worker B polls concurrently, reclaiming anything whose lease lapsed — under a
+    // claim-once batch lease it would re-run the execution still waiting behind A's slow
+    // action, and A would run it too after the slow one finished.
+    let worker_b = {
+        let (pool, registry, dir) = (pool.clone(), registry, dir);
+        let count_watch = count_hits.clone();
+        let cfg = batch_cfg("w-batch-b", lease);
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            while std::time::Instant::now() < deadline {
+                let stats = actions::run_once(&pool, &dir, &registry, &SqlAlertOps, &cfg)
+                    .await
+                    .expect("worker B run_once");
+                if count_watch.load(Ordering::SeqCst) >= 1 {
+                    return stats;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("worker B never saw the counted execution finish");
+        })
+    };
+
+    let stats_a = tokio::time::timeout(Duration::from_secs(60), worker_a)
+        .await
+        .expect("worker A timed out")
+        .expect("worker A panicked")
+        .expect("worker A db error");
+    let stats_b = tokio::time::timeout(Duration::from_secs(60), worker_b)
+        .await
+        .expect("worker B timed out")
+        .expect("worker B panicked");
+
+    // The slow action may legitimately be re-run once its own lease lapses mid-flight
+    // (that is the ordinary reclaim path, fenced at finalize); the SECOND execution must
+    // not: it never runs lease-less behind the first any more.
+    assert!(slow_hits.load(Ordering::SeqCst) >= 1, "the slow action ran");
+    assert_eq!(
+        count_hits.load(Ordering::SeqCst),
+        1,
+        "the second execution must not be run twice: a={stats_a:?} b={stats_b:?}"
+    );
+    let (state, _, _) = exec_state(&pool, count_id).await;
+    assert_eq!(state, "ok", "finalized exactly once");
+}

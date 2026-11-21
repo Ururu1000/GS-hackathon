@@ -221,6 +221,21 @@ pub async fn route_once(
         {
             let notified: HashSet<String> = planned_by_person.keys().cloned().collect();
             let chain = escalation::plan_chain(dir, &payload.route, &payload.team, &notified);
+            // The channels this notification planned, frozen onto the timer (S11-8):
+            // parked rows count too, so later jobs (fallback jobs, digests, prompts) cannot
+            // change an escalation step's fallback channels.
+            let planned_channels: Vec<String> = {
+                let mut seen = HashSet::new();
+                let mut out: Vec<String> = Vec::new();
+                for jobs in planned_by_person.values() {
+                    for job in jobs {
+                        if seen.insert(job.channel.clone()) {
+                            out.push(job.channel.clone());
+                        }
+                    }
+                }
+                out
+            };
             if !chain.is_empty()
                 && escalation::schedule(
                     &mut tx,
@@ -229,6 +244,7 @@ pub async fn route_once(
                     &ctx,
                     &chain,
                     interval,
+                    &planned_channels,
                 )
                 .await?
             {

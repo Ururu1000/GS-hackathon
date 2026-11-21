@@ -497,6 +497,69 @@ async fn acked_or_resolved_alert_sends_no_email(pool: PgPool) {
     }
 }
 
+/// Review fix (PR #11): an acked alert stops normal paging but keeps its approval prompts
+/// deliverable — the approval stays decidable while the alert is being worked on. A
+/// resolved alert cancels everything, prompts included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn acked_alerts_send_approval_prompts_but_resolved_ones_do_not(pool: PgPool) {
+    let acked = insert_alert(&pool, "acked", &alert_title(&unique_tag())).await;
+    let resolved = insert_alert(&pool, "resolved", &alert_title(&unique_tag())).await;
+
+    // A normal page on the acked alert, an approval prompt on the acked alert, and an
+    // approval prompt on the resolved one — route_info frozen the way
+    // `approvals::request` writes it (`target = "approval"`).
+    let normal = insert_job(&pool, acked, "anna", "anna@example.test").await;
+    let prompt_route = || {
+        json!({
+            "target": "approval",
+            "approval": {
+                "id": Uuid::new_v4(),
+                "code": "4821",
+                "step_id": "s3",
+                "action": "escalate",
+            },
+        })
+    };
+    let acked_prompt: Uuid = sqlx::query_scalar(
+        "INSERT INTO delivery_jobs \
+            (alert_id, notify_seq, recipient_id, channel, address, route_info) \
+         VALUES ($1, 1, 'bob', 'email', 'bob@example.test', $2) RETURNING id",
+    )
+    .bind(acked)
+    .bind(prompt_route())
+    .fetch_one(&pool)
+    .await
+    .expect("prompt job on the acked alert");
+    let resolved_prompt: Uuid = sqlx::query_scalar(
+        "INSERT INTO delivery_jobs \
+            (alert_id, notify_seq, recipient_id, channel, address, route_info) \
+         VALUES ($1, 1, 'bob', 'email', 'bob@example.test', $2) RETURNING id",
+    )
+    .bind(resolved)
+    .bind(prompt_route())
+    .fetch_one(&pool)
+    .await
+    .expect("prompt job on the resolved alert");
+
+    let (fake, channel) = FakeChannel::new().into_channel();
+    let stats = work_once_bounded(&pool, &channel, &worker_cfg("w-ack-prompt")).await;
+    assert_eq!(stats.claimed, 3, "{stats:?}");
+    // The acked alert's approval prompt is still deliverable; its normal page is not, and
+    // a resolved alert cancels everything, prompts included.
+    assert_eq!(stats.sent, 1, "{stats:?}");
+    assert_eq!(stats.cancelled, 2, "{stats:?}");
+
+    assert_eq!(job_row(&pool, acked_prompt).await.status, "sent");
+    assert_eq!(fake.sent(), vec![acked_prompt]);
+    assert_eq!(job_row(&pool, normal).await.status, "cancelled");
+    let resolved_row = job_row(&pool, resolved_prompt).await;
+    assert_eq!(resolved_row.status, "cancelled");
+    assert!(
+        resolved_row.last_error.is_some(),
+        "the cancel reason is recorded"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // 4. Failures and retries
 // ---------------------------------------------------------------------------------------------

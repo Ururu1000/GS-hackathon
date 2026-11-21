@@ -337,6 +337,310 @@ async fn concurrent_takes_grant_exactly_one_token(pool: PgPool) {
     assert!(a != b, "exactly one take wins, got {a},{b}");
 }
 
+// ---------------------------------------------------------------------------------------------
+// S11-5: the pair selection filters by eligibility BEFORE the limit.
+// ---------------------------------------------------------------------------------------------
+
+/// One parked row for `(rule, recipient)` with a single email job, straight into the
+/// tables (the router path is covered by the tests above).
+async fn park_row(pool: &PgPool, rule_id: &str, recipient_id: &str, alert: Uuid) {
+    let jobs = json!([{
+        "channel": "email",
+        "address": format!("{recipient_id}@example.test"),
+        "route_info": { "target": format!("user:{recipient_id}") },
+    }]);
+    sqlx::query(
+        "INSERT INTO throttle_suppressed (rule_id, recipient_id, alert_id, notify_seq, jobs) \
+         VALUES ($1, $2, $3, 1, $4)",
+    )
+    .bind(rule_id)
+    .bind(recipient_id)
+    .bind(alert)
+    .bind(&jobs)
+    .execute(pool)
+    .await
+    .expect("park suppressed row");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn digest_selects_eligible_pairs_before_the_limit(pool: PgPool) {
+    const RULE: &str = "starve-rule";
+    let alert = insert_alert(&pool, "open", "digest starvation").await;
+
+    // 150 not-ready pairs: the bucket is empty and refills one token a day.
+    sqlx::query(
+        "INSERT INTO throttle_buckets (rule_id, recipient_id, tokens, capacity, refill_per_sec) \
+         SELECT $1, 'p' || lpad(g::text, 3, '0'), 0.0, 1, 1.0 / 86400.0 \
+         FROM generate_series(0, 149) g",
+    )
+    .bind(RULE)
+    .execute(&pool)
+    .await
+    .expect("not-ready buckets");
+    sqlx::query(
+        "INSERT INTO throttle_suppressed (rule_id, recipient_id, alert_id, notify_seq, jobs) \
+         SELECT $1, 'p' || lpad(g::text, 3, '0'), $2, 1, \
+                '[{\"channel\":\"email\",\"address\":\"e@example.test\",\
+                  \"route_info\":{\"target\":\"user:p\"}}]'::jsonb \
+         FROM generate_series(0, 149) g",
+    )
+    .bind(RULE)
+    .bind(alert)
+    .execute(&pool)
+    .await
+    .expect("not-ready suppressed rows");
+
+    // One ready pair, sorted AFTER the whole not-ready block: with a plain
+    // `LIMIT 100` over all pairs it would never make the first page.
+    park_row(&pool, RULE, "zz-ready", alert).await;
+    sqlx::query(
+        "INSERT INTO throttle_buckets \
+             (rule_id, recipient_id, tokens, capacity, refill_per_sec) \
+         VALUES ($1, 'zz-ready', 1.0, 1, 1.0 / 86400.0)",
+    )
+    .bind(RULE)
+    .execute(&pool)
+    .await
+    .expect("ready bucket");
+
+    let d = throttle::digest_once(&pool, 100).await.expect("digest");
+    assert_eq!(d.digests, 1, "{d:?}");
+    assert_eq!(d.jobs_inserted, 1, "{d:?}");
+    assert_eq!(d.rows_covered, 1, "{d:?}");
+    assert_eq!(
+        suppressed_pending(&pool).await,
+        150,
+        "the not-ready rows stay parked"
+    );
+
+    // The ready pair's digest job exists; no not-ready pair got one.
+    let ready: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM delivery_jobs \
+         WHERE recipient_id = 'zz-ready' AND route_info->>'target' = 'digest'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ready digest job");
+    assert_eq!(ready, 1);
+    let starved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM delivery_jobs \
+         WHERE recipient_id LIKE 'p%' AND route_info->>'target' = 'digest'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("starved digest jobs");
+    assert_eq!(starved, 0, "not-ready pairs must not be digested");
+}
+
+// ---------------------------------------------------------------------------------------------
+// S11-6: one digest job per frozen (channel, address) group.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn digest_files_one_job_per_channel_address_group(pool: PgPool) {
+    let dir = directory();
+    let cfg = RouterConfig::default();
+    let rule_id = "throttle-test-groups";
+    let throttle = json!({"max": 1, "per_ms": 60000});
+
+    // Notification 1 drains the bucket (W gets its email job); the next four are parked:
+    // A plans email, B plans sms, C plans email + sms, D plans email again.
+    let mut alerts = Vec::new();
+    for channels in [
+        vec!["email"],
+        vec!["email"],
+        vec!["sms"],
+        vec!["email", "sms"],
+        vec!["email"],
+    ] {
+        let alert = insert_alert(&pool, "open", "digest groups").await;
+        insert_outbox_raw(
+            &pool,
+            "notify",
+            alert,
+            notify_payload(
+                alert,
+                1,
+                rule_id,
+                json!([{"to": "user:anna", "channels": channels}]),
+                throttle.clone(),
+            ),
+        )
+        .await;
+        alerts.push(alert);
+    }
+    let stats = route_once(&pool, &dir, &cfg).await.expect("route_once");
+    assert_eq!(stats.suppressed, 4, "{stats:?}");
+    let [alert_w, alert_a, alert_b, alert_c, alert_d] =
+        [alerts[0], alerts[1], alerts[2], alerts[3], alerts[4]];
+
+    sqlx::query(
+        "UPDATE throttle_buckets SET refilled_at = now() - interval '60 seconds' \
+         WHERE rule_id = $1 AND recipient_id = 'anna'",
+    )
+    .bind(rule_id)
+    .execute(&pool)
+    .await
+    .expect("rewind");
+
+    let d = throttle::digest_once(&pool, 100).await.expect("digest");
+    assert_eq!(d.digests, 1, "{d:?}");
+    assert_eq!(d.jobs_inserted, 2, "one digest job per group: {d:?}");
+    assert_eq!(d.rows_covered, 4, "{d:?}");
+    assert_eq!(suppressed_pending(&pool).await, 0);
+
+    // One digest job per (channel, address) group, filed under the latest covered row's
+    // alert (D: its unique key was free, its notification created no job). The email group
+    // covers A, C and D; the sms group covers B and C.
+    let jobs: Vec<(String, String, Value)> = sqlx::query_as(
+        "SELECT channel, address, route_info FROM delivery_jobs \
+         WHERE route_info->>'target' = 'digest' ORDER BY channel",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("digest jobs");
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+
+    let (channel, address, info) = &jobs[0];
+    assert_eq!(channel, "email");
+    assert_eq!(address, "anna@example.test");
+    assert_eq!(info["digest"]["rule_id"], rule_id);
+    assert_eq!(
+        info["digest"]["count"], 3,
+        "A, C and D planned email: {info:?}"
+    );
+    let ids: Vec<String> =
+        serde_json::from_value(info["digest"]["alert_ids"].clone()).expect("email alert_ids");
+    assert_eq!(
+        ids,
+        vec![
+            alert_a.to_string(),
+            alert_c.to_string(),
+            alert_d.to_string()
+        ],
+        "the email group's own alert ids, oldest first"
+    );
+    assert!(info.get("fallback").is_none(), "fallback is stripped");
+
+    let (channel, address, info) = &jobs[1];
+    assert_eq!(channel, "sms");
+    assert_eq!(address, "+44 7700 900123");
+    assert_eq!(info["digest"]["rule_id"], rule_id);
+    assert_eq!(info["digest"]["count"], 2, "B and C planned sms: {info:?}");
+    let ids: Vec<String> =
+        serde_json::from_value(info["digest"]["alert_ids"].clone()).expect("sms alert_ids");
+    assert_eq!(
+        ids,
+        vec![alert_b.to_string(), alert_c.to_string()],
+        "the sms group's own alert ids, oldest first"
+    );
+    assert!(info.get("fallback").is_none(), "fallback is stripped");
+
+    // Both jobs are filed under the latest covered row (D: its unique key was free).
+    let digest_alerts: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT alert_id FROM delivery_jobs WHERE route_info->>'target' = 'digest'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("digest alert ids");
+    assert_eq!(digest_alerts, vec![alert_d]);
+    // Every covered row is marked with that alert, and W's own job still stands.
+    let marked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM throttle_suppressed \
+         WHERE rule_id = $1 AND digested_at IS NOT NULL AND digest_alert = $2",
+    )
+    .bind(rule_id)
+    .bind(alert_d)
+    .fetch_one(&pool)
+    .await
+    .expect("marked");
+    assert_eq!(marked, 4);
+    let w: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM delivery_jobs WHERE alert_id = $1 AND route_info->>'target' != 'digest'",
+    )
+    .bind(alert_w)
+    .fetch_one(&pool)
+    .await
+    .expect("w job");
+    assert_eq!(w, 1, "the token-paying notification kept its job");
+}
+
+// ---------------------------------------------------------------------------------------------
+// S11-7: the refill clock is sampled after the lock wait, and refilled_at stays monotonic.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refill_after_a_lock_wait_uses_the_fresh_clock(pool: PgPool) {
+    let big = big_pool(&pool, 2).await;
+    let spec = ThrottleSpec {
+        max: 2,
+        per: Duration::from_secs(1), // refill 2 tokens/s
+    };
+
+    // The bucket is empty and was last refilled 250 ms ago: at a transaction-START clock no
+    // token is available yet, but by the end of the 1.5 s lock wait below one must be.
+    sqlx::query(
+        "INSERT INTO throttle_buckets \
+             (rule_id, recipient_id, tokens, capacity, refill_per_sec, refilled_at) \
+         VALUES ('rule-lockwait', 'anna', 0.0, 2, 2.0, now() - interval '250 milliseconds')",
+    )
+    .execute(&pool)
+    .await
+    .expect("bucket");
+
+    // Transaction A takes the bucket row lock and holds it for 1.5 s.
+    let mut a = pool.begin().await.expect("begin a");
+    let (tokens,): (f64,) = sqlx::query_as(
+        "SELECT tokens FROM throttle_buckets \
+         WHERE rule_id = 'rule-lockwait' AND recipient_id = 'anna' FOR UPDATE",
+    )
+    .fetch_one(&mut *a)
+    .await
+    .expect("lock the bucket row");
+    assert_eq!(tokens, 0.0);
+
+    // Transaction B begins while A holds the lock: `take` blocks on it, so the refill it
+    // computes must come from a clock sampled AFTER the wait, not from B's stale start.
+    let take_b = tokio::spawn(async move {
+        let mut tx = big.begin().await.expect("begin b");
+        let got = throttle::take(&mut tx, "rule-lockwait", "anna", &spec)
+            .await
+            .expect("take");
+        tx.commit().await.expect("commit b");
+        got
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    a.commit().await.expect("commit a");
+
+    let got = tokio::time::timeout(Duration::from_secs(30), take_b)
+        .await
+        .expect("take b timed out")
+        .expect("take b panicked");
+    assert!(
+        got,
+        "a refill computed after a 1.5 s lock wait must credit the waited time"
+    );
+
+    // Not too small, not negative: the full elapsed (>= 1.75 s at 2/s, capped at the
+    // capacity of 2) minus the taken token, and `refilled_at` moved to the post-lock
+    // sample instead of the stale transaction start.
+    let (tokens, refilled_at_fresh): (f64, bool) = sqlx::query_as(
+        "SELECT tokens, refilled_at > now() - interval '1 second' \
+         FROM throttle_buckets WHERE rule_id = 'rule-lockwait' AND recipient_id = 'anna'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("bucket after");
+    assert!(
+        (tokens - 1.0).abs() < 0.1,
+        "the refill credited the lock wait, got {tokens}"
+    );
+    assert!(
+        refilled_at_fresh,
+        "refilled_at must be the post-lock clock sample, not the stale tx start"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_digests_file_one_digest(pool: PgPool) {
     let dir = directory();

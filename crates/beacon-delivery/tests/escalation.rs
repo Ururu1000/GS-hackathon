@@ -195,7 +195,10 @@ fn rule_ctx(rule_id: &str) -> RoutingContext {
     }
 }
 
-/// Start a timer directly through `escalation::schedule` (no router involved).
+/// Start a timer directly through `escalation::schedule` (no router involved). The frozen
+/// planned channels default to none: `schedule` stores that as NULL, which keeps the
+/// historical fire-time fallback (existing job channels) — timers written before the
+/// `planned_channels` column behave the same way.
 async fn schedule_direct(pool: &PgPool, alert_id: Uuid, rule_id: &str, chain: Vec<ChainStep>) {
     let mut tx = pool.begin().await.expect("tx");
     let inserted = escalation::schedule(
@@ -205,6 +208,7 @@ async fn schedule_direct(pool: &PgPool, alert_id: Uuid, rule_id: &str, chain: Ve
         &rule_ctx(rule_id),
         &chain,
         Duration::from_secs(600),
+        &[],
     )
     .await
     .expect("schedule");
@@ -362,6 +366,7 @@ async fn router_schedules_one_timer_and_renotify_does_not_restart_it(pool: PgPoo
         &rule_ctx("settlements-workflow-failed"),
         &[],
         Duration::from_secs(600),
+        &[],
     )
     .await
     .expect("schedule empty chain");
@@ -740,6 +745,7 @@ async fn a_stale_leases_finalize_writes_nothing(pool: PgPool) {
         }],
         step: 0,
         interval: Duration::from_secs(600),
+        planned_channels: None,
         lease_token: stale,
     };
     let outcome = escalation::fire_claimed(&pool, &dir, &claimed)
@@ -947,6 +953,147 @@ async fn fire_matches_preferences_on_the_first_notifications_service(pool: PgPoo
     assert_eq!(
         x1.channel, "sms",
         "the service preference must match at fire time"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frozen planned channels (S11-8)
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn frozen_planned_channels_ignore_later_jobs_on_other_channels(pool: PgPool) {
+    // y1 resolves email through her own preference; x1 (lead of t) has no preferences and
+    // t has no default channels, so at fire time she resolves to UI only and her step
+    // falls back to the timer's planned channels.
+    let dir = Directory::from_parts(
+        vec![
+            person(
+                "y1",
+                Some("y1@example.test"),
+                Some("+44 7700 900301"),
+                Some(json!([{ "match": { "severity": "warning" }, "channels": ["email"] }])),
+            ),
+            person("x1", Some("x1@example.test"), Some("+44 7700 900302"), None),
+        ],
+        vec![team("t", &["x1", "y1"], Some("x1"), None)],
+    )
+    .expect("directory");
+
+    let alert = insert_alert_as(&pool, "open", "warning", "t", "frozen-channels-rule").await;
+    insert_notify(
+        &pool,
+        alert,
+        1,
+        Notify {
+            rule_id: "frozen-channels-rule",
+            team_id: "t",
+            severity: "warning",
+            reason: "new",
+            // No explicit channels: the chain step must resolve its own, so the step
+            // really exercises the fallback, not an inherited channel list.
+            route: json!([{ "to": "user:y1" }]),
+        },
+    )
+    .await;
+    let stats = route_once(&pool, &dir, &router_cfg(60_000))
+        .await
+        .expect("route_once");
+    assert_eq!(stats.timers, 1, "{stats:?}");
+
+    // The router froze exactly what the notification planned: y1's email job.
+    let planned: Option<Vec<String>> =
+        sqlx::query_scalar("SELECT planned_channels FROM escalation_timers WHERE alert_id = $1")
+            .bind(alert)
+            .fetch_one(&pool)
+            .await
+            .expect("planned_channels");
+    assert_eq!(planned, Some(vec!["email".to_string()]));
+
+    // Later jobs on other channels appear for the same notification (a fallback-style
+    // send): the historical fallback would pick them up, the frozen plan must not.
+    sqlx::query(
+        "INSERT INTO delivery_jobs \
+             (alert_id, notify_seq, recipient_id, channel, address, route_info, \
+              escalation_step) \
+         VALUES ($1, 1, 'y1', 'sms', '+44 7700 900301', \
+                 '{\"target\":\"team:t\",\"note\":\"fallback-style\"}', 1)",
+    )
+    .bind(alert)
+    .execute(&pool)
+    .await
+    .expect("plant the drifting sms job");
+
+    make_due(&pool, alert).await;
+    let s = escalation::escalate_once(&pool, &dir, &sched_cfg("s1"))
+        .await
+        .expect("escalate_once");
+    assert_eq!(
+        (s.claimed, s.fired, s.jobs_inserted, s.skipped),
+        (1, 1, 1, 0)
+    );
+
+    // x1 was paged on the FROZEN channel only: the later sms job never changed the step.
+    let x1: Vec<_> = job_rows(&pool, alert)
+        .await
+        .into_iter()
+        .filter(|j| j.recipient_id == "x1")
+        .collect();
+    assert_eq!(x1.len(), 1, "{x1:?}");
+    assert_eq!(x1[0].channel, "email");
+    assert_eq!(x1[0].escalation_step, Some(1));
+    assert_eq!(x1[0].address, "x1@example.test");
+    assert_eq!(
+        x1[0].route_info["decision"],
+        json!({"source": "ui_default"})
+    );
+
+    // Old timers (planned_channels NULL, like rows written before the column) keep the
+    // historical behaviour: the step falls back to whatever channels the alert's jobs
+    // use by then, drifting channels included.
+    let legacy = insert_alert_as(&pool, "open", "warning", "t", "frozen-channels-rule").await;
+    schedule_direct(
+        &pool,
+        legacy,
+        "frozen-channels-rule",
+        vec![ChainStep {
+            recipient_id: "x1".into(),
+            via: "lead:t".into(),
+            channels: None,
+        }],
+    )
+    .await;
+    for channel in ["email", "sms"] {
+        sqlx::query(
+            "INSERT INTO delivery_jobs \
+                 (alert_id, notify_seq, recipient_id, channel, address, route_info, \
+                  escalation_step) \
+             VALUES ($1, 1, 'y1', $2, 'y1@example.test', '{\"target\":\"team:t\"}', 1)",
+        )
+        .bind(legacy)
+        .bind(channel)
+        .execute(&pool)
+        .await
+        .expect("plant legacy job");
+    }
+    make_due(&pool, legacy).await;
+    let s = escalation::escalate_once(&pool, &dir, &sched_cfg("s1"))
+        .await
+        .expect("escalate legacy");
+    assert_eq!(
+        (s.claimed, s.fired, s.jobs_inserted, s.skipped),
+        (1, 1, 2, 0)
+    );
+    let mut channels: Vec<String> = job_rows(&pool, legacy)
+        .await
+        .into_iter()
+        .filter(|j| j.recipient_id == "x1")
+        .map(|j| j.channel)
+        .collect();
+    channels.sort();
+    assert_eq!(
+        channels,
+        vec!["email".to_string(), "sms".to_string()],
+        "NULL planned_channels keeps reading the (drifted) job channels"
     );
 }
 

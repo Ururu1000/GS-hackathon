@@ -4,8 +4,8 @@
 //! 3. self-approval is impossible (requester never eligible, never prompted, never decides;
 //!    a sole-approver step answers 409 "no one else can approve this step"),
 //! 4. the replay window on `/api/replies` (missing/old/future timestamp -> 401, good -> 200),
-//! 5. `text/plain` POSTs are 415, the standalone demo header acts only when allowed and a
-//!    non-loopback bind is refused,
+//! 5. non-JSON POSTs are 415 — empty bodies included, whatever their (missing) header —
+//!    the standalone demo header acts only when allowed and a non-loopback bind is refused,
 //! 6. an expired approval sharing a code never makes a reply ambiguous.
 //!
 //! Needs Postgres (`DATABASE_URL`; sqlx creates a throwaway database per test).
@@ -294,6 +294,19 @@ async fn post_body(url: &str, body: &str, content_type: &str) -> (u16, Value) {
         .send()
         .await
         .expect("post body");
+    read_response(resp).await
+}
+
+/// A POST sent with NO content-type header at all — what a bare cross-site form or a
+/// hand-rolled client produces for an empty body.
+async fn post_no_content_type(url: &str) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .post(url)
+        .body(String::new())
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("post without a content type");
     read_response(resp).await
 }
 
@@ -645,23 +658,93 @@ async fn non_json_post_bodies_are_unsupported_media_type(pool: PgPool) {
     assert_eq!(status, 415, "{res}");
     assert_eq!(error_code(&res), "unsupported_media_type", "{res}");
 
-    // An EMPTY body is still allowed wherever the contract allows one, whatever the header,
-    // and a charset parameter does not spoil a JSON body.
+    // An empty body without the JSON content type is a 415 too (the dedicated test below
+    // covers every route and the no-header case); a charset parameter does not spoil a
+    // JSON body that parses.
     let (status, res) = post_body(
         &format!("{base}/api/alerts/{alert}/steps/s2/run"),
         "",
         "text/plain",
     )
     .await;
-    assert_eq!(status, 202, "empty bodies stay allowed: {res}");
-    let fresh = insert_team_alert(&pool, "settlements", &[action_step("s2", "none")]).await;
+    assert_eq!(
+        status, 415,
+        "an empty cross-site form body passes no gate: {res}"
+    );
     let (status, res) = post_body(
-        &format!("{base}/api/alerts/{fresh}/steps/s2/run"),
+        &format!("{base}/api/alerts/{alert}/steps/s2/run"),
         &json!({}).to_string(),
         "application/json; charset=utf-8",
     )
     .await;
     assert_eq!(status, 202, "{res}");
+}
+
+/// The gate holds for EMPTY bodies too: every mutating route requires the JSON content
+/// type even when the body is empty — a cross-site `<form>` posting an empty body (no
+/// header, or `text/plain`) passes nothing. An empty body WITH the content type is still
+/// "no body" wherever the contract allows one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn empty_post_bodies_need_the_json_content_type(pool: PgPool) {
+    let state = api_state(&pool, Some(b"secret".to_vec()));
+    let alert = insert_team_alert(
+        &pool,
+        "settlements",
+        &[action_step("s2", "none"), manual_step("m1")],
+    )
+    .await;
+    let base = serve_api_as(state, "user:bob").await;
+
+    for url in [
+        format!("{base}/api/alerts/{alert}/steps/s2/run"),
+        format!("{base}/api/alerts/{alert}/steps/m1/check"),
+        format!("{base}/api/approvals/{}/approve", Uuid::new_v4()),
+        format!("{base}/api/approvals/{}/reject", Uuid::new_v4()),
+        format!("{base}/api/replies"),
+    ] {
+        // No content-type header at all.
+        let (status, res) = post_no_content_type(&url).await;
+        assert_eq!(status, 415, "no content type: {url}: {res}");
+        assert_eq!(error_code(&res), "unsupported_media_type", "{url}: {res}");
+        // The form enctype.
+        let (status, res) = post_body(&url, "", "text/plain").await;
+        assert_eq!(status, 415, "text/plain: {url}: {res}");
+        assert_eq!(error_code(&res), "unsupported_media_type", "{url}: {res}");
+    }
+
+    // The same empty body WITH the JSON content type means "no body": run and check
+    // accept it, the approval routes get past the gate to their own errors, and
+    // /api/replies passes the gate to its signature check.
+    let (status, res) = post_body(
+        &format!("{base}/api/alerts/{alert}/steps/s2/run"),
+        "",
+        "application/json",
+    )
+    .await;
+    assert_eq!(status, 202, "an empty JSON body runs the step: {res}");
+    let (status, res) = post_body(
+        &format!("{base}/api/alerts/{alert}/steps/m1/check"),
+        "",
+        "application/json",
+    )
+    .await;
+    assert_eq!(status, 200, "an empty JSON body checks the step: {res}");
+    let (status, res) = post_body(
+        &format!("{base}/api/approvals/{}/approve", Uuid::new_v4()),
+        "",
+        "application/json",
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "the gate passed; the unknown approval 404s: {res}"
+    );
+    let (status, res) = post_body(&format!("{base}/api/replies"), "", "application/json").await;
+    assert_eq!(
+        status, 401,
+        "the gate passed; the signature check answers: {res}"
+    );
+    assert_eq!(error_code(&res), "unauthorized", "{res}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
