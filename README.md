@@ -66,16 +66,17 @@ Everything below was measured, not estimated. Each row lists its hardware, workl
 
 ### Throughput
 
-The workload is `beacon-loadgen --duration 30 --batch 100 --distinct-keys 1000 --match-ratio 0.8 --concurrency 256`. It sends open-loop HTTP batches of all four sample event types, and 80% of the events match a rule. It ran on *CI* at commit `631545c` ([run 44869239778](https://github.com/Ururu1000/GS-hackathon/actions/runs/44869239778), `.github/workflows/loadgen.yml`). Each latency starts at server ingest of the first event for an alert key, not at every event. All figures are p50 / p99 in milliseconds.
+The workload is `beacon-loadgen --duration 30 --batch 100 --distinct-keys 1000 --match-ratio 0.8 --concurrency 256`. It sends open-loop HTTP batches of all four sample event types, and 80% of the events match a rule. It ran on *CI* through `.github/workflows/loadgen.yml`. Each latency starts at server ingest of the first event for an alert key, not at every event. All figures are p50 / p99 in milliseconds.
 
-| Target rate | Accepted | Processed | Ingest → alert | Ingest → gateway (sms) | Ingest → Mailpit |
-|---|---|---|---:|---:|---:|
-| 200 ev/s | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,806 alerts; backlog drained 2.5 s after sending stopped | 281 / 1,690 | 1,286 / 3,045 | 1,387 / 3,107 |
-| 2,000 ev/s | 60,000 of 60,000 (1,996 ev/s), 0 rejected | 4,000 alerts; drained 5.5 s after sending stopped (about 1,690 ev/s end to end) | 3,949 / 12,526 | not met, see below | not met, see below |
+| Target rate | Commit, run | Accepted | Processed | Ingest → alert | Ingest → gateway (sms) | Ingest → Mailpit | Delivered |
+|---|---|---|---|---:|---:|---:|---|
+| 200 ev/s | `e5d7522`, [run 44870310169](https://github.com/Ururu1000/GS-hackathon/actions/runs/44870310169) | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,783 alerts; drained 2.5 s after sending stopped | 518 / 2,892 | 3,916 / 5,330 | 4,341 / 5,868 | 684 SMS, 684 phone, 2,129 email; 0 missing, dead or duplicate |
+| 200 ev/s | `631545c`, [run 44869239778](https://github.com/Ururu1000/GS-hackathon/actions/runs/44869239778) | 6,000 of 6,000 (203 ev/s), 0 rejected | 2,806 alerts; drained 2.5 s after sending stopped | 281 / 1,690 | 1,286 / 3,045 | 1,387 / 3,107 | 709 SMS, 709 phone, 2,140 email; 0 missing, dead or duplicate |
+| 2,000 ev/s | `e5d7522`, [run 44870310169](https://github.com/Ururu1000/GS-hackathon/actions/runs/44870310169) | 60,000 of 60,000 (2,000 ev/s), 0 rejected | 4,000 alerts; drained 6.5 s after sending stopped | 3,904 / 8,495 | 41,214 / 49,649 | 41,010 / 49,514 | 1,000 SMS, 1,000 phone, 3,000 email; 0 missing, dead or duplicate |
 
-At 200 ev/s, delivery kept up: 709 SMS, 709 phone calls and 2,140 emails were sent, with 0 missing, 0 dead and 0 duplicates.
+The two 200 ev/s runs used the same code path and workload, and their delivery p50 differs threefold. That is the noise of a shared 2-vCPU runner, so read these as ranges, not exact figures.
 
-At 2,000 ev/s, ingest and alerting kept up on the 2-vCPU runner, but routing did not. When the measurement ran, 2,101 of the 3,000 alerts that notify someone still had no delivery jobs (the 1,000 pricing alerts show only in the UI). The jobs that did exist were planned at p50 24.8 s, and they reached the gateway at p50 28.5 s. The tool that measures delivery stopped before routing finished, so this run gives no valid delivery percentile at 2,000 ev/s. The fix is tracked on the board.
+**At 2,000 ev/s**, nothing was lost, but delivery fell behind. Ingest and alerting kept up. Routing turns each notification into delivery jobs, and Beacon runs a single routing task: one batch of 100 per transaction, with per-row inserts. It handles about 30 batches/s, below the roughly 3,000 notifications/s this load produces, so the backlog grew for the whole run. Jobs were planned at p50 about 40 s and cleared 20 s after sending stopped. The routing claim already uses `FOR UPDATE SKIP LOCKED`, and job inserts are idempotent, so more routing tasks or bigger batches are the next step. That change is out of scope for the demo.
 
 ### Ingest → delivery latency
 
