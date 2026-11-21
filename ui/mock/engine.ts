@@ -14,6 +14,7 @@ import type {
   Scalar,
   Severity,
 } from '../src/api/types.ts'
+import { redactText, redactValue } from '../src/lib/redact.ts'
 import { parseRuleStructure } from '../src/rules/structure.ts'
 
 const SEVERITIES: readonly Severity[] = ['critical', 'error', 'warning', 'info']
@@ -53,7 +54,7 @@ const MAX_SIG_DEPTH = 16
 const MAX_SIG_PATHS = 500
 
 /** Structural signature for unknown shapes: sorted paths, values ignored. */
-function signature(raw: unknown): string {
+export function unknownSignature(raw: unknown): string {
   const paths: string[] = []
   const walk = (v: unknown, p: string, depth: number) => {
     if (depth > MAX_SIG_DEPTH || paths.length >= MAX_SIG_PATHS) return
@@ -66,16 +67,26 @@ function signature(raw: unknown): string {
   return `unknown:${h.toString(16).padStart(8, '0')}`
 }
 
-export function normalize(raw: unknown): { schema: string; fields: Record<string, unknown> } {
-  const r = raw as any
-  if (isObj(r) && typeof r.type === 'string' && 'workflowId' in r)
-    return {
-      schema: 'workflow.failed',
+interface BuiltInMapping {
+  schema: string
+  fields: Record<string, unknown>
+  priority: number
+  preferredSource?: string
+  fallback?: true
+}
+
+export function* builtInMappings(raw: unknown): Generator<BuiltInMapping, void> {
+  if (!isObj(raw)) return
+  const r = raw
+  if (typeof r.type === 'string' && 'workflowId' in r) {
+    yield {
+      schema: 'workflow.failed', priority: 50,
       fields: compact({ type: r.type, severity: sevOf(r.severity), environment: r.environment, workflow: r.workflowName, occurred_at: r.timestamp }),
     }
-  if (isObj(r) && typeof r.alertname === 'string' && ['firing', 'resolved'].includes(r.status))
-    return {
-      schema: 'prometheus.alert',
+  }
+  if (typeof r.alertname === 'string' && ['firing', 'resolved'].includes(r.status)) {
+    yield {
+      schema: 'prometheus.alert', priority: 50, preferredSource: 'http:alertmanager',
       fields: compact({
         type: r.alertname,
         severity: sevOf(r.labels?.severity),
@@ -85,11 +96,13 @@ export function normalize(raw: unknown): { schema: string; fields: Record<string
         occurred_at: r.startsAt,
       }),
     }
-  if (isObj(r) && isObj(r.meta) && typeof r.meta.schema === 'string' && 'payload' in r)
-    return { schema: r.meta.schema, fields: compact({ type: r.meta.schema, service: r.meta.producer }) }
-  if (isObj(r) && typeof r.level === 'string' && typeof r.msg === 'string')
-    return {
-      schema: 'log.line',
+  }
+  if (isObj(r.meta) && typeof r.meta.schema === 'string' && 'payload' in r) {
+    yield { schema: r.meta.schema, priority: 0, fallback: true, fields: compact({ type: r.meta.schema, service: r.meta.producer }) }
+  }
+  if (typeof r.level === 'string' && typeof r.msg === 'string') {
+    yield {
+      schema: 'log.line', priority: 30,
       fields: compact({
         service: r.service,
         severity: sevOf(r.level),
@@ -98,14 +111,15 @@ export function normalize(raw: unknown): { schema: string; fields: Record<string
         instance: r.instance,
       }),
     }
-  if (isObj(r) && r.kind === 'deployment')
-    return { schema: 'ci.deployment', fields: compact({ type: 'deployment', service: r.service, severity: 'info', region: r.region }) }
-  return { schema: signature(raw), fields: {} }
+  }
+  if (r.kind === 'deployment') {
+    yield { schema: 'ci.deployment', priority: 30, fields: compact({ type: 'deployment', service: r.service, severity: 'info', region: r.region }) }
+  }
 }
 
 export function context(raw: unknown, source: string): Ctx {
-  const { schema, fields } = normalize(raw)
-  return { raw, fields, source, schema }
+  const first = builtInMappings(raw).next().value
+  return { raw, source, schema: first?.schema ?? unknownSignature(raw), fields: first?.fields ?? {} }
 }
 
 // ---- paths -------------------------------------------------------------------
@@ -142,6 +156,7 @@ export const isLeaf = (c: Condition): c is Leaf => typeof (c as Leaf).op === 'st
 const MAX_REGEX_LEN = 256
 const MAX_REGEX_INPUT = 4096
 const NESTED_QUANTIFIER_RE = /\((?:[^()\\]|\\.)*[+*?](?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,?\d*\})/
+const QUANTIFIED_ALT_RE = /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*(?:[+*?]|\{\d+,?\d*\})/
 const BACKREF_RE = /\\[1-9]/
 
 /** Compile a regex with basic ReDoS guards (production engine uses linear-time RE2/Rust regex). */
@@ -149,6 +164,7 @@ export function compileSafeRegex(pattern: string): { ok: true; re: RegExp } | { 
   if (pattern.length > MAX_REGEX_LEN) return { ok: false, error: `regex too long (max ${MAX_REGEX_LEN} chars)` }
   if (BACKREF_RE.test(pattern)) return { ok: false, error: 'backreferences are not allowed in regex' }
   if (NESTED_QUANTIFIER_RE.test(pattern)) return { ok: false, error: 'nested quantifiers are not allowed (ReDoS risk)' }
+  if (QUANTIFIED_ALT_RE.test(pattern)) return { ok: false, error: 'quantified alternation is not allowed (ReDoS risk)' }
   try {
     return { ok: true, re: new RegExp(pattern) }
   } catch (e) {
@@ -417,17 +433,22 @@ export interface Applied {
 }
 
 function present(rule: RuleSpec, ctx: Ctx, warnings: string[]): Applied {
-  const title = render(rule.present.title, ctx, warnings)
-  const body = render(rule.present.body ?? '', ctx, warnings)
+  const safeCtx: Ctx = {
+    ...ctx,
+    raw: redactValue(ctx.raw),
+    fields: redactValue(ctx.fields) as Record<string, unknown>,
+  }
+  const title = redactText(render(rule.present.title, safeCtx, warnings), 300)
+  const body = redactText(render(rule.present.body ?? '', safeCtx, warnings), 2000)
   const fields = fieldSpecs(rule).map(({ path, label }) => {
-    const v = getPath(ctx, path)
+    const v = getPath(safeCtx, path)
     if (v === MISSING) warnings.push(`field "${label}": ${path} is missing in this event`)
-    return { path, label, value: v === MISSING ? '—' : show(v) }
+    return { path, label, value: v === MISSING ? '—' : redactText(show(v), 500) }
   })
   const dedup_key = (rule.dedup?.key ?? []).map((p) => {
-    const v = getPath(ctx, p)
+    const v = getPath(safeCtx, p)
     if (v === MISSING) warnings.push(`dedup key ${p} is missing: such events would not merge into one alert`)
-    return v === MISSING ? '∅' : show(v)
+    return v === MISSING ? '∅' : redactText(show(v), 200)
   })
   const fsev = ctx.fields.severity as Severity
   const severity = rule.severity ?? (SEVERITIES.includes(fsev) ? fsev : 'warning')
@@ -463,8 +484,7 @@ export function recovers(rule: RuleSpec, ctx: Ctx): boolean {
 }
 
 /** `POST /api/rules/test`: zero writes, zero dispatches. */
-export function testRule(rule: unknown, event: unknown, source = 'http:test'): RuleTestResult {
-  const ctx = context(event, source)
+export function testRule(rule: unknown, event: unknown, source = 'http:test', ctx = context(event, source)): RuleTestResult {
   const parsed = parseRuleStructure(rule)
   if ('problem' in parsed)
     return { matched: false, schema: ctx.schema, fields: ctx.fields, nodes: [], card: null, warnings: [], errors: [parsed.problem] }

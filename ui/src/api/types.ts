@@ -211,7 +211,14 @@ export interface DeliveryStatus {
   updated_at: string
 }
 
+export interface Occurrences {
+  from: string
+  bucket_seconds: number
+  counts: number[]
+}
+
 export interface AlertDetail extends FeedAlert {
+  occurrences?: Occurrences
   /** First N and latest matching events (secrets and PII redacted server-side). */
   samples: EventSample[]
   /** The runbook selected for this alert, with per-step state, or null. */
@@ -265,6 +272,7 @@ export interface Session {
   teams: { id: string; name: string }[]
   /** Echo in the `X-CSRF-Token` header on every write. */
   csrf_token: string
+  capabilities?: { recipient_feed?: boolean; mock_transports?: boolean; runbook_import?: boolean }
 }
 
 // ---- SSE: GET /api/stream?team= -------------------------------------------

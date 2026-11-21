@@ -1,22 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { streamUrl } from '../api/client'
+import { errorText, loadAlertPage, streamUrl } from '../api/client'
 import { STREAM_EVENT_TYPES, type FeedAlert, type StreamEvent } from '../api/types'
-import { applyAlert, applyEvents, emptyFeed, type FeedState } from './feedStore'
+import { appendHistory, applyAlert, applyEvents, emptyFeed, type FeedState } from './feedStore'
 
 export type Connection = 'connecting' | 'live' | 'reconnecting'
 
 /** Subscribes to `GET /api/stream` for a scope and keeps the feed page.
  * Events are queued and applied once per animation frame (with a timer
  * fallback for background tabs), so a burst costs one React render. */
-export function useFeedStream(team: string | null) {
+export function useFeedStream(team: string | null, recipient: string | null = null) {
   const [state, setState] = useState<FeedState>(emptyFeed)
   const [connection, setConnection] = useState<Connection>('connecting')
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const historyRequest = useRef<AbortController | null>(null)
   const queue = useRef<StreamEvent[]>([])
   const scheduled = useRef<{ raf: number; timer: ReturnType<typeof setTimeout> } | null>(null)
 
   useEffect(() => {
     setState(emptyFeed)
     setConnection('connecting')
+    setHistoryError(null)
+    setHistoryLoading(false)
     queue.current = []
 
     const flush = () => {
@@ -40,9 +45,10 @@ export function useFeedStream(team: string | null) {
     let closed = false
 
     const connect = () => {
-      es = new EventSource(streamUrl(team), { withCredentials: true })
+      es = new EventSource(streamUrl(team, recipient), { withCredentials: true })
       for (const type of STREAM_EVENT_TYPES) {
         es.addEventListener(type, (msg) => {
+          if (closed) return
           let data: unknown
           try {
             data = JSON.parse((msg as MessageEvent<string>).data)
@@ -53,6 +59,10 @@ export function useFeedStream(team: string | null) {
           if (type === 'snapshot') {
             // Anything queued before the snapshot is superseded by it.
             queue.current = []
+            historyRequest.current?.abort()
+            historyRequest.current = null
+            setHistoryLoading(false)
+            setHistoryError(null)
             setConnection('live')
           }
           queue.current.push({ type, data } as StreamEvent)
@@ -75,6 +85,8 @@ export function useFeedStream(team: string | null) {
     return () => {
       closed = true
       es?.close()
+      historyRequest.current?.abort()
+      historyRequest.current = null
       if (retry) clearTimeout(retry)
       if (scheduled.current) {
         cancelAnimationFrame(scheduled.current.raf)
@@ -82,10 +94,32 @@ export function useFeedStream(team: string | null) {
         scheduled.current = null
       }
     }
-  }, [team])
+  }, [team, recipient])
+
+  const loadOlder = async () => {
+    const cursor = state.nextCursor
+    if (!cursor || historyRequest.current) return
+    const controller = new AbortController()
+    historyRequest.current = controller
+    setHistoryLoading(true)
+    setHistoryError(null)
+    try {
+      const page = await loadAlertPage(team, recipient, cursor, controller.signal)
+      if (!controller.signal.aborted) setState((current) =>
+        current.nextCursor === cursor && current.snapshotAt === state.snapshotAt ? appendHistory(current, page) : current)
+    } catch (e) {
+      if (!controller.signal.aborted) setHistoryError(errorText(e))
+    } finally {
+      if (historyRequest.current === controller) {
+        historyRequest.current = null
+        setHistoryLoading(false)
+      }
+    }
+  }
 
   /** Feed a mutation result through the same version rule as the stream. */
-  const applyLocal = useCallback((alert: FeedAlert) => setState((s) => applyAlert(s, alert)), [])
+  const applyLocal = useCallback((alert: FeedAlert) => setState((s) =>
+    s.byId.has(alert.id) || s.history.has(alert.id) ? applyAlert(s, alert) : s), [])
 
-  return { state, connection, applyLocal }
+  return { state, connection, applyLocal, loadOlder, historyError, historyLoading }
 }

@@ -3,7 +3,7 @@ import { Readable } from 'node:stream'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, describe, expect, it } from 'vitest'
-import { Runbook } from '../src/alert/Runbook'
+import { Runbook, safeUrl } from '../src/alert/Runbook'
 import { errorText, HttpError } from '../src/api/client'
 import type { FeedAlert, RunbookView } from '../src/api/types'
 import { diffLines } from '../src/lib/diff'
@@ -11,8 +11,11 @@ import { maskAddress, redactText, redactValue } from '../src/lib/redact'
 import { parseHash } from '../src/lib/router'
 import { fromYaml } from '../src/rules/draft'
 import { compileSafeRegex, testRule, validateRule } from './engine'
+import { prepareRunbook, validateActionUrl } from './import-runbook'
 import { createMock } from './mock'
 import { RULES } from './scenario'
+import { parseMapping } from './schemas'
+import { createSimulator } from './simulator'
 
 interface MockResponse {
   status: number
@@ -162,11 +165,17 @@ describe('mock API security & privacy controls', () => {
     expect(ing.status).toBe(202)
     const alertId = ing.json().matched_alerts[0] as string
 
-    // Check raw sample & deliveries redaction on alert detail
+    // Check raw sample, alert card presentation & deliveries redaction on alert detail
     const d1 = (await callMock(mock, 'GET', `/api/alerts/${alertId}`)).json()
     expect(d1.samples[0].raw.api_key).toBe('[REDACTED]')
     expect(d1.samples[0].raw.error.message).not.toContain('supersecrettoken12345')
     expect(d1.samples[0].raw.error.message).not.toContain('alice@corp.test')
+    expect(d1.body).not.toContain('supersecrettoken12345')
+    expect(d1.body).not.toContain('alice@corp.test')
+    for (const f of d1.fields) {
+      expect(f.value).not.toContain('supersecrettoken12345')
+      expect(f.value).not.toContain('alice@corp.test')
+    }
     for (const del of d1.deliveries) {
       expect(del.address).not.toContain('7700')
       expect(del.address).not.toContain('bob@example.test')
@@ -286,11 +295,13 @@ describe('mock API security & privacy controls', () => {
 })
 
 describe('hardening helpers: regex, YAML, router, diff, redaction, errorText', () => {
-  it('blocks ReDoS nested quantifiers, backreferences, and oversized patterns', () => {
+  it('blocks ReDoS nested quantifiers, quantified alternation, backreferences, and oversized patterns', () => {
     expect(compileSafeRegex('(a+)+$').ok).toBe(false)
+    expect(compileSafeRegex('(a|aa)+$').ok).toBe(false)
     expect(compileSafeRegex('(a)\\1').ok).toBe(false)
     expect(compileSafeRegex('a'.repeat(300)).ok).toBe(false)
     expect(compileSafeRegex('^prod-[a-z0-9]+$').ok).toBe(true)
+    expect(compileSafeRegex('^(prod|staging)$').ok).toBe(true)
 
     const errs = validateRule({ ...RULES[0]!, when: { path: 'raw.s', op: 'regex', value: '(a+)+$' } })
     expect(errs).toContainEqual(expect.objectContaining({ path: 'when.value' }))
@@ -334,5 +345,292 @@ describe('hardening helpers: regex, YAML, router, diff, redaction, errorText', (
     expect(errorText(new HttpError(500, { error: { code: 'internal', message: 'pg error at /srv/db.rs:42' } }))).toBe(
       'Something went wrong on the server. Please try again.',
     )
+  })
+})
+
+describe('PR #14 security & privacy controls: runbook import, schemas, simulator, feed params', () => {
+  it('enforces team authz before parsing, blocks SSRF & prototype keys, and redacts imported runbooks', async () => {
+    const mock = bootMock()
+    const csrf = (await callMock(mock, 'GET', '/api/session')).json().csrf_token as string
+    const h = { 'x-csrf-token': csrf }
+
+    // Non-member team gets 403 immediately even with malformed YAML
+    const unauthImport = await callMock(mock, 'POST', '/api/runbooks/import', {
+      headers: h,
+      body: { format: 'yaml', team: 'pricing', title: 'Evil', content: ':::not-yaml' },
+    })
+    expect(unauthImport.status).toBe(403)
+
+    // SSRF targets and credentialed/templated URLs are rejected for http_get
+    for (const badUrl of [
+      'http://169.254.169.254/latest/meta-data/',
+      'http://127.0.0.1:8080/admin',
+      'http://localhost/health',
+      'http://[::1]/health',
+      'http://[::ffff:127.0.0.1]/health',
+      'http://2130706433/health',
+      'http://0.0.0.0/health',
+      'http://metadata.google.internal/computeMetadata/v1/',
+      'http://{{raw.host}}/health',
+      'http://user:pass@counterparty-service/health',
+      'javascript:alert(1)',
+    ]) {
+      expect(validateActionUrl(badUrl), badUrl).toBe(false)
+      const res = await callMock(mock, 'POST', '/api/runbooks/import', {
+        headers: h,
+        body: {
+          format: 'yaml',
+          team: 'settlements',
+          title: 'SSRF check',
+          content: `steps:\n  - action: http_get\n    url: "${badUrl}"\n`,
+        },
+      })
+      expect(res.status, badUrl).toBe(422)
+    }
+
+    // Valid service URL and safeUrl credential check
+    expect(validateActionUrl('http://counterparty-service/health')).toBe(true)
+    expect(safeUrl('https://user:pass@wiki.example/runbook')).toBeNull()
+    expect(safeUrl('javascript:alert(1)')).toBeNull()
+    expect(safeUrl('https://wiki.example/runbook')).toBe('https://wiki.example/runbook')
+
+    // Prototype keys in YAML runbook are rejected
+    expect(() =>
+      prepareRunbook({
+        format: 'yaml',
+        team: 'settlements',
+        title: 'Proto check',
+        content: 'constructor: evil\nsteps:\n  - check: ok\n',
+      }),
+    ).toThrow(/Forbidden key/i)
+
+    // Imported runbook redacts deleted steps and renders raw secrets safely on alerts
+    const draft = {
+      format: 'markdown',
+      team: 'settlements',
+      title: 'Redaction check',
+      content: '1. Inspect {{ raw.api_key }} and {{ raw.error.message }}\n2. SECRET_DELETED_LINE password=supersecret',
+    }
+    const prev = (await callMock(mock, 'POST', '/api/runbooks/import', { headers: h, body: draft })).json()
+    expect(prev.steps).toHaveLength(2)
+    // User removes step 2 before saving
+    const saved = await callMock(mock, 'POST', '/api/runbooks', {
+      headers: h,
+      body: { ...draft, ...prev, steps: [prev.steps[0]] },
+    })
+    expect(saved.status).toBe(201)
+    const bookId = saved.json().id as string
+
+    await callMock(mock, 'POST', '/api/rules', {
+      headers: h,
+      body: { rule: { ...RULES[0]!, id: 'settlements-redacted-rb', runbook: bookId } },
+    })
+    const ing = await callMock(mock, 'POST', '/ingest/kafka:workflows', {
+      headers: h,
+      body: {
+        type: 'WORKFLOW_FAILED',
+        workflowId: 'WF-RB-SEC',
+        workflowName: 'order-settlement',
+        step: 'validate-counterparty',
+        severity: 'ERROR',
+        environment: 'prod',
+        timestamp: new Date().toISOString(),
+        error: { code: 'TIMEOUT', message: 'Bearer topsecret99999 from bob@corp.test' },
+        api_key: 'sk-live-do-not-leak',
+      },
+    })
+    const alertId = ing.json().matched_alerts.find((id: string) => id)
+    const list = (await callMock(mock, 'GET', '/api/alerts?rule=settlements-redacted-rb')).json().items
+    const detail = (await callMock(mock, 'GET', `/api/alerts/${list[0]?.id ?? alertId}`)).json()
+    expect(detail.runbook.text).not.toContain('SECRET_DELETED_LINE')
+    expect(detail.runbook.text).not.toContain('supersecret')
+    expect(detail.runbook.steps[0].text).not.toContain('sk-live-do-not-leak')
+    expect(detail.runbook.steps[0].text).not.toContain('topsecret99999')
+    expect(detail.runbook.steps[0].text).not.toContain('bob@corp.test')
+    expect(detail.runbook.steps[0].text).toContain('[REDACTED]')
+  })
+
+  it('prevents schema mapping secret-key aliasing, prototype keys, and invalid preview sources', async () => {
+    const mock = bootMock()
+    const csrf = (await callMock(mock, 'GET', '/api/session')).json().csrf_token as string
+    const h = { 'x-csrf-token': csrf }
+
+    // Forbidden keys & excessive path depth rejected
+    expect('error' in parseMapping({
+      schema: 'custom.proto',
+      detect: { path: 'a', op: 'exists' },
+      fields: { ok: { value: { constructor: 'bad' } } },
+    })).toBe(true)
+    expect('error' in parseMapping({
+      schema: 'custom.deep',
+      detect: { path: Array(20).fill('a').join('.'), op: 'exists' },
+      fields: {},
+    })).toBe(true)
+
+    // Invalid source rejected on preview
+    const badSource = await callMock(mock, 'POST', '/api/schemas/preview', {
+      headers: h,
+      body: {
+        spec: { schema: 'custom.ev', detect: { path: 'x', op: 'exists' }, fields: {} },
+        event: { x: 1 },
+        source: 'bad source!',
+      },
+    })
+    expect(badSource.status).toBe(422)
+
+    // Aliasing sensitive source path (api_key -> label) must stay redacted
+    const preview = await callMock(mock, 'POST', '/api/schemas/preview', {
+      headers: h,
+      body: {
+        spec: {
+          schema: 'custom.leak',
+          detect: { path: 'kind', op: 'eq', value: 'x' },
+          fields: {
+            label: { path: 'api_key' },
+            contact_tag: { path: '/nested/email' },
+            safe: { path: 'kind' },
+          },
+        },
+        event: { kind: 'x', api_key: 'sk-live-secret-alias', nested: { email: 'alice@corp.test' } },
+        source: 'http:playground',
+      },
+    })
+    expect(preview.status).toBe(200)
+    expect(preview.json().fields).toEqual({
+      label: '[REDACTED]',
+      contact_tag: '[REDACTED]',
+      safe: 'x',
+    })
+  })
+
+  it('blocks SMS approval brute-force bypass, enforces rate limits, and validates feed query params', async () => {
+    const mock = bootMock()
+    const csrf = (await callMock(mock, 'GET', '/api/session')).json().csrf_token as string
+    const h = { 'x-csrf-token': csrf }
+
+    // Invalid recipient / cursor rejected on /api/alerts & /api/stream
+    expect((await callMock(mock, 'GET', '/api/alerts?recipient=../admin')).status).toBe(400)
+    expect((await callMock(mock, 'GET', '/api/alerts?cursor=not-a-valid-cursor')).status).toBe(400)
+    expect((await callMock(mock, 'GET', '/api/stream?recipient=bad%20id')).status).toBe(400)
+
+    // Security headers present on JSON responses
+    const s = await callMock(mock, 'GET', '/api/session')
+    expect(s.headers['X-Content-Type-Options']).toBe('nosniff')
+    expect(s.headers['Cache-Control']).toBe('no-store')
+
+    // Create a settlements runbook with an immediate approval-required high-risk step
+    const rbDraft = {
+      format: 'yaml',
+      team: 'settlements',
+      title: 'Immediate escalate',
+      content: 'steps:\n  - action: escalate\n    team: ops\n',
+    }
+    const rbPrev = (await callMock(mock, 'POST', '/api/runbooks/import', { headers: h, body: rbDraft })).json()
+    const rbSaved = (await callMock(mock, 'POST', '/api/runbooks', { headers: h, body: { ...rbDraft, ...rbPrev } })).json()
+    await callMock(mock, 'POST', '/api/rules', {
+      headers: h,
+      body: {
+        rule: {
+          ...RULES[0]!,
+          id: 'settlements-fast-approval',
+          when: { path: 'raw.fast_approval', op: 'exists' },
+          dedup: { key: ['raw.fast_approval'], window: '10m' },
+          runbook: rbSaved.id,
+        },
+      },
+    })
+    const ingB = await callMock(mock, 'POST', '/ingest/http:playground', { headers: h, body: { fast_approval: 'B' } })
+    const idB = ingB.json().matched_alerts[0] as string
+    const reqB = await callMock(mock, 'POST', `/api/alerts/${idB}/steps/step-1/run`, { headers: h, body: {} })
+    expect(reqB.status).toBe(409)
+
+    const ingA = await callMock(mock, 'POST', '/ingest/http:playground', { headers: h, body: { fast_approval: 'A' } })
+    const idA = ingA.json().matched_alerts[0] as string
+    const reqA = await callMock(mock, 'POST', `/api/alerts/${idA}/steps/step-1/run`, { headers: h, body: {} })
+    expect(reqA.status).toBe(409)
+
+    const msgs = (await callMock(mock, 'GET', '/api/simulator/messages')).json().items as any[]
+    const smsA = msgs.find((m) => m.alert_id === idA && m.approval_challenge)
+    const smsB = msgs.find((m) => m.alert_id === idB && m.approval_challenge)
+    expect(smsA).toBeTruthy()
+    expect(smsB).toBeTruthy()
+
+    // Decide the newer approval (A) first via its bound receipt
+    const decA = await callMock(mock, 'POST', '/api/simulator/reply', {
+      headers: h,
+      body: { from: smsA.to, text: smsA.approval_challenge.replace(/^Y/, 'N'), receipt_id: smsA.receipt_id },
+    })
+    expect(decA.json().outcome).toBe('rejected')
+
+    // Now try 5 wrong guesses WITHOUT receipt_id: MUST count against pending B (not return already_decided from A!)
+    const wrongCode = smsB.approval_challenge === 'Y 9999' ? 'Y 9998' : 'Y 9999'
+    for (let i = 0; i < 5; i++) {
+      const bad = await callMock(mock, 'POST', '/api/simulator/reply', {
+        headers: h,
+        body: { from: smsB.to, text: wrongCode },
+      })
+      expect(bad.json().outcome).toBe('wrong_code')
+    }
+    // 6th attempt even with the REAL code for B MUST be locked out
+    const locked = await callMock(mock, 'POST', '/api/simulator/reply', {
+      headers: h,
+      body: { from: smsB.to, text: smsB.approval_challenge },
+    })
+    expect(locked.json().outcome).toBe('too_many_attempts')
+
+    // Verify sms_attempts is never leaked on alert detail
+    const detailB = (await callMock(mock, 'GET', `/api/alerts/${idB}`)).json()
+    expect(detailB.runbook.steps[0].approval_request).not.toHaveProperty('sms_attempts')
+    expect(detailB.runbook.steps[0].approval_request).not.toHaveProperty('sms_code_hash')
+
+    // Rate limiting kicks in after 30 replies
+    let hit429 = false
+    for (let i = 0; i < 35; i++) {
+      const r = await callMock(mock, 'POST', '/api/simulator/reply', {
+        headers: h,
+        body: { from: smsB.to, text: wrongCode },
+      })
+      if (r.status === 429) {
+        hit429 = true
+        break
+      }
+    }
+    expect(hit429).toBe(true)
+  })
+
+  it('scopes simulator approval challenges to team members and preserves workflow IDs during phone redaction', () => {
+    const sim = createSimulator(
+      (team) => team === 'settlements' || team === 'pricing',
+      (team) => team === 'settlements',
+    )
+    sim.send(
+      'pricing',
+      {
+        receipt_id: 'sms_pricing_1',
+        job_id: 'apr_pricing_1',
+        alert_id: 'alt_pricing_1',
+        channel: 'sms',
+        recipient: 'user:dave',
+        to: '+447700900126',
+        text: 'Approve Restart? Reply Y 4321 or N 4321.',
+        approval_challenge: 'Y 4321',
+        duplicates: 0,
+        received_at: new Date().toISOString(),
+      },
+      { id: 'apr_pricing_1', step: 'restart' },
+      '+447700900126',
+    )
+    const listed = sim.list().items
+    expect(listed).toHaveLength(1)
+    expect(listed[0]!.approval_challenge).toBeNull()
+    expect(listed[0]!.to).toMatch(/^\+\d{1,3} •••• ••0126$/)
+    expect(listed[0]!.to).not.toContain('7700')
+    expect(listed[0]!.text).not.toContain('4321')
+    expect(sim.approvalSms('+447700900126', () => true, () => true)).toEqual({ kind: 'none' })
+    sim.close()
+
+    // Workflow IDs with embedded dates must not be mangled by phone redaction, while real phones are masked
+    expect(redactText('Inspect WF-20261023-0040')).toBe('Inspect WF-20261023-0040')
+    expect(redactText('Call +44 7700 900125 about WF-20261023-0040')).toBe('Call +44 •••• ••0125 about WF-20261023-0040')
   })
 })

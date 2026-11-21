@@ -18,12 +18,13 @@ interface Props {
 
 const FORMAT_LABEL: Record<string, string> = { yaml: 'Steps', markdown: 'Checklist', link: 'Wiki page', text: 'Notes' }
 
-/** Only http(s) links are followed; anything else is shown as text. */
+/** Only http(s) links without embedded credentials are followed; anything else is shown as text. */
 export function safeUrl(u: string | null): string | null {
-  if (!u) return null
+  if (!u || u.length > 2048 || /[\x00-\x1f\x7f]/.test(u)) return null
   try {
     const url = new URL(u)
-    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null
+    if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return null
+    return url.href
   } catch {
     return null
   }
@@ -126,6 +127,13 @@ function Step({ step: s, n, now, closed, busy, onRun, onCheck, onDecide }: {
         {s.done_by && <p className="step-meta">Done by {actorName(s.done_by)} <span title={absTime(s.done_at)}>{relTime(s.done_at, now)}</span></p>}
       </li>
     )
+
+  if (s.kind === 'condition' || !s.action) return (
+    <li className="step">
+      <span className="step-text">{s.text}</span>
+      {s.hint && <p className="step-hint">{s.hint}</p>}
+    </li>
+  )
 
   const needsApproval = s.approval === 'required'
   const req = s.approval_request

@@ -17,10 +17,12 @@ npm run build      # typecheck + static build → ui/dist/
 Against a real backend, the dev server proxies `/api` and `/ingest`:
 
 ```sh
-BEACON_API_URL=http://localhost:8080 npm run dev
+BEACON_API_URL=http://localhost:8080 BEACON_GATEWAY_URL=http://localhost:8070 npm run dev
 ```
 
 Standalone mock (for backend folks, or to serve a build): `npm run mock` serves the mock API on `:8787` (`PORT=` to change) and, if `ui/dist/` exists, the built UI too. `npm run build && npm run mock` gives a full demo on one port.
+
+The gateway URL sends the device inbox and SSE requests to the development gateway. Set `VITE_MAILPIT_URL` if the Mailpit inbox uses a port other than 8025. The mock implements the new source, schema, runbook import, and SMS reply endpoints. Live deployments need the corresponding backend routes. The recipient filter and runbook import appear when the session advertises support.
 
 ### Serving the build
 
@@ -38,6 +40,9 @@ Standalone mock (for backend folks, or to serve a build): `npm run mock` serves 
 |---|---|
 | `#/` · `#/alerts/<id>` | Live feed and alert detail: ack/resolve, the runbook with filled-in steps (manual checklist, action buttons, approve/reject for risky steps), deliveries, history, and **Suggest a change** |
 | `#/rules` · `#/rules/<id>` | Rules with 24 h fire counts; editor with a visual condition builder (nested AND/OR/NOT, typed values) and a YAML tab over one draft, plus a live test panel (per-condition ✓/✗, rendered card, template warnings) that writes nothing. New rules start from templates (workflow failures, Prometheus alerts, business events) |
+| `#/sources` | Sources and activity, discovery samples, rule drafts from events, and schema mapping preview and save |
+| `#/runbooks` | Import structured YAML, Markdown, a link, or plain text. Edit the preview checklist and save it for selection in the rule editor |
+| `#/simulator` | Live SMS and phone receipts, a Mailpit link, and approval replies where the gateway supports them |
 | `#/preferences` | Per person: ordered "first match wins" lines (severity, service, team → channels, optional hours + time zone, otherwise) with a **Try it** check. Per team: members, lead, on-call rotations, default channels |
 | `#/proposals` | Suggested rule changes with a YAML diff; accept publishes against the base revision (stale if the rule moved on) |
 
@@ -47,7 +52,7 @@ An in-memory stand-in for the backend. It generates the Appendix A events (workf
 
 Also in memory: people and teams (deliveries are planned from routes + preferences when an alert opens), the Appendix B runbooks with step state, approvals and fake actions (`mock/runbooks.ts`), and proposals (one auto-suggested). The real engine, delivery and config store are authoritative; writes to people and teams exist only in the mock until config moves to Postgres (spec §4.6, M2).
 
-Demo of "retry fails twice → escalate": open a settlement alert, run **Retry workflow** twice (the mock workflow engine fails by default), then **Ask for approval** on Escalate and approve it. `POST /api/__mock/workflow-engine?ok=1` (or `MOCK_RETRY_OK=1`) makes retries succeed, which resolves the alert (`resolves: true` step).
+To demo approval, open a settlement alert, run **Retry workflow** twice, and request approval on Escalate. Open **Devices**, select Carol's approval SMS, and reply with `Y` followed by its code. The simulator records Carol as the approver. The alert detail shows the decision and execution. To test recovery via a successful retry instead, set `MOCK_RETRY_OK=1` before starting the mock.
 
 | Env | Default | Effect |
 |---|---|---|

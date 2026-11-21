@@ -1,10 +1,12 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { countPendingProposals, getSession, transition, type TransitionOp } from './api/client'
-import type { FeedAlert, Session } from './api/types'
+import { countPendingProposals, errorText, getAlert, getSession, listDirectory, transition, type TransitionOp } from './api/client'
+import type { DiscoveredSchema } from './api/screens'
+import type { FeedAlert, PersonDirectoryEntry, Session } from './api/types'
 import { AlertDetail } from './alert/AlertDetail'
 import { FeedList } from './feed/FeedList'
 import { FilterChips, SearchBox } from './feed/FilterBar'
 import { defaultFilters, facetCounts, loadFilters, matches, saveFilters, type Filters } from './feed/filters'
+import { compareFeed } from './feed/feedStore'
 import { useFeedStream, type Connection } from './feed/useFeedStream'
 import { BeaconLogo, KeyboardIcon, MoonIcon, SunIcon } from './lib/icons'
 import { useRoute, type Route } from './lib/router'
@@ -15,6 +17,9 @@ const RulesList = lazy(() => import('./rules/RulesList').then((m) => ({ default:
 const RuleEditor = lazy(() => import('./rules/RuleEditor').then((m) => ({ default: m.RuleEditor })))
 const PreferencesScreen = lazy(() => import('./prefs/PreferencesScreen').then((m) => ({ default: m.PreferencesScreen })))
 const ProposalsScreen = lazy(() => import('./proposals/ProposalsScreen').then((m) => ({ default: m.ProposalsScreen })))
+const SourcesScreen = lazy(() => import('./sources/SourcesScreen').then((m) => ({ default: m.SourcesScreen })))
+const RunbooksScreen = lazy(() => import('./runbooks/RunbooksScreen').then((m) => ({ default: m.RunbooksScreen })))
+const SimulatorScreen = lazy(() => import('./simulator/SimulatorScreen').then((m) => ({ default: m.SimulatorScreen })))
 const screenFallback = <div className="screen"><div className="empty"><p>Loading…</p></div></div>
 
 // ---- toasts -----------------------------------------------------------------
@@ -106,8 +111,17 @@ export function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [team, setTeam] = useState<string | null>(loadTeam)
+  const [recipient, setRecipient] = useState<string | null>(null)
+  const [directory, setDirectory] = useState<PersonDirectoryEntry[]>([])
+  const [linkedAlert, setLinkedAlert] = useState<FeedAlert | null>(null)
+  const [linkedAlertError, setLinkedAlertError] = useState<string | null>(null)
   const [filters, setFilters] = useState<Filters>(loadFilters)
   const [route, go, setRouteDirty] = useRoute()
+  const [ruleSample, setRuleSample] = useState<{ sample: DiscoveredSchema; ruleId: string | null } | null>(null)
+  const createRuleFromSample = (sample: DiscoveredSchema) => {
+    setRuleSample({ sample, ruleId: null })
+    go('#/rules/new?from=event')
+  }
   const selectedId = route.view === 'alerts' ? route.id : null
   const select = useCallback((id: string | null) => go({ view: 'alerts', id }, { replace: true }), [go])
   const navigate = useCallback((hash: string) => go(hash), [go])
@@ -127,10 +141,21 @@ export function App() {
     getSession().then(setSession, (e: unknown) => setSessionError(e instanceof Error ? e.message : String(e)))
   }, [])
 
-  const { state, connection, applyLocal } = useFeedStream(team)
+  const recipientFeed = session?.capabilities?.recipient_feed === true
+  useEffect(() => {
+    if (!recipientFeed) return
+    let active = true
+    listDirectory().then((items) => { if (active) setDirectory(items) }, () => {})
+    return () => { active = false }
+  }, [recipientFeed])
+
+  const { state, connection, applyLocal, loadOlder, historyError, historyLoading } =
+    useFeedStream(team, recipientFeed ? recipient : null)
 
   const changeTeam = (t: string | null) => {
     setTeam(t)
+    setRecipient(null)
+    if (route.view === 'alerts') select(null)
     try {
       if (t) sessionStorage.setItem(TEAM_KEY, t)
       else sessionStorage.removeItem(TEAM_KEY)
@@ -143,10 +168,29 @@ export function App() {
     saveFilters(f)
   }
 
-  const all = useMemo(() => state.order.map((id) => state.byId.get(id)!).filter(Boolean), [state.order, state.byId])
+  const all = useMemo(() => {
+    const live = state.order.flatMap((id) => {
+      const alert = state.byId.get(id)
+      return alert ? [alert] : []
+    })
+    return state.history.size ? [...live, ...state.history.values()].sort(compareFeed) : live
+  }, [state.order, state.byId, state.history])
   const visible = useMemo(() => all.filter((a) => matches(a, filters)), [all, filters])
   const counts = useMemo(() => facetCounts(all, filters), [all, filters])
-  const selected = selectedId ? state.byId.get(selectedId) ?? null : null
+  const cachedAlert = selectedId ? state.byId.get(selectedId) ?? state.history.get(selectedId) : undefined
+  const selected = cachedAlert ?? (linkedAlert?.id === selectedId ? linkedAlert : null)
+
+  useEffect(() => {
+    setLinkedAlertError(null)
+    setLinkedAlert(null)
+    if (!selectedId || cachedAlert) return
+    const controller = new AbortController()
+    getAlert(selectedId, controller.signal).then(
+      (alert) => { if (!controller.signal.aborted) setLinkedAlert(alert) },
+      (e: unknown) => { if (!controller.signal.aborted) setLinkedAlertError(errorText(e)) },
+    )
+    return () => controller.abort()
+  }, [selectedId, Boolean(cachedAlert)])
 
   const act = useCallback(
     async (alert: FeedAlert, op: TransitionOp) => {
@@ -164,9 +208,14 @@ export function App() {
       setPending(null)
       if (res.ok) {
         applyLocal(res.alert)
+        setLinkedAlert((current) => current?.id === res.alert.id ? res.alert : current)
         push('ok', `${op === 'ack' ? 'Acknowledged' : 'Resolved'}: ${alert.title}`)
       } else {
-        if (res.current) applyLocal(res.current)
+        if (res.current) {
+          const next = res.current
+          applyLocal(next)
+          setLinkedAlert((current) => current?.id === next.id ? next : current)
+        }
         push('error', res.message)
       }
     },
@@ -274,19 +323,32 @@ export function App() {
       <Suspense key={route.view} fallback={screenFallback}>
       {route.view === 'rules' && (
         route.id ? (
-          <RuleEditor key={JSON.stringify([route.id, route.from])} id={route.id} from={route.from} team={team} onNavigate={navigate} onDirtyChange={setRouteDirty} onToast={push} />
+          <RuleEditor key={JSON.stringify([route.id, route.from])} id={route.id} from={route.from} team={team} initialEvent={ruleSample && (route.from === 'event' || route.id === ruleSample.ruleId) ? ruleSample.sample : null} onEventRuleCreated={(ruleId) => setRuleSample((current) => current ? { ...current, ruleId } : null)} mockTransports={session?.capabilities?.mock_transports === true} onNavigate={navigate} onDirtyChange={setRouteDirty} onToast={push} />
         ) : (
           <RulesList team={team} teamName={teamName} onNavigate={navigate} />
         )
       )}
       {route.view === 'preferences' && <PreferencesScreen kind={route.kind} id={route.id} me={session?.user.id ?? null} onNavigate={navigate} onToast={push} />}
       {route.view === 'proposals' && <ProposalsScreen id={route.id} team={team} onNavigate={navigate} onToast={push} onChanged={refreshProposals} />}
+      {route.view === 'sources' && <SourcesScreen onCreateRule={createRuleFromSample} />}
+      {route.view === 'runbooks' && <RunbooksScreen team={team} teams={session?.teams ?? []} canImport={session?.capabilities?.runbook_import === true} />}
+      {route.view === 'simulator' && <SimulatorScreen mockReplies={session?.capabilities?.mock_transports === true} />}
       </Suspense>
 
       {route.view === 'alerts' && (
       <main className="layout">
         <section className="feed" aria-label={`Live feed: ${teamName}`}>
           <SearchBox ref={searchRef} filters={filters} onChange={changeFilters} onReset={() => changeFilters(defaultFilters)} />
+          {recipientFeed && (
+            <label className="inline feed-recipient">
+              <span className="small muted">Recipient</span>
+              <select className="select" value={recipient ?? ''} onChange={(e) => { setRecipient(e.target.value || null); select(null) }}>
+                <option value="">All recipients</option>
+                {directory.map((person) =>
+                  <option key={person.id} value={person.id}>{person.name}</option>)}
+              </select>
+            </label>
+          )}
           <FeedList
             alerts={visible}
             inserted={state.inserted}
@@ -310,6 +372,14 @@ export function App() {
               </div>
             }
           />
+          {(state.nextCursor || historyError) && (
+            <div className="inline feed-history">
+              {state.nextCursor && <button className="btn btn-sm" onClick={() => void loadOlder()} disabled={historyLoading}>
+                {historyLoading ? 'Loading older alerts…' : 'Load older alerts'}
+              </button>}
+              {historyError && <span className="small problems-inline" role="alert">{historyError}</span>}
+            </div>
+          )}
         </section>
 
         {selectedId && (
@@ -327,7 +397,7 @@ export function App() {
               />
             ) : (
               <div className="empty">
-                <p>{state.stats.snapshots === 0 ? 'Loading…' : 'This alert is not in the current feed. It may have expired or belong to another team.'}</p>
+                <p>{linkedAlertError ?? 'Loading alert…'}</p>
                 <button className="btn" onClick={() => select(null)}>Close</button>
               </div>
             )}
@@ -365,8 +435,11 @@ export function App() {
 const NAV: { view: Route['view']; label: string; hash: string }[] = [
   { view: 'alerts', label: 'Alerts', hash: '#/' },
   { view: 'rules', label: 'Rules', hash: '#/rules' },
+  { view: 'sources', label: 'Sources', hash: '#/sources' },
+  { view: 'runbooks', label: 'Runbooks', hash: '#/runbooks' },
   { view: 'preferences', label: 'Preferences', hash: '#/preferences' },
   { view: 'proposals', label: 'Proposals', hash: '#/proposals' },
+  { view: 'simulator', label: 'Devices', hash: '#/simulator' },
 ]
 
 function Nav({ route, pendingProposals, onNavigate }: { route: Route; pendingProposals: number; onNavigate: (hash: string) => void }) {

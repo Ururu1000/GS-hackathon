@@ -4,6 +4,7 @@
 // toy engine (engine.ts) evaluates the rules, so rules edited in the UI change
 // what the feed does.
 
+import type { ImportedStep } from '../src/api/screens.ts'
 import type { DeliveryStatus, FeedAlert, PersonView, RuleSpec, TeamView } from '../src/api/types.ts'
 import { maskAddress } from '../src/lib/redact.ts'
 
@@ -181,18 +182,7 @@ export const PEOPLE: PersonView[] = [
 
 // ---- Runbooks (Appendix B), in the internal model (spec §6.1) -------------
 
-export interface RunbookStepDef {
-  id: string
-  kind: 'manual' | 'condition' | 'action'
-  text: string
-  hint?: string
-  action?: { name: string; label: string; params: Record<string, string>; risk: 'low' | 'high' }
-  approval?: 'none' | 'required'
-  /** Available only after N failed runs of another step ("retry fails twice"). */
-  after_failures?: { step: string; count: number }
-  /** A success closes the alert (spec §6.4). */
-  resolves?: boolean
-}
+export type RunbookStepDef = ImportedStep
 
 export interface RunbookDef {
   id: string
@@ -377,7 +367,7 @@ const hash = (s: string) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >
 export function deliveriesFor(a: FeedAlert, plan: DeliveryPlan, people: Map<string, PersonView>, now = Date.now()): DeliveryStatus[] {
   const opened = Date.parse(a.first_seen)
   const stopped = a.acked_at ?? a.resolved_at
-  return plan.map(([recipient, channel], i) => {
+  return plan.filter(([, channel]) => channel !== 'ui').map(([recipient, channel], i) => {
     const h = hash(a.id + i)
     const p = people.get(recipient.replace(/^user:/, ''))
     const rawAddress = (channel === 'email' ? p?.contact.email : p?.contact.phone) ?? '—'

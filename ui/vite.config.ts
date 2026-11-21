@@ -5,6 +5,7 @@ import { createMock } from './mock/mock.ts'
 // `npm run dev` serves the in-process mock API (ui/mock) unless BEACON_API_URL
 // points at a real backend, e.g. BEACON_API_URL=http://localhost:8080.
 const backend = process.env.BEACON_API_URL
+const gateway = process.env.BEACON_GATEWAY_URL
 
 function mockApi(): Plugin {
   return {
@@ -29,6 +30,10 @@ export default defineConfig({
     port: 5173,
     proxy: backend
       ? {
+          ...(gateway ? {
+            '/api/simulator/messages': { target: gateway, changeOrigin: true },
+            '/api/simulator/stream': { target: gateway, changeOrigin: true },
+          } : {}),
           '/api': { target: backend, changeOrigin: true },
           '/ingest': { target: backend, changeOrigin: true },
         }

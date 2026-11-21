@@ -4,8 +4,9 @@
 // next to the alert they bump.
 
 import type { ApprovalRequest, Execution, RunbookStep, RunbookView, StepState } from '../src/api/types.ts'
-import { isSensitiveKey, redactText } from '../src/lib/redact.ts'
+import { isSensitiveKey, redactText, redactValue } from '../src/lib/redact.ts'
 import { render, templateErrors, type Ctx } from './engine.ts'
+import { validateActionUrl } from './import-runbook.ts'
 import type { RunbookDef, RunbookStepDef } from './scenario.ts'
 
 export interface StepRuntime {
@@ -18,6 +19,8 @@ export interface StepRuntime {
 export interface StoredApproval extends ApprovalRequest {
   /** SHA-256 hash of the out-of-band SMS challenge (never serialized to API responses). */
   sms_code_hash?: string | null
+  /** Failed SMS verification attempts (never serialized to API responses). */
+  sms_attempts?: number
 }
 
 export type RunbookRuntime = Map<string, StepRuntime>
@@ -42,7 +45,7 @@ function sanitizeParam(key: string, val: string): string {
 }
 
 function publicApproval(a: StoredApproval, viewer: string): ApprovalRequest {
-  const { sms_code_hash: _hash, ...rest } = a
+  const { sms_code_hash: _hash, sms_attempts: _attempts, ...rest } = a
   return {
     ...rest,
     can_decide: rest.eligible.includes(viewer) && rest.requested_by !== viewer,
@@ -68,18 +71,25 @@ export function stepState(def: RunbookStepDef, rt: RunbookRuntime, now: number):
   return { state: 'idle', disabled_reason }
 }
 
+function redactContext(ctx: Ctx): Ctx {
+  return { ...ctx, raw: redactValue(ctx.raw), fields: redactValue(ctx.fields) as Record<string, unknown> }
+}
+
 export function renderActionParams(d: RunbookStepDef, ctx: Ctx) {
+  const safeCtx = redactContext(ctx)
   const invalidParams: string[] = []
   const params = Object.fromEntries(Object.entries(d.action?.params ?? {}).map(([key, template]) => {
     const warnings = templateErrors(template)
-    const value = render(template, ctx, warnings, { requireScalar: true })
-    if (warnings.length || !value.trim()) invalidParams.push(key)
+    const value = render(template, safeCtx, warnings, { requireScalar: true })
+    if (warnings.length || !value.trim() || (d.action?.name === 'http_get' && key === 'url' && !validateActionUrl(value)))
+      invalidParams.push(key)
     return [key, value]
   }))
   return { params, invalidParams }
 }
 
 export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewer: string, now = Date.now()): RunbookView {
+  const safeCtx = redactContext(ctx)
   const steps: RunbookStep[] = def.steps.map((d) => {
     const s = rt.get(d.id)
     const { state, disabled_reason } = stepState(d, rt, now)
@@ -88,8 +98,8 @@ export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewe
     return {
       id: d.id,
       kind: d.kind,
-      text: render(d.text, ctx),
-      hint: d.hint ?? null,
+      text: redactText(render(d.text, safeCtx), 2000),
+      hint: d.hint ? redactText(d.hint, 500) : null,
       action: d.action ? { ...d.action, params: Object.fromEntries(Object.entries(params).map(([key, value]) => [key, sanitizeParam(key, value)])) } : null,
       approval: d.approval ?? 'none',
       state,
@@ -100,5 +110,5 @@ export function viewRunbook(def: RunbookDef, ctx: Ctx, rt: RunbookRuntime, viewe
       approval_request: last ? publicApproval(last, viewer) : null,
     }
   })
-  return { id: def.id, revision: 1, title: def.title, format: def.format, url: def.url ?? null, text: def.text ?? null, steps }
+  return { id: def.id, revision: 1, title: redactText(def.title, 120), format: def.format, url: def.url ?? null, text: def.text ? redactText(def.text) : null, steps }
 }
