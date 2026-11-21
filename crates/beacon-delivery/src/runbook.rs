@@ -29,6 +29,14 @@
 //! team-scoped runbooks (`team == alert team`) whose `matches` all equal the context, highest
 //! `priority` then id; else none.
 //!
+//! **Runtime import (the UI's Runbooks tab, `POST /api/runbooks/import` +
+//! `POST /api/runbooks`):** pasted content goes through the SAME adapters
+//! (`parse_imported`), the id is derived from the title (`import_id`), and the parsed
+//! steps are projected for editing (`preview_steps`) and read back validated
+//! (`imported_steps`). A publish stores the import as a `directory_overrides` row
+//! (`overrides::apply_runbooks` rebuilds it through `runbook_from_override`), so the
+//! router, scheduler, actions worker and API see it with no restart.
+//!
 //! **Rendering:** minijinja with strict undefined, autoescape off (the UI escapes), fuel limit;
 //! context = `{raw, fields, context, alert: {id, title, severity, team, rule_id}}` where `raw`/
 //! `fields` come from the optional `payload["event"]` (board #174) and `context` from
@@ -65,6 +73,17 @@ impl Format {
             Format::Markdown => "markdown",
             Format::Link => "link",
             Format::Text => "text",
+        }
+    }
+
+    /// The contract's enum string (`RunbookImport.format`), `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "yaml" => Some(Self::Yaml),
+            "markdown" => Some(Self::Markdown),
+            "link" => Some(Self::Link),
+            "text" => Some(Self::Text),
+            _ => None,
         }
     }
 }
@@ -154,6 +173,16 @@ enum LoadIssue {
     Syntax(String),
     /// The file parses but violates the runbook model.
     Semantic(String),
+}
+
+impl LoadIssue {
+    /// The message a runtime import answers 422 with (and an override drop logs).
+    fn message(&self) -> String {
+        match self {
+            LoadIssue::Syntax(m) => format!("cannot parse the runbook content: {m}"),
+            LoadIssue::Semantic(m) => m.clone(),
+        }
+    }
 }
 
 /// Which adapter parses a file, from its name.
@@ -751,6 +780,503 @@ fn matches_field(obj: &Map<String, Value>) -> Result<Map<String, Value>, LoadIss
             "matches must be a mapping, got {other}"
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Runtime import (POST /api/runbooks/import, POST /api/runbooks)
+// ---------------------------------------------------------------------------------------------
+
+/// The limits the contract (openapi `RunbookImport` / `RunbookPreview`) and the mock
+/// put on a runtime import.
+const IMPORT_MAX_TITLE: usize = 120;
+const IMPORT_MAX_CONTENT: usize = 65536;
+const IMPORT_MAX_STEPS: usize = 50;
+const IMPORT_MAX_STEP_TEXT: usize = 2000;
+const IMPORT_MAX_URL: usize = 2048;
+
+/// The preview id of a runtime import (the mock's `idFor`): the title lowercased, every
+/// run of non-`[a-z0-9]` collapsed to one `-`, no leading/trailing `-`, at most 64
+/// chars — empty for a title without a single ascii letter or digit.
+pub fn import_id(title: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in title.to_lowercase().chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            if dash && !out.is_empty() {
+                out.push('-');
+            }
+            dash = false;
+            out.push(ch);
+        } else {
+            dash = true;
+        }
+    }
+    out.chars().take(64).collect()
+}
+
+/// A validated runtime import body (contract `RunbookImport`): what the preview shows
+/// and what a publish stores.
+#[derive(Debug, Clone)]
+pub struct ImportInput {
+    /// [`import_id`] of the title: the preview id, the published row's id, the rebuilt
+    /// runbook's id.
+    pub id: String,
+    pub format: Format,
+    pub team: String,
+    pub title: String,
+    /// The submitted content, verbatim (what a publish stores).
+    pub content: String,
+    /// The content parsed with its format's file adapter, `id`/`title`/`team` already
+    /// replaced by the request's; the preview's steps are `preview_steps(&runbook)`.
+    pub runbook: Runbook,
+}
+
+/// Validate a `RunbookImport` JSON object and parse its content with the same adapter
+/// the format's `config/runbooks` files take. `Err` is the route's 422 `invalid`
+/// message. The team's membership is NOT checked here (the route does that first, the
+/// mock's rule).
+pub fn validate_import(body: &Value) -> Result<ImportInput, String> {
+    let format = match body.get("format").and_then(Value::as_str) {
+        None => {
+            return Err("select a runbook format (yaml, markdown, link or text)".into());
+        }
+        Some(f) => Format::parse(f).ok_or_else(|| {
+            format!("unknown runbook format {f:?} (yaml, markdown, link or text)")
+        })?,
+    };
+    let title = body
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if title.is_empty() || title.chars().count() > IMPORT_MAX_TITLE {
+        return Err(format!(
+            "enter a title of up to {IMPORT_MAX_TITLE} characters"
+        ));
+    }
+    let id = import_id(title);
+    if id.is_empty() {
+        return Err("the title needs a letter or a digit to derive the runbook id from".into());
+    }
+    let team = body
+        .get("team")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if team.is_empty() {
+        return Err("select a team for the runbook".into());
+    }
+    let Some(content) = body.get("content").and_then(Value::as_str) else {
+        return Err(format!(
+            "enter runbook content of up to {IMPORT_MAX_CONTENT} characters"
+        ));
+    };
+    if content.trim().is_empty() {
+        return Err("enter runbook content".into());
+    }
+    if content.trim().chars().count() > IMPORT_MAX_CONTENT {
+        return Err(format!(
+            "runbook content is limited to {IMPORT_MAX_CONTENT} characters"
+        ));
+    }
+    let mut runbook = parse_imported(format, content.as_bytes(), &id)?;
+    runbook.title = title.to_string();
+    runbook.team = Some(team.to_string());
+    Ok(ImportInput {
+        id,
+        format,
+        team: team.to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        runbook,
+    })
+}
+
+/// Parse imported content through the SAME adapter a `config/runbooks` file of `format`
+/// takes (validation included: unknown actions, unparsable YAML, a non-http link url).
+/// `id` is the derived preview id; it OVERRIDES any `runbook:` key the content names,
+/// so a published row always rebuilds under its row id. A `link` import's content is
+/// the URL itself (what the UI's URL field sends); the `*.link.yaml` mapping form is
+/// accepted too.
+pub fn parse_imported(format: Format, content: &[u8], id: &str) -> Result<Runbook, String> {
+    let err = |e: LoadIssue| e.message();
+    let mut rb = match format {
+        Format::Yaml => {
+            parse_yaml_runbook(content, id, crate::actions::ActionRegistry::known()).map_err(err)?
+        }
+        Format::Markdown => parse_markdown_runbook(content, id).map_err(err)?,
+        Format::Text => parse_text_runbook(content, id).map_err(err)?,
+        Format::Link => parse_link_import(content, id).map_err(err)?,
+    };
+    rb.id = id.to_string();
+    Ok(rb)
+}
+
+/// A `link` import's content: the bare http(s) URL (the UI's URL field, the mock's
+/// `webLink`) or the `*.link.yaml` mapping form. Credentials, control characters and
+/// huge urls are rejected; local hosts are fine for links (the mock blocks them for
+/// action params only).
+fn parse_link_import(content: &[u8], id: &str) -> Result<Runbook, LoadIssue> {
+    let text = String::from_utf8_lossy(content);
+    let url = text.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return parse_link_runbook(content, id);
+    }
+    if url.chars().count() > IMPORT_MAX_URL {
+        return Err(LoadIssue::Semantic(format!(
+            "link runbook url is limited to {IMPORT_MAX_URL} characters"
+        )));
+    }
+    if url
+        .chars()
+        .any(|c| c.is_ascii_control() || c.is_whitespace())
+    {
+        return Err(LoadIssue::Semantic(
+            "link runbook url must not contain control or space characters".into(),
+        ));
+    }
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(LoadIssue::Semantic(
+            "link runbook url must be an http(s) link without credentials".into(),
+        ));
+    }
+    Ok(Runbook {
+        id: id.to_string(),
+        revision: stable_revision(content),
+        title: id.to_string(),
+        format: Format::Link,
+        team: None,
+        priority: 0,
+        matches: Map::new(),
+        url: Some(url.to_string()),
+        text: None,
+        steps: Vec::new(),
+    })
+}
+
+/// The contract's `RunbookPreview.steps` (`ImportedStep`) projection of a parsed import:
+/// `{id, kind, text, hint?, action? {name, label, params, risk}, approval?,
+/// after_failures? {step, count}, resolves?}`. `approval` is the effective value the
+/// frozen copy computes (`required` also for high-risk actions); `after_failures`
+/// references the LAST earlier step that runs the condition's action and is dropped
+/// when no earlier step does — the edit round-trip keeps the condition only through it.
+pub fn preview_steps(rb: &Runbook) -> Vec<Value> {
+    rb.steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut step = json!({ "id": s.id, "kind": s.kind.as_str(), "text": s.text });
+            if let Some(hint) = &s.hint {
+                step["hint"] = json!(hint);
+            }
+            if let Some(name) = s.action.as_deref() {
+                let required =
+                    s.approval_required || crate::actions::ActionRegistry::risk_of(name) == "high";
+                step["action"] = json!({
+                    "name": name,
+                    "label": action_label(name),
+                    "params": Value::Object(s.params.clone()),
+                    "risk": crate::actions::ActionRegistry::risk_of(name),
+                });
+                step["approval"] = if required {
+                    json!("required")
+                } else {
+                    json!("none")
+                };
+            }
+            if let Some(Condition::AfterFailures { action, count }) = &s.condition
+                && let Some(referenced) = rb.steps[..i]
+                    .iter()
+                    .rev()
+                    .find(|e| e.action.as_deref() == Some(action.as_str()))
+            {
+                step["after_failures"] = json!({ "step": referenced.id, "count": count });
+            }
+            if s.resolves {
+                step["resolves"] = json!(true);
+            }
+            step
+        })
+        .collect()
+}
+
+/// One submitted `RunbookPreview.steps` entry, parsed before the cross-entry checks.
+struct ImportStep {
+    id: String,
+    kind: StepKind,
+    text: String,
+    hint: Option<String>,
+    action: Option<String>,
+    params: Map<String, Value>,
+    approval_required: bool,
+    /// The raw `after_failures` `{step, count}`, resolved once every entry is parsed.
+    after: Option<(String, u32)>,
+    resolves: bool,
+}
+
+/// Validate the submitted (possibly edited) checklist of a publish and convert it to the
+/// runbook model — the same rules a `config/runbooks` file's steps go through plus the
+/// import contract's limits: `{id, kind, text}` objects, the mock's id pattern (letters,
+/// digits, dashes; at most 80 chars), unique ids, 1..=50 steps (a `link` import carries
+/// none), text of 1..=2000 chars, a registered action, well-typed `approval`/`resolves`,
+/// and `after_failures` referencing a kept action step. `Err` is the 422 message.
+pub fn imported_steps(raw: Option<&Value>, format: Format) -> Result<Vec<StepDef>, String> {
+    let Some(arr) = raw.and_then(Value::as_array) else {
+        return Err("the preview steps are required: submit the (edited) checklist".into());
+    };
+    if arr.len() > IMPORT_MAX_STEPS {
+        return Err(format!("a runbook is limited to {IMPORT_MAX_STEPS} steps"));
+    }
+    if format == Format::Link && !arr.is_empty() {
+        return Err("a link runbook cannot include checklist steps".into());
+    }
+    if format != Format::Link && arr.is_empty() {
+        return Err("keep at least one step (a link runbook carries none)".into());
+    }
+    let known = crate::actions::ActionRegistry::known();
+
+    let mut parsed: Vec<ImportStep> = Vec::with_capacity(arr.len());
+    let mut ids: HashSet<String> = HashSet::new();
+    for (i, entry) in arr.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("step {} must be an object", i + 1))?;
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if id.is_empty()
+            || id.len() > 80
+            || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(format!(
+                "step {} needs an id of up to 80 letters, digits or dashes",
+                i + 1
+            ));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(format!("duplicate step id {id:?}"));
+        }
+        let text = obj
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if text.is_empty() || text.chars().count() > IMPORT_MAX_STEP_TEXT {
+            return Err(format!(
+                "step {id:?} needs text of up to {IMPORT_MAX_STEP_TEXT} characters"
+            ));
+        }
+        let hint = match obj.get("hint") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(h)) => Some(h.clone()),
+            Some(_) => return Err(format!("hint of step {id:?} must be a string")),
+        };
+        let (action, params): (Option<String>, Map<String, Value>) = match obj.get("action") {
+            None | Some(Value::Null) => (None, Map::new()),
+            Some(Value::Object(a)) => {
+                let name = a.get("name").and_then(Value::as_str).unwrap_or_default();
+                if !known.contains(&name) {
+                    return Err(format!("step {id:?} uses an unregistered action {name:?}"));
+                }
+                // Params are the action object's `params` map, scalars coerced to
+                // template strings exactly like `parse_steps` does for a file.
+                let mut params = Map::new();
+                match a.get("params") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Object(m)) => {
+                        for (k, v) in m {
+                            let s = match v {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                Value::Null => String::new(),
+                                other => {
+                                    return Err(format!(
+                                        "param {k:?} of step {id:?} must be a scalar, got {other}"
+                                    ));
+                                }
+                            };
+                            params.insert(k.clone(), Value::String(s));
+                        }
+                    }
+                    Some(_) => return Err(format!("params of step {id:?} must be an object")),
+                }
+                (Some(name.to_string()), params)
+            }
+            Some(_) => return Err(format!("action of step {id:?} must be an object")),
+        };
+        let approval_required = match obj.get("approval") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) if s == "required" => true,
+            Some(Value::String(s)) if s == "none" => false,
+            Some(other) => {
+                return Err(format!(
+                    "approval of step {id:?} must be \"required\" or \"none\", got {other}"
+                ));
+            }
+        };
+        let resolves = match obj.get("resolves") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => {
+                return Err(format!(
+                    "resolves of step {id:?} must be a boolean, got {other}"
+                ));
+            }
+        };
+        let after = match obj.get("after_failures") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(f)) => {
+                let step = f
+                    .get("step")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("after_failures of step {id:?} needs a step id"))?
+                    .to_string();
+                let count = f
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u32::try_from(c).ok())
+                    .filter(|c| *c >= 1)
+                    .ok_or_else(|| {
+                        format!("after_failures of step {id:?} needs a count of at least 1")
+                    })?;
+                Some((step, count))
+            }
+            Some(_) => return Err(format!("after_failures of step {id:?} must be an object")),
+        };
+        // The declared kind (enum-checked) or the one a file would derive; an action
+        // object only ever belongs to an action step (files cannot say otherwise).
+        let kind = match obj.get("kind").and_then(Value::as_str) {
+            Some("manual") => StepKind::Manual,
+            Some("condition") => StepKind::Condition,
+            Some("action") => StepKind::Action,
+            Some(other) => {
+                return Err(format!(
+                    "kind of step {id:?} must be manual, condition or action, got {other:?}"
+                ));
+            }
+            None if action.is_some() => StepKind::Action,
+            None => StepKind::Manual,
+        };
+        if matches!(kind, StepKind::Action) != action.is_some() {
+            return Err(format!(
+                "step {id:?}: kind \"action\" and an action object belong together"
+            ));
+        }
+        parsed.push(ImportStep {
+            id: id.to_string(),
+            kind,
+            text: text.to_string(),
+            hint,
+            action,
+            params,
+            approval_required,
+            after,
+            resolves,
+        });
+    }
+
+    // Cross-entry: `after_failures` names a kept step that runs an action (the mock's
+    // "keep the retry step that the escalation depends on").
+    let mut steps = Vec::with_capacity(parsed.len());
+    for s in &parsed {
+        let condition = match &s.after {
+            None => None,
+            Some((ref_id, count)) => {
+                let Some(target) = parsed.iter().find(|e| &e.id == ref_id) else {
+                    return Err(format!(
+                        "step {:?} depends on step {ref_id:?}: keep the step it waits for",
+                        s.id
+                    ));
+                };
+                let Some(action) = target.action.clone() else {
+                    return Err(format!(
+                        "step {:?} depends on step {ref_id:?}, which has no action",
+                        s.id
+                    ));
+                };
+                Some(Condition::AfterFailures {
+                    action,
+                    count: *count,
+                })
+            }
+        };
+        steps.push(StepDef {
+            id: s.id.clone(),
+            kind: s.kind,
+            text: s.text.clone(),
+            hint: s.hint.clone(),
+            action: s.action.clone(),
+            params: s.params.clone(),
+            approval_required: s.approval_required,
+            condition,
+            resolves: s.resolves,
+        });
+    }
+    Ok(steps)
+}
+
+/// Rebuild the runbook a published import stored ([`crate::overrides::apply_runbooks`]).
+/// The body is `{"format", "team", "title", "content", "steps"}`: the content goes
+/// through its format's file adapter (validation, url, matches, priority), the stored
+/// (edited) checklist through [`imported_steps`], and the id/team/title/revision come
+/// from the row. A markdown/text runbook's `text` is rebuilt from the stored checklist —
+/// steps deleted before publishing stay deleted everywhere the runbook is shown (the
+/// mock's behaviour). `Err` explains why the row is dropped.
+pub fn runbook_from_override(id: &str, body: &Value, revision: i32) -> Result<Runbook, String> {
+    let format = body
+        .get("format")
+        .and_then(Value::as_str)
+        .and_then(Format::parse)
+        .ok_or_else(|| "missing or unknown format".to_string())?;
+    let team = body
+        .get("team")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "missing team".to_string())?;
+    let title = body
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "missing title".to_string())?;
+    let content = body
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing content".to_string())?;
+    let steps = imported_steps(body.get("steps"), format)?;
+    let mut rb = parse_imported(format, content.as_bytes(), id)?;
+    rb.title = title.to_string();
+    rb.team = Some(team.to_string());
+    rb.revision = revision;
+    rb.steps = steps;
+    if matches!(format, Format::Markdown | Format::Text) {
+        rb.text = Some(
+            rb.steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    if format == Format::Markdown {
+                        format!("{}. {}", i + 1, s.text)
+                    } else {
+                        s.text.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    Ok(rb)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1590,6 +2116,359 @@ mod tests {
             matches!(e, LoadIssue::Semantic(ref m) if m.contains("needs an http(s)")),
             "{e:?}"
         );
+    }
+
+    // --- runtime import ----------------------------------------------------------------------
+
+    #[test]
+    fn import_id_collapses_and_caps_like_the_mock() {
+        assert_eq!(import_id("Settlement Timeout!!"), "settlement-timeout");
+        assert_eq!(
+            import_id("  HighErrorRate  on payments-api "),
+            "higherrorrate-on-payments-api"
+        );
+        assert_eq!(import_id("Ünïcödé Tïtlé"), "n-c-d-t-tl");
+        assert_eq!(import_id("x"), "x");
+        assert_eq!(import_id("!!!"), "");
+        assert_eq!(import_id("---"), "");
+        let long = "a".repeat(100);
+        assert_eq!(import_id(&long).len(), 64);
+    }
+
+    fn import_body(format: &str, title: &str, team: &str, content: &str) -> Value {
+        json!({ "format": format, "title": title, "team": team, "content": content })
+    }
+
+    #[test]
+    fn validate_import_parses_content_and_overrides_metadata() {
+        let input = validate_import(&import_body(
+            "yaml",
+            "Imported workflow failure",
+            "settlements",
+            "runbook: content-says-another-id\ntitle: Content title\nteam: pricing\nsteps:\n  \
+             - check: Check the service\n    action: http_get\n    url: http://x/health\n",
+        ))
+        .expect("valid import");
+        // The request wins over any metadata the content carries.
+        assert_eq!(input.id, "imported-workflow-failure");
+        assert_eq!(input.title, "Imported workflow failure");
+        assert_eq!(input.team, "settlements");
+        assert_eq!(input.runbook.id, input.id);
+        assert_eq!(input.runbook.title, input.title);
+        assert_eq!(input.runbook.team.as_deref(), Some("settlements"));
+        assert_eq!(input.runbook.steps.len(), 1);
+        // The verbatim content is kept for the publish to store.
+        assert!(input.content.contains("content-says-another-id"));
+    }
+
+    #[test]
+    fn validate_import_rejects_shapes_and_limits() {
+        for (name, body) in [
+            (
+                "missing format",
+                json!({ "title": "T", "team": "t", "content": "x" }),
+            ),
+            ("unknown format", import_body("docx", "T", "t", "x")),
+            ("empty title", import_body("yaml", "  ", "t", "x")),
+            (
+                "long title",
+                import_body("yaml", &"t".repeat(121), "t", "x"),
+            ),
+            (
+                "title without id chars",
+                import_body("yaml", "!!!", "t", "x"),
+            ),
+            (
+                "missing team",
+                json!({ "format": "yaml", "title": "T", "content": "x" }),
+            ),
+            ("empty content", import_body("yaml", "T", "t", "   ")),
+            (
+                "huge content",
+                import_body("yaml", "T", "t", &"x".repeat(65537)),
+            ),
+            (
+                "unparsable yaml",
+                import_body("yaml", "T", "t", "steps: [::"),
+            ),
+            (
+                "unknown action",
+                import_body("yaml", "T", "t", "steps:\n  - action: detonate\n"),
+            ),
+            (
+                "bad link url",
+                import_body("link", "T", "t", "ftp://wiki.test/x"),
+            ),
+        ] {
+            let err = validate_import(&body).unwrap_err();
+            assert!(!err.is_empty(), "{name}: message must not be empty");
+        }
+    }
+
+    #[test]
+    fn link_import_accepts_the_url_and_the_mapping_form() {
+        let rb = parse_imported(
+            Format::Link,
+            b"https://wiki.example.test/pricing-latency",
+            "pricing-latency",
+        )
+        .expect("bare url parses");
+        assert_eq!(rb.format, Format::Link);
+        assert_eq!(rb.id, "pricing-latency");
+        assert_eq!(
+            rb.url.as_deref(),
+            Some("https://wiki.example.test/pricing-latency")
+        );
+        assert!(rb.steps.is_empty());
+
+        // Credentials and control characters are rejected, like the mock's webLink.
+        for bad in [
+            "https://user:pass@wiki.test/a".as_bytes(),
+            "https://wiki.test/a b".as_bytes(),
+            &"https://wiki.test/"
+                .bytes()
+                .chain(std::iter::repeat_n(b'a', 2100))
+                .collect::<Vec<u8>>(),
+        ] {
+            assert!(
+                parse_imported(Format::Link, bad, "x").is_err(),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
+        // The `*.link.yaml` mapping form parses through the file adapter.
+        let rb = parse_imported(
+            Format::Link,
+            b"runbook: content-id\nurl: http://wiki.test/a\n",
+            "row-id",
+        )
+        .expect("mapping form parses");
+        assert_eq!(rb.id, "row-id", "the derived id wins");
+        assert_eq!(rb.url.as_deref(), Some("http://wiki.test/a"));
+    }
+
+    #[test]
+    fn preview_steps_shape_and_references() {
+        let input = validate_import(&import_body("yaml", "Previewed", "settlements", APPENDIX_B))
+            .expect("parses");
+        let steps = preview_steps(&input.runbook);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0]["kind"], json!("action"));
+        assert_eq!(steps[0]["id"], json!("s1"));
+        assert_eq!(steps[0]["action"]["name"], json!("http_get"));
+        assert_eq!(steps[0]["action"]["label"], json!("HTTP GET request"));
+        assert_eq!(steps[0]["action"]["risk"], json!("low"));
+        assert_eq!(
+            steps[0]["action"]["params"]["url"],
+            json!("http://counterparty-service/health")
+        );
+        assert_eq!(steps[0]["approval"], json!("none"));
+        // No `resolves: true` anywhere: the key is omitted, not false.
+        assert!(steps.iter().all(|s| s.get("resolves").is_none()));
+
+        let escalate = &steps[2];
+        assert_eq!(escalate["action"]["name"], json!("escalate"));
+        assert_eq!(escalate["action"]["risk"], json!("high"));
+        assert_eq!(escalate["approval"], json!("required"));
+        // `if: "retry fails twice"` references the retry step by id.
+        assert_eq!(
+            escalate["after_failures"],
+            json!({ "step": "s2", "count": 2 })
+        );
+
+        // A condition whose action no earlier step runs cannot name a step.
+        let input = validate_import(&import_body(
+            "yaml",
+            "Dangling",
+            "settlements",
+            "steps:\n  - if: \"retry fails twice\"\n    check: Then consider it\n",
+        ))
+        .expect("parses");
+        let steps = preview_steps(&input.runbook);
+        assert_eq!(steps[0]["kind"], json!("condition"));
+        assert!(steps[0].get("after_failures").is_none());
+    }
+
+    #[test]
+    fn imported_steps_round_trips_a_preview_exactly() {
+        let input = validate_import(&import_body(
+            "yaml",
+            "Round trip",
+            "settlements",
+            APPENDIX_B,
+        ))
+        .expect("parses");
+        let preview = preview_steps(&input.runbook);
+        let back = imported_steps(Some(&json!(preview)), Format::Yaml).expect("valid");
+        assert_eq!(
+            back, input.runbook.steps,
+            "the echo of a preview is the parse"
+        );
+    }
+
+    #[test]
+    fn imported_steps_validation_errors() {
+        for (name, steps, format) in [
+            ("missing", json!(Value::Null), Format::Yaml),
+            ("empty for yaml", json!([]), Format::Yaml),
+            (
+                "steps for link",
+                json!([{ "id": "s1", "kind": "manual", "text": "x" }]),
+                Format::Link,
+            ),
+            ("not an object", json!(["x"]), Format::Yaml),
+            (
+                "bad id",
+                json!([{ "id": "has space", "kind": "manual", "text": "x" }]),
+                Format::Yaml,
+            ),
+            (
+                "empty text",
+                json!([{ "id": "s1", "kind": "manual", "text": "  " }]),
+                Format::Yaml,
+            ),
+            (
+                "long text",
+                json!([{ "id": "s1", "kind": "manual", "text": "x".repeat(2001) }]),
+                Format::Yaml,
+            ),
+            (
+                "duplicate ids",
+                json!([
+                    { "id": "s1", "kind": "manual", "text": "a" },
+                    { "id": "s1", "kind": "manual", "text": "b" },
+                ]),
+                Format::Yaml,
+            ),
+            (
+                "unknown action",
+                json!([{
+                    "id": "s1", "kind": "action", "text": "x",
+                    "action": { "name": "detonate", "params": {} }
+                }]),
+                Format::Yaml,
+            ),
+            (
+                "kind without action",
+                json!([{ "id": "s1", "kind": "action", "text": "x" }]),
+                Format::Yaml,
+            ),
+            (
+                "bad kind",
+                json!([{ "id": "s1", "kind": "automatic", "text": "x" }]),
+                Format::Yaml,
+            ),
+            (
+                "bad approval",
+                json!([{ "id": "s1", "kind": "manual", "text": "x", "approval": "maybe" }]),
+                Format::Yaml,
+            ),
+            (
+                "dangling after_failures",
+                json!([
+                    { "id": "s1", "kind": "manual", "text": "a" },
+                    {
+                        "id": "s2", "kind": "action", "text": "b",
+                        "action": { "name": "escalate", "params": { "team": "support" } },
+                        "after_failures": { "step": "gone", "count": 2 }
+                    },
+                ]),
+                Format::Yaml,
+            ),
+            (
+                "after_failures to a manual step",
+                json!([
+                    { "id": "s1", "kind": "manual", "text": "a" },
+                    {
+                        "id": "s2", "kind": "condition", "text": "b",
+                        "after_failures": { "step": "s1", "count": 2 }
+                    },
+                ]),
+                Format::Yaml,
+            ),
+        ] {
+            assert!(
+                imported_steps(Some(&steps), format).is_err(),
+                "{name} must be rejected: {steps}"
+            );
+        }
+        // More than 50 steps.
+        let many = (1..=51)
+            .map(|i| json!({ "id": format!("s{i}"), "kind": "manual", "text": "x" }))
+            .collect::<Vec<_>>();
+        assert!(imported_steps(Some(&json!(many)), Format::Yaml).is_err());
+    }
+
+    #[test]
+    fn runbook_from_override_rebuilds_the_stored_steps() {
+        // A publish that edited the first step's text and dropped the escalate step.
+        let input = validate_import(&import_body("yaml", "Rebuilt", "settlements", APPENDIX_B))
+            .expect("parses");
+        let mut steps = preview_steps(&input.runbook);
+        steps[0]["text"] = json!("Check the counterparty service");
+        steps.remove(2);
+        let body = json!({
+            "format": "yaml",
+            "team": "settlements",
+            "title": "Rebuilt",
+            "content": input.content,
+            "steps": steps,
+        });
+        let rb = runbook_from_override("rebuilt", &body, 1).expect("rebuilds");
+        assert_eq!(rb.id, "rebuilt");
+        assert_eq!(rb.revision, 1);
+        assert_eq!(rb.title, "Rebuilt");
+        assert_eq!(rb.team.as_deref(), Some("settlements"));
+        assert_eq!(rb.steps.len(), 2);
+        assert_eq!(rb.steps[0].text, "Check the counterparty service");
+        assert_eq!(rb.steps[0].action.as_deref(), Some("http_get"));
+        assert_eq!(rb.steps[1].action.as_deref(), Some("retry_workflow"));
+        // The markdown/text `text` is rebuilt from the stored checklist, so steps
+        // deleted before publishing stay deleted (mock behaviour).
+        let md = json!({
+            "format": "markdown",
+            "team": "settlements",
+            "title": "Markdown rebuilt",
+            "content": "# Page\n1. First\n2. Second deleted\n",
+            "steps": [
+                { "id": "s1", "kind": "manual", "text": "First kept" },
+                { "id": "s2", "kind": "manual", "text": "Second kept" },
+            ],
+        });
+        let rb = runbook_from_override("markdown-rebuilt", &md, 1).expect("rebuilds");
+        assert_eq!(rb.text.as_deref(), Some("1. First kept\n2. Second kept"));
+        assert_eq!(rb.steps[1].text, "Second kept");
+
+        // A stored body that no longer validates says why.
+        for (name, body) in [
+            (
+                "no format",
+                json!({ "team": "t", "title": "T", "content": "x", "steps": [] }),
+            ),
+            (
+                "unknown action",
+                json!({
+                    "format": "yaml", "team": "t", "title": "T", "content": "steps: []",
+                    "steps": [{
+                        "id": "s1", "kind": "action", "text": "x",
+                        "action": { "name": "detonate", "params": {} }
+                    }],
+                }),
+            ),
+            (
+                "unparsable content",
+                json!({
+                    "format": "yaml", "team": "t", "title": "T", "content": "steps: [::",
+                    "steps": [{ "id": "s1", "kind": "manual", "text": "x" }],
+                }),
+            ),
+        ] {
+            assert!(
+                runbook_from_override("x", &body, 1).is_err(),
+                "{name} must not rebuild"
+            );
+        }
     }
 
     fn tmp(name: &str) -> PathBuf {

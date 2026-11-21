@@ -8,6 +8,12 @@
 //! is `{"preferences": [...]}`; a team row's `body` is the full effective team after the
 //! save (`{"members", "lead", "oncall", "default_channels"}`).
 //!
+//! A `runbook` row (runtime import, `POST /api/runbooks`) is one published runbook: its
+//! id the derived preview id, `revision` 1, `body` `{"format", "team", "title",
+//! "content", "steps"}` — [`apply_runbooks`] parses each body back into a
+//! [`crate::runbook::Runbook`] and adds it to the base library, so a published runbook
+//! reaches the router, scheduler, actions worker and API with no restart.
+//!
 //! [`apply`] replaces the overridden fields and rebuilds the whole directory with
 //! `Directory::from_parts`, so a saved edit goes through exactly the parsing and
 //! cross-reference validation a YAML import does (SPEC §4.6: one validator). Overrides
@@ -106,8 +112,9 @@ pub fn revision_of(ov: &Overrides, kind: &str, id: &str) -> i64 {
 /// The base directory with every override applied: a person's raw `preferences` and a
 /// team's members / lead / on-call / default channels are replaced from the override
 /// bodies, then the whole directory is rebuilt with `Directory::from_parts` — the same
-/// parsing and validation a YAML import goes through. `delivery`, `rules` and `runbooks`
-/// are carried over from the base unchanged. Overrides for ids missing from the base
+/// parsing and validation a YAML import goes through. `delivery` and `rules` are
+/// carried over from the base unchanged; `runbooks` is carried over and then extended
+/// with the imported ones ([`apply_runbooks`]). Overrides for ids missing from the base
 /// (removed from the YAML) are ignored with a warning.
 pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError> {
     for id in ov.people.keys() {
@@ -148,14 +155,31 @@ pub fn apply(base: &Directory, ov: &Overrides) -> Result<Directory, ConfigError>
     Ok(dir)
 }
 
-/// Add the runbooks imported at runtime to `dir.runbooks` (runtime runbook import).
-/// Placeholder: the import task fills this in (parse each body through the same
-/// validator `config/runbooks` files go through; an id that exists in the YAML base is
-/// an error). Until then imported rows are ignored.
+/// Add the runbooks imported at runtime (`POST /api/runbooks`, rows of
+/// [`KIND_RUNBOOK`]) to `dir.runbooks`, sorted by id. Each stored body —
+/// `{"format", "team", "title", "content", "steps"}` — is rebuilt through the same
+/// adapter and step validation a publish used
+/// (`crate::runbook::runbook_from_override`), with the row's id and revision. An id
+/// that already exists in the YAML base is a `ConfigError`, as is a body that no
+/// longer validates (say an action no registry knows any more); `apply_lenient` drops
+/// only the offending row.
 pub fn apply_runbooks(
-    _dir: &mut Directory,
-    _runbooks: &HashMap<String, RunbookOverride>,
+    dir: &mut Directory,
+    runbooks: &HashMap<String, RunbookOverride>,
 ) -> Result<(), ConfigError> {
+    let mut rows: Vec<(&String, &RunbookOverride)> = runbooks.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, o) in rows {
+        if dir.runbooks.get(id).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "runbook {id:?} already exists in config/runbooks"
+            )));
+        }
+        let revision = i32::try_from(o.revision).unwrap_or(i32::MAX);
+        let rb = crate::runbook::runbook_from_override(id, &o.body, revision)
+            .map_err(|e| ConfigError::Invalid(format!("runbook {id:?}: {e}")))?;
+        dir.runbooks.runbooks.push(rb);
+    }
     Ok(())
 }
 
@@ -203,10 +227,11 @@ fn apply_team_body(t: &mut Team, body: &Value) {
 }
 
 /// [`apply`], but one override that no longer validates (say a team naming a person since
-/// removed from the YAML) drops only itself, with a warning, instead of the whole set.
-/// Returns the directory and the overrides that were applied. If the whole set applies
-/// this is exactly [`apply`]; otherwise overrides are tried one at a time in a fixed
-/// order (people, then teams, each by id) and kept only if the set so far still applies.
+/// removed from the YAML, or a runbook row whose body a newer validator rejects) drops
+/// only itself, with a warning, instead of the whole set. Returns the directory and the
+/// overrides that were applied. If the whole set applies this is exactly [`apply`];
+/// otherwise overrides are tried one at a time in a fixed order (people, then teams,
+/// then runbooks, each by id) and kept only if the set so far still applies.
 pub fn apply_lenient(base: &Directory, ov: &Overrides) -> (Directory, Overrides) {
     if let Ok(dir) = apply(base, ov) {
         return (dir, ov.clone());
@@ -232,6 +257,18 @@ pub fn apply_lenient(base: &Directory, ov: &Overrides) -> (Directory, Overrides)
         match apply(base, &trial) {
             Ok(_) => kept = trial,
             Err(err) => warn!(team = %id, %err, "saved team no longer validates, ignoring it"),
+        }
+    }
+    let mut runbooks: Vec<_> = ov.runbooks.iter().collect();
+    runbooks.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, o) in runbooks {
+        let mut trial = kept.clone();
+        trial.runbooks.insert(id.clone(), o.clone());
+        match apply(base, &trial) {
+            Ok(_) => kept = trial,
+            Err(err) => {
+                warn!(runbook = %id, %err, "saved runbook no longer validates, ignoring it")
+            }
         }
     }
     match apply(base, &kept) {
@@ -568,5 +605,126 @@ mod tests {
         assert_eq!(revision_of(&ov, KIND_TEAM, "rates"), 5);
         assert_eq!(revision_of(&ov, KIND_TEAM, "payments"), 1);
         assert_eq!(revision_of(&ov, "nonsense", "bob"), 1);
+    }
+
+    // --- runtime-imported runbooks ------------------------------------------------------------
+
+    fn runbook_override(body: Value, revision: i64) -> (String, RunbookOverride) {
+        (
+            body.get("title")
+                .and_then(Value::as_str)
+                .map(crate::runbook::import_id)
+                .unwrap_or_default(),
+            RunbookOverride { body, revision },
+        )
+    }
+
+    fn import_body(title: &str, content: &str) -> Value {
+        json!({
+            "format": "yaml",
+            "team": "rates",
+            "title": title,
+            "content": content,
+            "steps": [
+                { "id": "s1", "kind": "manual", "text": "Check by hand" },
+                {
+                    "id": "s2", "kind": "action", "text": "Retry the workflow",
+                    "action": { "name": "retry_workflow", "params": { "workflowId": "{{workflowId}}" } },
+                    "resolves": true
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn apply_runbooks_adds_each_body_to_the_library() {
+        let mut ov = Overrides::default();
+        let (id, o) = runbook_override(import_body("Imported book", "steps: []"), 1);
+        assert_eq!(id, "imported-book");
+        ov.runbooks.insert(id.clone(), o);
+
+        let mut dir = base();
+        apply_runbooks(&mut dir, &ov.runbooks).expect("the runbook applies");
+        let rb = dir
+            .runbooks
+            .get(&id)
+            .expect("the imported runbook is in the library");
+        assert_eq!(rb.revision, 1, "the revision comes from the row");
+        assert_eq!(rb.team.as_deref(), Some("rates"));
+        assert_eq!(rb.steps.len(), 2);
+        assert_eq!(rb.steps[1].action.as_deref(), Some("retry_workflow"));
+        assert!(rb.steps[1].resolves);
+    }
+
+    #[test]
+    fn apply_runbooks_rejects_base_ids_and_bad_bodies() {
+        // An id that exists in the YAML base (here: as a file-loaded runbook).
+        let mut dir = base();
+        dir.runbooks.runbooks.push(crate::runbook::Runbook {
+            id: "existing".into(),
+            revision: 9,
+            title: "Existing".into(),
+            format: crate::runbook::Format::Yaml,
+            team: None,
+            priority: 0,
+            matches: Default::default(),
+            url: None,
+            text: None,
+            steps: Vec::new(),
+        });
+        let mut runbooks = HashMap::new();
+        let (_, o) = runbook_override(import_body("Existing", "steps: []"), 1);
+        runbooks.insert("existing".to_string(), o);
+        let err = apply_runbooks(&mut dir, &runbooks).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        // A body that no longer validates (an action no registry knows).
+        let mut runbooks = HashMap::new();
+        runbooks.insert(
+            "broken".to_string(),
+            RunbookOverride {
+                body: json!({
+                    "format": "yaml", "team": "rates", "title": "Broken", "content": "steps: []",
+                    "steps": [{
+                        "id": "s1", "kind": "action", "text": "Boom",
+                        "action": { "name": "detonate", "params": {} }
+                    }],
+                }),
+                revision: 1,
+            },
+        );
+        let err = apply_runbooks(&mut dir, &runbooks).unwrap_err();
+        assert!(err.to_string().contains("detonate"), "{err}");
+    }
+
+    #[test]
+    fn lenient_apply_drops_only_the_bad_runbook_row() {
+        let mut ov = Overrides::default();
+        insert_person(&mut ov, "bob", json!([{ "default": ["sms"] }]));
+        let (good, o) = runbook_override(import_body("Good book", "steps: []"), 1);
+        ov.runbooks.insert(good.clone(), o);
+        ov.runbooks.insert(
+            "broken-book".into(),
+            RunbookOverride {
+                body: json!({
+                    "format": "yaml", "team": "rates", "title": "Broken book",
+                    "content": "steps: [::",
+                    "steps": [{ "id": "s1", "kind": "manual", "text": "x" }],
+                }),
+                revision: 1,
+            },
+        );
+        assert!(
+            apply(&base(), &ov).is_err(),
+            "the strict validator rejects the set"
+        );
+        let (dir, applied) = apply_lenient(&base(), &ov);
+        // The bad row drops alone: the person and the good runbook still apply.
+        assert!(applied.people.contains_key("bob"));
+        assert!(applied.runbooks.contains_key(&good));
+        assert!(!applied.runbooks.contains_key("broken-book"));
+        assert!(dir.runbooks.get(&good).is_some());
+        assert!(dir.runbooks.get("broken-book").is_none());
+        assert!(dir.person("bob").unwrap().preferences.is_some());
     }
 }

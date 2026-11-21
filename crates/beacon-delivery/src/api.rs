@@ -10,6 +10,8 @@
 //! | `POST /api/approvals/email` (`application/x-www-form-urlencoded` body `a,p,e,s,decision=approve\|reject`) — decides through the same `approvals::decide` path with actor `user:<p>` and `via = email` | `200` HTML (approved / rejected) | `404` HTML (no config / unknown approval); `401` HTML (bad params/signature); `410` HTML (expired); `403` HTML (the requester, or not eligible); `409` HTML (already decided: `<state>`, or the alert is resolved); `415` HTML (any other content type) |
 //! | `GET /api/runbooks` | `200 {items}` (RunbookSummary, with `revision`) | |
 //! | `GET /api/runbooks/{runbookId}` | `200 {id, revision, title, format, team, steps: [{id, kind, text, action: {name, label} \| null, approval}]}` (current library version, step templates unrendered) | `401`; `404 not_found` |
+//! | `POST /api/runbooks/import` `{format, team, title, content}` (RunbookImport) | `200 {id, title, steps}` (RunbookPreview: id derived from the title, steps the parsed checklist as ImportedSteps) | `401`; `403 forbidden` (not a member or the lead of `team` — checked before the content is parsed, unknown teams authorize nobody); `415`; `422 invalid` (shape/limit failures, unparsable content, unknown action) |
+//! | `POST /api/runbooks` `{...RunbookImport, ...RunbookPreview}` (publish a previewed import; the submitted, possibly edited `steps` are validated like a file's) | `201 RunbookSummary` (revision 1) | `401`; `403 forbidden`; `409 revision_conflict` (the id is already published or exists in config/runbooks); `415`; `422 invalid` (import or steps validation) |
 //! | `GET /api/people/directory` | `200 {items}` of `PersonDirectoryEntry` (`{id, name, teams}`) | `401 unauthorized` |
 //! | `GET /api/people` | `200 {items}` of `PersonView` | `401 unauthorized` |
 //! | `GET /api/teams` | `200 {items}` of `TeamView` | `401 unauthorized` |
@@ -38,7 +40,15 @@
 //! (compare-and-set on `expected_revision`, the first save at revision 2) through the same
 //! validator a YAML import uses (`overrides::apply` -> `Directory::from_parts`), and
 //! `/api/people` redacts everyone except the actor to `contact: {}` and
-//! `preferences: []`, so no other user's email, phone or preferences may leak. `Admin(bool)`
+//! `preferences: []`, so no other user's email, phone or preferences may leak.
+//! The two runbook `GET`s read the effective library too (an imported runbook is listed
+//! with no restart, its `revision` from its row), and the two runbook `POST`s are the
+//! UI's Runbooks tab: the content goes through the same adapter a `config/runbooks`
+//! file of that format takes, the preview id is derived from the title, and a publish
+//! stores `kind = 'runbook'` rows of `directory_overrides` (revision 1, the actor in
+//! `updated_by`, `overrides::apply_runbooks` rebuilds each stored body into the
+//! effective library). Importing is for a member or the lead of the target team only
+//! (the mock's rule, checked before the content is parsed). `Admin(bool)`
 //! is inserted by the mounting app (beacon-api's
 //! `Session.admin`; absent means not admin, and `serve_standalone` never inserts it) and
 //! widens `can_edit` to every person and team — otherwise a person's `can_edit` is being
@@ -286,8 +296,12 @@ pub fn router(state: ApiState) -> Router {
             "/api/approvals/email",
             get(email_approval_page).post(email_approval_decide),
         )
-        .route("/api/runbooks", get(runbooks_handler))
+        .route(
+            "/api/runbooks",
+            get(runbooks_handler).post(publish_runbook_handler),
+        )
         .route("/api/runbooks/{runbook_id}", get(runbook_detail_handler))
+        .route("/api/runbooks/import", post(import_runbook_handler))
         .route("/api/people/directory", get(directory_handler))
         .route("/api/people", get(people_handler))
         .route("/api/teams", get(teams_handler))
@@ -1014,30 +1028,190 @@ async fn email_approval_decide(
 }
 
 // ---------------------------------------------------------------------------------------------
-// GET /api/runbooks
+// GET /api/runbooks, GET /api/runbooks/{runbookId}, POST /api/runbooks[/import]
 // ---------------------------------------------------------------------------------------------
 
+/// `GET /api/runbooks`: the effective library (a runbook imported at runtime is listed
+/// with no restart). An imported runbook carries its row's revision, a file one its
+/// content hash. Same access as before (any session).
 async fn runbooks_handler(
     State(state): State<ApiState>,
+    axum::Extension(effective): axum::Extension<Arc<overrides::EffectiveDirectory>>,
     actor: Option<axum::Extension<Actor>>,
 ) -> Result<Response, ApiError> {
     let _actor = actor.map(|a| a.0).ok_or_else(unauthorized)?;
-    let items = crate::runbook::list_items(&state.dir.runbooks);
+    let dir = effective.get(&state.pool).await;
+    let items = crate::runbook::list_items(&dir.runbooks);
     Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
 }
 
-/// `GET /api/runbooks/{runbookId}`: the current library version of one runbook with its
-/// step templates ([`crate::runbook::detail_item`]); same access as the list (any
+/// `GET /api/runbooks/{runbookId}`: the current effective version of one runbook with
+/// its step templates ([`crate::runbook::detail_item`]); same access as the list (any
 /// session), `404 not_found` for an unknown id.
 async fn runbook_detail_handler(
     State(state): State<ApiState>,
     Path(runbook_id): Path<String>,
+    axum::Extension(effective): axum::Extension<Arc<overrides::EffectiveDirectory>>,
     actor: Option<axum::Extension<Actor>>,
 ) -> Result<Response, ApiError> {
     let _actor = actor.map(|a| a.0).ok_or_else(unauthorized)?;
-    let item = crate::runbook::detail_item(&state.dir.runbooks, &runbook_id)
+    let dir = effective.get(&state.pool).await;
+    let item = crate::runbook::detail_item(&dir.runbooks, &runbook_id)
         .ok_or_else(|| not_found(format!("unknown runbook {runbook_id:?}")))?;
     Ok((StatusCode::OK, Json(item)).into_response())
+}
+
+/// The import routes' team authorization (the mock's rule): a runbook may be imported
+/// for a team only by one of its members or its lead — an unknown team authorizes
+/// nobody. On-call alone does not grant importing (it grants running steps).
+fn member_or_lead(dir: &Directory, team_id: &str, actor: &str) -> bool {
+    let Some(person) = actor.strip_prefix("user:") else {
+        return false;
+    };
+    dir.teams
+        .get(team_id)
+        .is_some_and(|t| t.members.iter().any(|m| m == person) || t.lead.as_deref() == Some(person))
+}
+
+/// The checks both import routes share: the mock's team authorization BEFORE anything is
+/// parsed (a named team must be the actor's own, so a foreign team is a 403 whatever
+/// the content says), then the `RunbookImport` validation and the content parse.
+async fn validated_import(
+    state: &ApiState,
+    effective: &Arc<overrides::EffectiveDirectory>,
+    actor: &str,
+    body: &Value,
+) -> Result<crate::runbook::ImportInput, ApiError> {
+    if let Some(team) = body.get("team").and_then(Value::as_str).map(str::trim)
+        && !team.is_empty()
+    {
+        // The effective directory: a saved team change applies to this check too.
+        let dir = effective.get(&state.pool).await;
+        if !member_or_lead(&dir, team, actor) {
+            return Err(forbidden(
+                "only a member or the lead of the team may import a runbook for it",
+            ));
+        }
+    }
+    crate::runbook::validate_import(body).map_err(invalid)
+}
+
+/// `POST /api/runbooks/import` (contract `previewRunbookImport`): validate the
+/// `RunbookImport`, parse the content with the same adapter a `config/runbooks` file of
+/// that format takes, answer the derived preview `{id, title, steps}`. Nothing is
+/// stored — the UI shows the checklist for editing, then publishes it.
+async fn import_runbook_handler(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(effective): axum::Extension<Arc<overrides::EffectiveDirectory>>,
+    actor: Option<axum::Extension<Actor>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let Some(axum::Extension(Actor(actor))) = actor else {
+        return Err(unauthorized());
+    };
+    require_json_body(&headers)?;
+    let body = parse_body(&body)?;
+    let input = validated_import(&state, &effective, &actor, &body).await?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "id": input.id,
+            "title": input.title,
+            "steps": crate::runbook::preview_steps(&input.runbook),
+        })),
+    )
+        .into_response())
+}
+
+/// `POST /api/runbooks` (contract `publishRunbook`): publish a previewed import. The
+/// submitted (possibly edited) `steps` are validated like a file's
+/// (`runbook::imported_steps`) and stored with the import as a `kind = 'runbook'` row
+/// of `directory_overrides` (revision 1, the actor in `updated_by`); the effective
+/// directory rebuilds when the table's stamp moves, so the router, scheduler, actions
+/// worker and this API see the new runbook with no restart. An id that exists in the
+/// YAML base, or a row that was already published, is a `409 revision_conflict` (a
+/// runbook is published once; there is no update route). `201` answers the contract's
+/// `RunbookSummary`; the stored runbook is what the preview steps describe.
+async fn publish_runbook_handler(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(effective): axum::Extension<Arc<overrides::EffectiveDirectory>>,
+    actor: Option<axum::Extension<Actor>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let Some(axum::Extension(Actor(actor))) = actor else {
+        return Err(unauthorized());
+    };
+    require_json_body(&headers)?;
+    let body = parse_body(&body)?;
+    let input = validated_import(&state, &effective, &actor, &body).await?;
+    let steps = crate::runbook::imported_steps(body.get("steps"), input.format).map_err(invalid)?;
+
+    if state.dir.runbooks.get(&input.id).is_some() {
+        return Err(revision_conflict(format!(
+            "runbook {:?} already exists in config/runbooks",
+            input.id
+        )));
+    }
+    let stored = json!({
+        "format": input.format.as_str(),
+        "team": input.team,
+        "title": input.title,
+        "content": input.content,
+        "steps": body.get("steps").cloned().unwrap_or(Value::Null),
+    });
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let inserted = sqlx::query(
+        "INSERT INTO directory_overrides (kind, id, body, revision, updated_by) \
+         VALUES ($1, $2, $3, 1, $4) \
+         ON CONFLICT (kind, id) DO NOTHING",
+    )
+    .bind(overrides::KIND_RUNBOOK)
+    .bind(&input.id)
+    .bind(&stored)
+    .bind(&actor)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if inserted.rows_affected() == 0 {
+        let _ = tx.rollback().await;
+        return Err(revision_conflict(format!(
+            "runbook {:?} is already published (revision 1)",
+            input.id
+        )));
+    }
+    audit::record(
+        &mut tx,
+        &actor,
+        "ui",
+        None,
+        "runbook.published",
+        &format!("published runbook {} (revision 1)", input.id),
+        json!({
+            "runbook_id": input.id,
+            "team": input.team,
+            "format": input.format.as_str(),
+            "revision": 1,
+        }),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": input.id,
+            "revision": 1,
+            "title": input.title,
+            "format": input.format.as_str(),
+            "team": input.team,
+            "steps": steps.len(),
+        })),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------------------------
