@@ -660,7 +660,7 @@ pub async fn run_worker(
 ) {
     let mut shutdown = shutdown;
     info!(worker_id = %cfg.worker_id, channel = channel.name(), "delivery worker started");
-    while !*shutdown.borrow() {
+    while !*shutdown.borrow() && shutdown.has_changed().is_ok() {
         match work_once(&pool, &channel, &cfg).await {
             Ok(stats) if stats.claimed > 0 || stats.dead_on_claim > 0 => continue,
             Ok(_) => {

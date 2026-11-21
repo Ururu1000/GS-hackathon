@@ -15,9 +15,10 @@
 //!   LOCKED`, `locked_until = now() + lease`, fresh `lease_token`; expired leases are claimable).
 //!   Per timer, ONE tx: lock the alert row `FOR SHARE`; status not `open` → `state='cancelled'`,
 //!   `last_note = 'alert <status>'`. Else take `chain[step]`: unknown person → skip it (note).
-//!   Channels = step.channels, else `prefs::resolve_channels` (context from the alert row:
-//!   severity, team, rule_id); if that yields no job channel (UI only), use the distinct
-//!   channels of this alert's existing jobs for `notify_seq`. Insert jobs (`notify_seq` = the
+//!   Channels = step.channels, else `prefs::resolve_channels` (severity, team, rule_id from
+//!   the alert row; service, environment from the first notification); if that yields no
+//!   job channel (UI only), use the distinct channels of this alert's existing jobs for
+//!   `notify_seq`. Insert jobs (`notify_seq` = the
 //!   timer's, `escalation_step = step + 1`, route_info `{"target": "escalation", "via",
 //!   "step", "rule_id", "decision", "decided_at", "fallback"?}`, `ON CONFLICT DO NOTHING`).
 //!   Non-critical alerts with a rule throttle go through `throttle::take`/`suppress`; critical
@@ -190,7 +191,7 @@ pub async fn schedule(
     tx: &mut Transaction<'_, Postgres>,
     alert_id: Uuid,
     notify_seq: i32,
-    rule_id: &str,
+    ctx: &RoutingContext,
     chain: &[ChainStep],
     interval: Duration,
 ) -> Result<bool, sqlx::Error> {
@@ -202,13 +203,15 @@ pub async fn schedule(
         .max(1);
     let res = sqlx::query(
         "INSERT INTO escalation_timers \
-              (alert_id, notify_seq, rule_id, chain, interval_ms, due_at) \
-         VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6::float8)) \
+              (alert_id, notify_seq, rule_id, service, environment, chain, interval_ms, due_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8::float8)) \
          ON CONFLICT (alert_id) DO NOTHING",
     )
     .bind(alert_id)
     .bind(notify_seq)
-    .bind(rule_id)
+    .bind(&ctx.rule_id)
+    .bind(&ctx.service)
+    .bind(&ctx.environment)
     .bind(serde_json::to_value(chain).expect("chain serializes"))
     .bind(interval_ms)
     .bind(interval.as_secs_f64())
@@ -239,6 +242,9 @@ pub struct ClaimedTimer {
     pub alert_id: Uuid,
     pub notify_seq: i32,
     pub rule_id: String,
+    /// The first notification's `context.service` / `context.environment`.
+    pub service: Option<String>,
+    pub environment: Option<String>,
     pub chain: Vec<ChainStep>,
     pub step: i32,
     pub interval: Duration,
@@ -277,7 +283,18 @@ pub async fn claim_due(
     cfg: &SchedulerConfig,
 ) -> Result<Vec<ClaimedTimer>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let rows: Vec<(Uuid, i32, String, serde_json::Value, i32, i64, Uuid)> = sqlx::query_as(
+    type Row = (
+        Uuid,
+        i32,
+        String,
+        Option<String>,
+        Option<String>,
+        serde_json::Value,
+        i32,
+        i64,
+        Uuid,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
         "WITH c AS ( \
              SELECT * FROM escalation_timers \
              WHERE state = 'pending' AND due_at <= now() \
@@ -290,8 +307,8 @@ pub async fn claim_due(
              locked_until = now() + make_interval(secs => $3::float8), \
              lease_token = gen_random_uuid(), updated_at = now() \
          FROM c WHERE t.alert_id = c.alert_id \
-         RETURNING t.alert_id, t.notify_seq, t.rule_id, t.chain, t.step, t.interval_ms, \
-                   t.lease_token",
+         RETURNING t.alert_id, t.notify_seq, t.rule_id, t.service, t.environment, t.chain, \
+                   t.step, t.interval_ms, t.lease_token",
     )
     .bind(cfg.batch_size)
     .bind(&cfg.worker_id)
@@ -300,12 +317,25 @@ pub async fn claim_due(
     .await?;
 
     let mut claimed = Vec::with_capacity(rows.len());
-    for (alert_id, notify_seq, rule_id, raw, step, interval_ms, lease_token) in rows {
+    for (
+        alert_id,
+        notify_seq,
+        rule_id,
+        service,
+        environment,
+        raw,
+        step,
+        interval_ms,
+        lease_token,
+    ) in rows
+    {
         match serde_json::from_value::<Vec<ChainStep>>(raw) {
             Ok(chain) => claimed.push(ClaimedTimer {
                 alert_id,
                 notify_seq,
                 rule_id,
+                service,
+                environment,
                 chain,
                 step,
                 interval: Duration::from_millis(u64::try_from(interval_ms).unwrap_or(0)),
@@ -375,7 +405,8 @@ pub async fn fire_claimed(
     };
 
     // Channels: the step's explicit list, else the person's preferences resolved against
-    // the alert (context from the alert row: severity, team, rule_id).
+    // the alert (severity, team, rule_id from the alert row; service, environment frozen
+    // on the timer).
     let now = Utc::now();
     let (resolved, decision) = match &step.channels {
         Some(explicit) => (explicit.clone(), Decision::Explicit),
@@ -384,8 +415,8 @@ pub async fn fire_claimed(
                 severity: severity.clone(),
                 team: team.clone(),
                 rule_id: rule_id.clone(),
-                service: None,
-                environment: None,
+                service: claimed.service.clone(),
+                environment: claimed.environment.clone(),
             };
             let r = prefs::resolve_channels(person, team_for_via(dir, &step.via), &ctx, now);
             (r.channels, r.decision)
@@ -687,7 +718,7 @@ pub async fn run_scheduler(
 ) {
     let mut shutdown = shutdown;
     info!(worker_id = %cfg.worker_id, "escalation scheduler started");
-    while !*shutdown.borrow() {
+    while !*shutdown.borrow() && shutdown.has_changed().is_ok() {
         let wait = match escalate_once(&pool, &dir, &cfg).await {
             Ok(stats) => {
                 if stats != EscalationStats::default() {

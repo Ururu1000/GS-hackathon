@@ -123,37 +123,10 @@ fn policy_from_rule(path: &str, rule: &Value) -> RulePolicy {
     }
 }
 
-/// `"90s"`, `"10m"`, `"1h30m"`, `"500ms"`, `"2d"`: one or more `<integer><unit>` parts.
+/// `"90s"`, `"10m"`, `"1h30m"`, `"2h 37min"`: the humantime syntax `RuleSpec` parses rule
+/// files with, so a rule the engine accepts never loses its `escalate_after` here.
 pub fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let mut total = Duration::ZERO;
-    let mut rest = s;
-    while !rest.is_empty() {
-        let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-        if digits == 0 {
-            return None;
-        }
-        let n: u64 = rest[..digits].parse().ok()?;
-        rest = &rest[digits..];
-        let unit_len = rest
-            .find(|c: char| c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        let unit = &rest[..unit_len];
-        rest = &rest[unit_len..];
-        let part = match unit {
-            "ms" => Duration::from_millis(n),
-            "s" => Duration::from_secs(n),
-            "m" => Duration::from_secs(n.checked_mul(60)?),
-            "h" => Duration::from_secs(n.checked_mul(3600)?),
-            "d" => Duration::from_secs(n.checked_mul(86_400)?),
-            _ => return None,
-        };
-        total = total.checked_add(part)?;
-    }
-    Some(total)
+    humantime_serde::re::humantime::parse_duration(s.trim()).ok()
 }
 
 #[cfg(test)]
@@ -166,7 +139,8 @@ mod tests {
         assert_eq!(parse_duration("1h30m"), Some(Duration::from_secs(5400)));
         assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
         assert_eq!(parse_duration("90s"), Some(Duration::from_secs(90)));
-        for bad in ["", "m", "10", "10x", "1.5m", "-1m"] {
+        assert_eq!(parse_duration("2h 37min"), Some(Duration::from_secs(9420)));
+        for bad in ["", "m", "10", "10x", "-1m"] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
     }

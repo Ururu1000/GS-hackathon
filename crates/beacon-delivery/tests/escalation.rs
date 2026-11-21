@@ -19,6 +19,7 @@ use beacon_delivery::config::{Contact, Directory, Person, Team};
 use beacon_delivery::escalation::{
     self, ChainStep, ClaimedTimer, EscalationStats, FireOutcome, SchedulerConfig,
 };
+use beacon_delivery::prefs::RoutingContext;
 use beacon_delivery::router::route_once;
 use beacon_delivery::rules::RulePolicy;
 use beacon_delivery::throttle::{self, ThrottleSpec};
@@ -182,6 +183,18 @@ async fn make_due(pool: &PgPool, alert_id: Uuid) {
     .expect("make timer due");
 }
 
+/// A routing context naming only the rule (`schedule` reads `rule_id`, `service`,
+/// `environment` from it).
+fn rule_ctx(rule_id: &str) -> RoutingContext {
+    RoutingContext {
+        severity: "warning".into(),
+        team: "t".into(),
+        rule_id: rule_id.into(),
+        service: None,
+        environment: None,
+    }
+}
+
 /// Start a timer directly through `escalation::schedule` (no router involved).
 async fn schedule_direct(pool: &PgPool, alert_id: Uuid, rule_id: &str, chain: Vec<ChainStep>) {
     let mut tx = pool.begin().await.expect("tx");
@@ -189,7 +202,7 @@ async fn schedule_direct(pool: &PgPool, alert_id: Uuid, rule_id: &str, chain: Ve
         &mut tx,
         alert_id,
         1,
-        rule_id,
+        &rule_ctx(rule_id),
         &chain,
         Duration::from_secs(600),
     )
@@ -346,7 +359,7 @@ async fn router_schedules_one_timer_and_renotify_does_not_restart_it(pool: PgPoo
         &mut tx,
         bare,
         1,
-        "settlements-workflow-failed",
+        &rule_ctx("settlements-workflow-failed"),
         &[],
         Duration::from_secs(600),
     )
@@ -718,6 +731,8 @@ async fn a_stale_leases_finalize_writes_nothing(pool: PgPool) {
         alert_id: alert,
         notify_seq: 1,
         rule_id: "settlements-workflow-failed".into(),
+        service: None,
+        environment: None,
         chain: vec![ChainStep {
             recipient_id: "carol".into(),
             via: "oncall:settlements".into(),
@@ -879,6 +894,60 @@ async fn fire_resolves_preferences_and_falls_back_to_existing_job_channels(pool:
                 .expect("timer state");
         assert_eq!(state, "done");
     }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn fire_matches_preferences_on_the_first_notifications_service(pool: PgPool) {
+    let dir = Directory::from_parts(
+        vec![
+            person("y1", Some("y1@example.test"), None, None),
+            // x1 (lead of t): payments-api -> sms, anything else -> email.
+            person(
+                "x1",
+                Some("x1@example.test"),
+                Some("+44 7700 900302"),
+                Some(json!([
+                    { "match": { "service": "payments-api", "environment": "prod" }, "channels": ["sms"] },
+                    { "default": ["email"] },
+                ])),
+            ),
+        ],
+        vec![team("t", &["x1", "y1"], Some("x1"), None)],
+    )
+    .expect("directory");
+
+    let alert = insert_alert_as(&pool, "open", "warning", "t", "pref-rule").await;
+    let payload = json!({
+        "alert_id": alert, "notify_seq": 1, "rule_id": "pref-rule", "rule_revision": 1,
+        "team": "t", "severity": "warning", "reason": "new",
+        "route": [{ "to": "user:y1" }],
+        "context": { "service": "payments-api", "environment": "prod" },
+        "created_at": chrono::Utc::now(),
+    });
+    sqlx::query("INSERT INTO outbox (kind, alert_id, payload) VALUES ('notify', $1, $2)")
+        .bind(alert)
+        .bind(payload)
+        .execute(&pool)
+        .await
+        .expect("insert notify row");
+    let stats = route_once(&pool, &dir, &router_cfg(60_000))
+        .await
+        .expect("route");
+    assert_eq!(stats.timers, 1);
+
+    make_due(&pool, alert).await;
+    escalation::escalate_once(&pool, &dir, &sched_cfg("s1"))
+        .await
+        .expect("escalate_once");
+    let x1 = job_rows(&pool, alert)
+        .await
+        .into_iter()
+        .find(|j| j.recipient_id == "x1")
+        .expect("x1 job");
+    assert_eq!(
+        x1.channel, "sms",
+        "the service preference must match at fire time"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

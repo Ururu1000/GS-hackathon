@@ -28,5 +28,6 @@ minijinja = { workspace = true, features = ["fuel"] }
 sha2.workspace = true
 hex.workspace = true
 hmac.workspace = true
+humantime-serde.workspace = true
 
 [dev-dependencies]

@@ -177,6 +177,9 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
     let db_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let grace: u64 = env_or("SHUTDOWN_GRACE_SECS", "20")
+        .parse()
+        .context("SHUTDOWN_GRACE_SECS")?;
     let max_connections = match std::env::var("DB_MAX_CONNECTIONS") {
         Ok(v) => v.parse::<u32>().context("DB_MAX_CONNECTIONS")?.max(1),
         Err(_) => pool_size(&args.roles)?,
@@ -484,9 +487,6 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     // Drain: roles stop claiming and finish in-flight work; anything still running after the
     // grace period is aborted (its leases expire and another replica reclaims the work).
-    let grace: u64 = env_or("SHUTDOWN_GRACE_SECS", "20")
-        .parse()
-        .context("SHUTDOWN_GRACE_SECS")?;
     let drained = tokio::time::timeout(std::time::Duration::from_secs(grace), async {
         while tasks.join_next().await.is_some() {}
     })

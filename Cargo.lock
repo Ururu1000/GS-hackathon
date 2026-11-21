@@ -253,6 +253,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "humantime-serde",
  "lettre",
  "minijinja",
  "rand 0.9.5",

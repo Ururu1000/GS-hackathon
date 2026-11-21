@@ -6,6 +6,8 @@ CREATE TABLE escalation_timers (
     alert_id     uuid        PRIMARY KEY REFERENCES alerts (id),
     notify_seq   integer     NOT NULL,      -- notification that started the clock; jobs reuse it
     rule_id      text        NOT NULL,
+    service      text,                      -- the first notification's context, for preferences
+    environment  text,                      -- re-resolved at fire time
     chain        jsonb       NOT NULL,
     step         integer     NOT NULL DEFAULT 0 CHECK (step >= 0),
     interval_ms  bigint      NOT NULL CHECK (interval_ms > 0),

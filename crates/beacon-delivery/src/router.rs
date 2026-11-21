@@ -226,7 +226,7 @@ pub async fn route_once(
                     &mut tx,
                     *alert_id,
                     payload.notify_seq,
-                    &payload.rule_id,
+                    &ctx,
                     &chain,
                     interval,
                 )
