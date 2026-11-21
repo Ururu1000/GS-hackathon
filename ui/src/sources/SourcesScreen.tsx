@@ -10,6 +10,7 @@ import { absTime } from '../lib/time'
 import { flattenPaths, slugify } from '../rules/draft'
 
 const MAX_INPUT_CHARS = 64 * 1024
+const SOURCE_KIND_LABEL: Record<SourceView['kind'], string> = { http: 'Webhook', kafka: 'Kafka', file: 'Log file', poll: 'Polled API' }
 const keyFor = (item: DiscoveredSchema) => JSON.stringify([item.schema, item.source])
 
 function mappingTemplate(sample: DiscoveredSchema | null) {
@@ -170,7 +171,7 @@ export function SourcesScreen({ onCreateRule, llmSuggest = false }: { onCreateRu
                 <tbody>{data.sources.map((source) => (
                   <tr key={source.id}>
                     <td><span className="mono">{source.id}</span>{source.topics?.length ? <div className="muted small">{source.topics.join(', ')}</div> : null}</td>
-                    <td><span className={`source-kind ${source.last_seen ? 'is-live' : ''}`}>{source.kind === 'http' ? 'Webhook' : source.kind === 'kafka' ? 'Kafka' : 'Log file'}</span></td>
+                    <td><span className={`source-kind ${source.last_seen ? 'is-live' : ''}`}>{SOURCE_KIND_LABEL[source.kind]}</span></td>
                     <td className={source.last_seen ? '' : 'muted'}>{source.last_seen ? absTime(source.last_seen) : 'No events yet'}</td>
                     <td className="num">{source.events_24h ? source.events_24h.toLocaleString() : <span className="muted">0</span>}</td>
                   </tr>

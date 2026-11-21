@@ -32,9 +32,9 @@ docker compose ps -a              # beacon healthy, demo-seed exited 0
 1. **New schema at runtime.** Post any JSON to `:8090/ingest/demo`, with the JSON content type:
    `curl -H 'content-type: application/json' --data @event.json http://localhost:8090/ingest/demo`
    The Sources tab shows its shape; write a rule in the Rules tab, dry-run it in the test panel, save. The next event raises an alert, with no restart.
-2. **Runbook + approval.** Open the settlement-workflow alert, run the steps, and ask for approval on *escalate*. The Devices tab (simulated phone) gets the approval SMS; reply `Y <code>`. To make the retry step fail so escalate unlocks:
+2. **Runbook + approval.** Open the settlement-workflow alert, run the steps, and ask for approval on *escalate*. The Phone simulator tab gets the approval SMS; reply `Y <code>`. To make the retry step fail so escalate unlocks:
    `docker compose exec beacon curl -s -X POST -H 'Authorization: Bearer beacon-demo-gateway-token' -H 'content-type: application/json' -d '{"target":"workflows","mode":"fail"}' http://127.0.0.1:8070/api/simulator/mock`
-3. **Channel outage.** In the Devices tab, open **Gateway outage**, pick SMS and 60 s, and press *Take SMS down for 60 s*. Then trigger alerts. The SMS are held, the breaker opens, and every SMS arrives after recovery (at-least-once delivery; in our 60 s outage runs, 0 lost and 0 duplicates against the gateway's receipts). *End SMS outage now* stops it early.
+3. **Channel outage.** In the Phone simulator tab, open **Gateway outage**, pick SMS and 60 s, and press *Take SMS down for 60 s*. Then trigger alerts. The SMS are held, the breaker opens, and every SMS arrives after recovery (at-least-once delivery; in our 60 s outage runs, 0 lost and 0 duplicates against the gateway's receipts). *End SMS outage now* stops it early.
 4. **Preferences.** Change a person's channels in Preferences; the next notification follows them.
 
 Stop with `docker compose down` (`-v` also deletes the data).

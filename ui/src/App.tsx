@@ -301,7 +301,6 @@ export function App() {
           </select>
         </label>
         <Nav route={route} pendingProposals={pendingProposals} onNavigate={navigate} />
-        {route.view === 'alerts' && <FilterChips filters={filters} counts={counts} onChange={changeFilters} />}
         <div className="spacer" />
         {/* Shown only when the stream is down: a live feed needs no badge. */}
         <div className={`conn conn-${connection}`} role="status">
@@ -324,6 +323,11 @@ export function App() {
           </button>
         </div>
       </header>
+      {route.view === 'alerts' && (
+        <div className="filter-row">
+          <FilterChips filters={filters} counts={counts} onChange={changeFilters} />
+        </div>
+      )}
 
       <Suspense key={route.view} fallback={screenFallback}>
       {route.view === 'rules' && (
@@ -427,7 +431,7 @@ const NAV: { view: Route['view']; label: string; hash: string }[] = [
   { view: 'runbooks', label: 'Runbooks', hash: '#/runbooks' },
   { view: 'preferences', label: 'Preferences', hash: '#/preferences' },
   { view: 'proposals', label: 'Proposals', hash: '#/proposals' },
-  { view: 'simulator', label: 'Devices', hash: '#/simulator' },
+  { view: 'simulator', label: 'Phone simulator', hash: '#/simulator' },
 ]
 
 function Nav({ route, pendingProposals, onNavigate }: { route: Route; pendingProposals: number; onNavigate: (hash: string) => void }) {

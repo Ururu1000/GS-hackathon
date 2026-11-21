@@ -52,7 +52,7 @@ An in-memory stand-in for the backend. It generates the Appendix A events (workf
 
 Also in memory: people and teams (deliveries are planned from routes + preferences when an alert opens), the Appendix B runbooks with step state, approvals and fake actions (`mock/runbooks.ts`), and proposals (one auto-suggested). The real engine, delivery and config store are authoritative; writes to people and teams exist only in the mock until config moves to Postgres (spec §4.6, M2).
 
-To demo approval, open a settlement alert, run **Retry workflow** twice, and request approval on Escalate. Open **Devices**, select Carol's approval SMS, and reply with `Y` followed by its code. The simulator records Carol as the approver. The alert detail shows the decision and execution. To test recovery via a successful retry instead, set `MOCK_RETRY_OK=1` before starting the mock.
+To demo approval, open a settlement alert, run **Retry workflow** twice, and request approval on Escalate. Open **Phone simulator**, select Carol's approval SMS, and reply with `Y` followed by its code. The simulator records Carol as the approver. The alert detail shows the decision and execution. To test recovery via a successful retry instead, set `MOCK_RETRY_OK=1` before starting the mock.
 
 | Env | Default | Effect |
 |---|---|---|

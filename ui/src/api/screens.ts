@@ -4,7 +4,7 @@ import type { Condition, RunbookFormat, RunbookSummary, StepAction } from './typ
 export interface SourceView {
   id: string
   type: string
-  kind: 'http' | 'kafka' | 'file'
+  kind: 'http' | 'kafka' | 'file' | 'poll'
   topics?: string[]
   last_seen: string | null
   events_24h: number
