@@ -11,8 +11,8 @@
 //! - **Release.** [`release_once`], run by the scheduler role each pass, picks people with due rows. Per person, in one transaction,
 //!   it locks their due rows (`FOR UPDATE SKIP LOCKED`, so router replicas never double-send),
 //!   files ONE email job under the latest held row's `(alert_id, notify_seq)` with
-//!   `escalation_step = 300` ([`STEP`], so it never collides with that notification's own
-//!   jobs), and marks the rows released. The job's `route_info` carries `"target": "offhours"`
+//!   `escalation_step = -1` ([`OFFHOURS_DIGEST_STEP`], so it never collides with that
+//!   notification's own jobs), and marks the rows released. The job's `route_info` carries `"target": "offhours"`
 //!   and `"offhours": {count, alert_ids, held_since, release_at}`; the email worker reads the
 //!   alerts' CURRENT status when it sends, so the digest can say which ones resolved meanwhile.
 //! - Throttles don't apply to held rows: the digest is already one message per person.
@@ -26,9 +26,11 @@ use uuid::Uuid;
 
 use crate::throttle::PlannedJob;
 
-/// `delivery_jobs.escalation_step` of a digest job: 0 is the plain notification, 1.. escalation
-/// steps, 100+n the `escalate` action and 200+n approval prompts.
-pub const STEP: i32 = 300;
+/// `delivery_jobs.escalation_step` of a digest job. 0 is the plain notification, 1.. escalation
+/// steps, 100+n the `escalate` action and 200+n approval prompts (`approvals` counts every
+/// step >= 200 as a taken prompt slot). A negative value is outside every one of those ranges,
+/// so nothing reads the digest as an escalation step or an approval slot.
+pub const OFFHOURS_DIGEST_STEP: i32 = -1;
 
 /// `route_info.target` of a digest job.
 pub const TARGET: &str = "offhours";
@@ -156,7 +158,7 @@ async fn release_person(
         latest.2,
         recipient_id,
         std::slice::from_ref(&job),
-        Some(STEP),
+        Some(OFFHOURS_DIGEST_STEP),
     )
     .await?;
 

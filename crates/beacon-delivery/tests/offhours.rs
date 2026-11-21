@@ -163,7 +163,7 @@ async fn night_warnings_are_held_and_sent_as_one_morning_email(pool: PgPool) {
     let (alert_id, channel, step, info) = &jobs[0];
     assert_eq!(
         (alert_id, channel.as_str(), *step),
-        (&a3, "email", offhours::STEP)
+        (&a3, "email", offhours::OFFHOURS_DIGEST_STEP)
     );
     assert_eq!(info["target"], json!("offhours"));
     assert_eq!(info["offhours"]["count"], json!(3));
@@ -221,6 +221,21 @@ async fn night_warnings_are_held_and_sent_as_one_morning_email(pool: PgPool) {
     let kinds: Vec<&str> = timeline.iter().filter_map(|e| e["kind"].as_str()).collect();
     assert!(
         kinds.contains(&"held") && kinds.contains(&"digest"),
+        "{timeline:?}"
+    );
+    // On the alert it is filed under, the digest shows as a digest, never as an escalation.
+    let timeline = beacon_delivery::audit::timeline_entries(&pool, a3)
+        .await
+        .expect("timeline");
+    assert!(
+        timeline.iter().all(|e| e["kind"] != json!("escalated")),
+        "{timeline:?}"
+    );
+    assert!(
+        timeline.iter().any(|e| e["kind"] == json!("digest")
+            && e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("off-hours digest"))),
         "{timeline:?}"
     );
 }
