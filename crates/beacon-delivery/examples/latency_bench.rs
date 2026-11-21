@@ -862,8 +862,8 @@ fn evaluate(
 
 /// One poll: the run's alerts (by title), their delivery jobs, and the gateway
 /// receipts of those jobs.
-/// Wait until the run's `warmup` alerts exist and none of their delivery jobs is still
-/// pending or in flight (at most [`SETTLE_LIMIT`]; then it warns and goes on).
+/// Wait until the run's `warmup` alerts exist, each has been routed (has a delivery job) and
+/// none of their jobs is still pending or in flight (at most [`SETTLE_LIMIT`]; then it warns and goes on).
 async fn settle(
     pool: &sqlx::PgPool,
     title_pattern: &str,
@@ -872,9 +872,9 @@ async fn settle(
 ) -> Result<(), String> {
     let started = tokio::time::Instant::now();
     loop {
-        let (alerts, jobs, open): (i64, i64, i64) = sqlx::query_as(
-            "SELECT count(DISTINCT a.id), count(j.id), \
-                    count(j.id) FILTER (WHERE j.status IN ('pending', 'in_flight')) \
+        let (alerts, unrouted, jobs, open): (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT count(DISTINCT a.id), count(DISTINCT a.id) FILTER (WHERE j.id IS NULL), \
+                    count(j.id), count(j.id) FILTER (WHERE j.status IN ('pending', 'in_flight')) \
              FROM alerts a LEFT JOIN delivery_jobs j ON j.alert_id = a.id \
              WHERE a.title LIKE $1 AND a.first_seen >= $2",
         )
@@ -883,7 +883,7 @@ async fn settle(
         .fetch_one(pool)
         .await
         .map_err(|e| format!("settle query failed: {e}"))?;
-        if alerts as u64 >= warmup && jobs > 0 && open == 0 {
+        if alerts as u64 >= warmup && unrouted == 0 && open == 0 {
             println!(
                 "[warmup] {alerts} alerts, {jobs} jobs drained in {:.1}s; measuring",
                 started.elapsed().as_secs_f64()
@@ -892,8 +892,8 @@ async fn settle(
         }
         if started.elapsed() >= SETTLE_LIMIT {
             println!(
-                "warning: warmup not drained after {}s ({alerts}/{warmup} alerts, {open} of {jobs} \
-                 jobs open); measuring anyway",
+                "warning: warmup not drained after {}s ({alerts}/{warmup} alerts, {unrouted} not \
+                 routed, {open} of {jobs} jobs open); measuring anyway",
                 SETTLE_LIMIT.as_secs()
             );
             return Ok(());

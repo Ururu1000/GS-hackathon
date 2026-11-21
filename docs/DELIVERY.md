@@ -96,6 +96,8 @@ Rows marked *CI* (and the latency rows) ran on a GitHub Actions `ubuntu-latest` 
 | *CI, on main* (`b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383)): the same latency workload again | 500/500 delivered, 0 missing. Gateway: **p50 952 / p90 1225 / p99 1606 / max 1804 ms**. Email: **p50 936 / p90 1204 / p99 1391 / max 1556 ms** |
 | *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): `--events 500 --rate 50` | 500/500 delivered, 0 missing. Gateway: **p50 464 / p90 618 / p99 743 / max 765 ms**. Email: **p50 380 / p90 491 / p99 549 / max 618 ms** |
 | *Apple M5 Mac, 10 cores* (alexey; release build, main `6f01c42`): `--events 2000 --rate 200` | 2000/2000 delivered, 0 missing, 0 dead. Gateway: **p50 653 / p90 833 / p99 959 / max 1085 ms**. Email: **p50 650 / p90 819 / p99 944 / max 1030 ms** |
+| *CI, LISTEN/NOTIFY wake-ups* (`delivery/latency-notify`, warm pipeline, 2 runs: [44880520414](https://github.com/Ururu1000/GS-hackathon/actions/runs/44880520414), [44880521566](https://github.com/Ururu1000/GS-hackathon/actions/runs/44880521566)): `--events 500 --rate 50` | 500/500 delivered, 0 missing, 0 dead. Gateway: **p50 120–159 / p90 219–249 / p99 323–342 / max 392–445 ms**. Email: **p50 124–159 / p90 188–239 / p99 288–359 / max 330–414 ms** |
+| *CI, polling (main `963b4b4` + the same benchmark)*, 2 runs for comparison ([44880514736](https://github.com/Ururu1000/GS-hackathon/actions/runs/44880514736), [44880517567](https://github.com/Ururu1000/GS-hackathon/actions/runs/44880517567)) | 500/500 delivered, 0 missing. Gateway: **p50 432–519 / p90 608–794 / p99 801–994 / max 914–1142 ms**. Email: **p50 419–526 / p90 617–759 / p99 754–898 / max 797–1095 ms** |
 | **Under beacon-loadgen** (*CI*, [run 44873549433](https://github.com/Ururu1000/GS-hackathon/actions/runs/44873549433), `9b6dd76`): 200 and 2000 ev/s for 30 s, 1000 keys per type | ingest accepted 203 / 2000 ev/s, 0 rejected; every job reconciled (0 missing). Ingest (first event per alert) → gateway receipt **p50 0.5 s / p99 1.3 s** at 200 ev/s, **p50 13.4 s / p99 23.2 s** at 2000 ev/s (41 s / 50 s with one router task) on 2 vCPU. Details under [Under beacon-loadgen](#under-beacon-loadgen-200-and-2000-eventss). |
 
 Run the settlement-timeout flow by hand against the stack above. The mock workflow engine is set to fail with `POST :8070/api/simulator/mock {"target":"workflows","mode":"fail"}` plus the gateway token. Post `samples/events/workflow-failed.json` to `:8090/ingest/webhook`, then run the steps with `POST :8071/api/alerts/<id>/steps/<s1|s2|s3>/run`, and answer the approval SMS through `POST :8070/api/simulator/reply`.
@@ -112,18 +114,20 @@ Run the settlement-timeout flow by hand against the stack above. The mock workfl
 
 Caveat: gateway receipts are timestamped by Postgres and email by Mailpit, so the numbers are only valid when the client, Postgres and Mailpit share a clock (same machine / NTP-synced) — the benchmark prints that warning with every run.
 
-**Measured result.** One CI run, [run 44867217055](https://github.com/Ururu1000/GS-hackathon/actions/runs/44867217055): commit `9140087`, a GitHub `ubuntu-latest` runner (2 vCPU), release `beacon --role ingest,matcher,aggregator,relay,router,delivery,gateway` and the `deploy/docker-compose.yml` services all on that runner, so every timestamp shares one clock. Workload: 500 measured events plus 20 warmup at 50 events/s, mix `both` (250 sms/phone events and 250 email events). The `results.json` artifact holds every sample.
+**Measured result.** CI, GitHub `ubuntu-latest` runners (2 vCPU), release `beacon --role ingest,matcher,aggregator,relay,router,delivery,gateway` and the `deploy/docker-compose.yml` services all on one runner, so every timestamp shares one clock. Workload: 500 measured events at 50 events/s after 50 warmup events had drained, mix `both` (250 sms/phone events and 250 email events). Each run's `results.json` artifact holds every sample. With the router and workers woken by LISTEN/NOTIFY ([run 44880520414](https://github.com/Ururu1000/GS-hackathon/actions/runs/44880520414), commit `35650c5`):
 
 | metric (ms) | count | p50 | p90 | p99 | max |
 |---|---:|---:|---:|---:|---:|
-| ingest → gateway receipt (phone + sms jobs) | 500 | 862 | 1361 | 1751 | 1970 |
-| ingest → email receipt (Mailpit, per recipient) | 500 | 904 | 1317 | 1542 | 1578 |
-| client → ingest accept (`first_seen − t0`) | 500 | 0 | 1 | 4 | 7 |
-| accept → delivered (`sent_at − first_seen`, per job) | 1000 | 902 | 1355 | 1694 | 1973 |
+| ingest → gateway receipt (phone + sms jobs) | 500 | 120 | 219 | 323 | 392 |
+| ingest → email receipt (Mailpit, per recipient) | 500 | 124 | 188 | 288 | 330 |
+| client → ingest accept (`first_seen − t0`) | 500 | 0 | 0 | 0 | 2 |
+| accept → delivered (`sent_at − first_seen`, per job) | 1000 | 125 | 213 | 308 | 394 |
 
-0 ingest errors, 0 missing alerts, receipts or Mailpit messages, 0 pending, dead or cancelled jobs, 0 fallbacks.
+0 ingest errors, 0 missing alerts, receipts or Mailpit messages, 0 pending, dead or cancelled jobs, 0 fallbacks. A second run gave gateway p50 159 / p99 342 ms. The same workload on `main` (250 ms polling) gave gateway p50 432–519 / p99 801–994 ms over two runs.
 
-`alerts.first_seen` is stamped with the event's `ingested_at`, so the "ingest → alert" split measures only the client → ingest accept step. Nearly all of the ~0.9 s median is in the pipeline after that: Kafka → matcher → aggregator linger → outbox relay → router → polling delivery worker → provider.
+`alerts.first_seen` is stamped with the event's `ingested_at`, so the "ingest → alert" split measures only the client → ingest accept step. The rest is the pipeline: Kafka → matcher (50 ms transaction flush) → aggregator (20 ms linger) → outbox → router → delivery worker → provider. The router and the workers no longer poll on the hot path: the aggregator's `NOTIFY beacon_outbox` wakes one router task, and a trigger on `delivery_jobs` sends `NOTIFY beacon_delivery_jobs` with the channel name, which wakes one worker of that channel. 250 ms polling remains as the fallback and for retries.
+
+Older CI runs (`9140087`, `b8a4905`: gateway p50 862–952 / p99 1606–1751 ms) used a 20-event warmup, so they included the stack's cold start (Kafka consumer groups joining): the first ~40% of each run sat in that backlog.
 
 Re-run it: Actions → `loadtest` → Run workflow (once this file is on `main`), or push any commit to a `ci-run/loadtest-<name>` branch.
 
