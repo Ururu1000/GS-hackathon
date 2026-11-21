@@ -60,6 +60,9 @@ jobs:
         ports: ["1025:1025", "8025:8025"]
     steps:
       - uses: actions/checkout@v4
+      # librdkafka's bundled C build includes curl/curl.h on the runner image.
+      - name: System libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@stable
       # Caches ~/.cargo and target/ (incl. the librdkafka C build) per job.
       - uses: Swatinem/rust-cache@v2
