@@ -465,12 +465,14 @@ pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, b
     state.session.check_csrf(&headers)?;
     let body = read_body(body, MAX_TEST_BODY).await?;
     let b: SchemaPreview = parse_body(&body, "{\"spec\": {...}, \"event\": {...}, \"source\": \"...\"}")?;
-    let spec = config_store::validate_schema(&b.spec).map_err(invalid)?;
     let Ok(slot) = TEST_SLOTS.try_acquire() else {
         return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "too_many_tests", "too many previews in flight, retry"));
     };
+    // Validating compiles the detector's regexes: CPU work, so it runs under
+    // the permit on a blocking thread too.
     let out = tokio::task::spawn_blocking(move || {
         let _slot = slot;
+        let spec = config_store::validate_schema(&b.spec)?;
         let m = beacon_core::mapping::SchemaMapping::compile(&spec).expect("validated above");
         let event = Event::new("preview".into(), b.source.unwrap_or_else(|| "http:preview".into()), b.event);
         let matched = m.detects(&event);
@@ -479,10 +481,11 @@ pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, b
         if !matched {
             warnings.push("The detector does not recognise this event".into());
         }
-        json!({"matched": matched, "fields": fields, "warnings": warnings})
+        Ok(json!({"matched": matched, "fields": fields, "warnings": warnings}))
     })
     .await
-    .map_err(|e| ApiError::from(anyhow::anyhow!("preview task failed: {e}")))?;
+    .map_err(|e| ApiError::from(anyhow::anyhow!("preview task failed: {e}")))?
+    .map_err(invalid)?;
     Ok(Json(out))
 }
 

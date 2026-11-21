@@ -933,11 +933,16 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
       })
     }
     if (path === '/api/schemas' && method === 'POST') {
-      return write(req, res, (b: { spec: unknown; expected_revision?: number }) => {
+      return write(req, res, (b: { spec: unknown; expected_revision?: number; schema?: string }) => {
         if (![...allowedVisibleTeams()].some(isTeamMember)) return err(res, 403, 'forbidden', 'A team member can publish mappings')
         const parsed = parseMapping(b.spec)
         if ('error' in parsed) return err(res, 422, 'invalid', parsed.error)
         const id = parsed.spec.schema
+        // Like the API: an edit names the mapping it changes, so renaming can't overwrite another one.
+        if (b.expected_revision !== undefined) {
+          if (typeof b.schema !== 'string') return err(res, 400, 'bad_request', 'schema (the mapping being edited) is required with expected_revision')
+          if (b.schema !== id) return err(res, 422, 'invalid', `A mapping can't be renamed; publish ${id} as a new mapping`, { details: [{ path: 'schema', message: 'cannot be renamed' }] })
+        }
         const prior = schemas.get(id)
         if (b.expected_revision !== prior?.revision)
           return err(res, 409, 'revision_conflict', 'This schema mapping changed. Reload it before saving.', { current: prior })

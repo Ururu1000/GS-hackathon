@@ -320,7 +320,11 @@ it('applies detector precedence before resolving matching detectors with the sam
   await request('/api/schemas', 200, 'POST', {
     spec: { ...spec, priority: 60, detect: { ...spec.detect, source: 'http:alertmanager' } },
     expected_revision: 1,
+    schema: spec.schema,
   })
+  // An edit can't rename a mapping onto another one at the same revision.
+  await request('/api/schemas', 422, 'POST', { spec: { ...spec, schema: 'other.mapping' }, expected_revision: 2, schema: spec.schema })
+  await request('/api/schemas', 400, 'POST', { spec, expected_revision: 2 })
   expect(await request('/api/rules/test', 200, 'POST', { rule: RULES[0], event, source: 'http:alertmanager' }))
     .toMatchObject({ schema: 'prometheus.alert', fields: { stage: 'firing' } })
 })

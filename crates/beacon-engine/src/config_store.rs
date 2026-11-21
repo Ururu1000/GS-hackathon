@@ -542,13 +542,13 @@ pub async fn get_schema(pool: &PgPool, schema: &str) -> Result<Option<StoredSche
 /// the import share one transaction under the ruleset lock, so concurrent
 /// replicas can't both seed and a crash mid-import leaves the table empty.
 async fn seed_schemas_from_yaml(pool: &PgPool, config_dir: &Path) -> Result<()> {
-    let specs: Vec<Value> = load_yaml_files(&config_dir.join("schemas"))?;
     let mut tx = pool.begin().await?;
     lock_rules(&mut tx).await?;
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_mappings").fetch_one(&mut *tx).await?;
     if n > 0 {
         return Ok(());
     }
+    let specs: Vec<Value> = load_yaml_files(&config_dir.join("schemas"))?;
     let mut imported = 0;
     for spec in specs {
         match save_schema_in(&mut tx, &spec, None, "config").await? {
