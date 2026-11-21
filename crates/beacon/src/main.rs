@@ -13,12 +13,12 @@
 //! | `DELIVERY_WORKERS`   | `1` (worker loops per channel per process)| delivery          |
 //! | `DELIVERY_CHANNELS`  | `email,sms,phone`                         | delivery          |
 //! | `SMS_GATEWAY_URL`    | `http://localhost:8070`                   | delivery          |
-//! | `PUBLIC_URL`         | `http://localhost:5173` (SMS short links) | delivery          |
+//! | `PUBLIC_URL`         | `http://localhost:5173` (SMS short links, email approval links) | delivery, api |
 //! | `GATEWAY_ADDR`       | `127.0.0.1:8070` (set `0.0.0.0:8070` in a container) | gateway |
 //! | `GATEWAY_TOKEN`      | unset = unauthenticated dev mode (warns)  | gateway, delivery, api (simulator mount) |
 //! | `ESCALATE_AFTER_OVERRIDE_MS` | unset (demo: replaces rule `escalate_after`) | router |
 //! | `ROUTER_TASKS`       | `4` (router loops sharing the outbox)     | router            |
-//! | `REPLY_SECRET`       | unset = SMS replies rejected              | gateway, api, delivery-api |
+//! | `REPLY_SECRET`       | unset = SMS replies rejected, no email approval links | gateway, api, delivery-api, delivery |
 //! | `DELIVERY_API_ADDR`  | `127.0.0.1:8071`                          | delivery-api      |
 //! | `DELIVERY_API_URL`   | this process's `API_ADDR` with the api role (and no delivery-api), else `http://127.0.0.1:8071` (reply forward) | gateway |
 //! | `DELIVERY_API_DEMO_ACTOR` | `user:bob` (dev only)                | delivery-api      |
@@ -681,11 +681,17 @@ async fn main() -> Result<()> {
                             "DELIVERY_CHANNELS: unknown channel {other:?} (email, sms, phone)"
                         ),
                     };
+                    // Approval prompt emails carry a signed decide link when REPLY_SECRET is
+                    // set (M7); without it they say "Decide in Beacon" and carry no link.
+                    let worker_cfg = WorkerConfig {
+                        email_link: email_link_config(),
+                        ..WorkerConfig::default()
+                    };
                     for _ in 0..workers.max(1) {
                         tasks.spawn(beacon_delivery::worker::run_worker(
                             pool.clone(),
                             channel.clone(),
-                            WorkerConfig::default(),
+                            worker_cfg.clone(),
                             shutdown_rx.clone(),
                         ));
                     }
@@ -762,7 +768,7 @@ fn delivery_api_state(
         registry,
         alert_ops: alert_ops(),
         reply_secret: reply_secret().map(Arc::new),
-        email_link: None,
+        email_link: email_link_config(),
     })
 }
 
@@ -779,6 +785,16 @@ fn local_url(addr: &str) -> Result<String> {
         "http://{}",
         std::net::SocketAddr::new(ip, addr.port())
     ))
+}
+
+/// Signed email approval links (M7): keyed by `REPLY_SECRET` and pointing at `PUBLIC_URL`
+/// (the origin that serves `/api`, e.g. `http://localhost:8080` under compose). `None`
+/// without a secret: prompt emails carry no link and `/api/approvals/email` answers 404.
+fn email_link_config() -> Option<beacon_delivery::email_link::EmailLinkConfig> {
+    reply_secret().map(|secret| beacon_delivery::email_link::EmailLinkConfig {
+        secret: Arc::new(secret),
+        public_url: env_or("PUBLIC_URL", "http://localhost:5173"),
+    })
 }
 
 /// `REPLY_SECRET` as bytes, if set.
