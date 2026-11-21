@@ -673,6 +673,7 @@ fn delivery_harness(pool: PgPool) -> Harness {
             registry,
             alert_ops: Arc::new(beacon_delivery::alert_ops::SqlAlertOps),
             reply_secret: Some(Arc::new(b"reply-secret".to_vec())),
+            email_link: Some(beacon_delivery::email_link::EmailLinkConfig { secret: Arc::new(b"reply-secret".to_vec()), public_url: "http://localhost:8080".into() }),
         },
         simulator: Some(beacon_api::SimulatorMount {
             state: beacon_delivery::gateway::GatewayState::new(pool).with_token(Some("gw-token".into())),
@@ -706,6 +707,11 @@ async fn delivery_routes_are_mounted_behind_the_session(pool: PgPool) {
     // /api/replies is the gateway's signed callback: no CSRF, but the signature is checked.
     let (s, e) = post(&h.app, "/api/replies", None, json!({"from": "+1", "text": "ACK"})).await;
     assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::UNAUTHORIZED, Some("unauthorized")));
+
+    // The signed email approval form post (M7): no CSRF either, the link's HMAC is checked
+    // (a forged link is a 401 page, not the 403 csrf error).
+    let res = h.app.clone().oneshot(Request::post("/api/approvals/email").header("content-type", "application/x-www-form-urlencoded").body(Body::from("a=00000000-0000-0000-0000-000000000000&p=bob&e=4102444800&s=00&decision=approve")).unwrap()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
     // The alert detail carries delivery's runbook view (null when none was frozen).
     let (_, v) = get(&h.app, "/api/alerts").await;

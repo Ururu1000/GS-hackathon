@@ -26,6 +26,7 @@ pub mod breaker;
 pub mod channel;
 pub mod clock;
 pub mod config;
+pub mod email_link;
 pub mod escalation;
 pub mod gateway;
 pub mod model;
@@ -102,6 +103,10 @@ pub struct WorkerConfig {
     pub concurrency: usize,
     pub backoff: BackoffPolicy,
     pub breaker: breaker::BreakerPolicy,
+    /// M7 (SPEC §6.3): signing config for the approval links email prompts carry.
+    /// `None` (the default) renders the link-less "Decide in Beacon" form — the prompt
+    /// email still names the request, it just cannot carry a deciding link.
+    pub email_link: Option<email_link::EmailLinkConfig>,
 }
 
 impl Default for WorkerConfig {
@@ -114,6 +119,7 @@ impl Default for WorkerConfig {
             concurrency: 16,
             backoff: BackoffPolicy::default(),
             breaker: breaker::BreakerPolicy::default(),
+            email_link: None,
         }
     }
 }

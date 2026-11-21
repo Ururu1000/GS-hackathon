@@ -930,6 +930,7 @@ async fn run_outage_scenario(pool: PgPool, mode: OutageMode, secs: u64) {
             cooldown: Duration::from_millis(300),
             probe_lease: Duration::from_secs(1),
         },
+        email_link: None,
     };
 
     state.set_outage("sms", mode, secs);

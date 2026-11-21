@@ -123,6 +123,7 @@ fn api_state(dir: Directory) -> ApiState {
         registry: ActionRegistry::default(),
         alert_ops: Arc::new(SqlAlertOps),
         reply_secret: None,
+        email_link: None,
     }
 }
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use rand::Rng;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
@@ -13,7 +14,8 @@ use uuid::Uuid;
 use crate::breaker::{self, Gate};
 use crate::channel::email::mask_emails_in_text;
 use crate::channel::gateway_client::MAX_RETRY_AFTER;
-use crate::channel::{AlertView, Channel, Receipt, SendError};
+use crate::channel::{AlertView, Channel, OutboundMessage, Receipt, SendError};
+use crate::email_link::EmailLinkConfig;
 use crate::model::{AlertStatus, DeliveryJob, JobStatus};
 use crate::{BackoffPolicy, Shutdown, WorkerConfig};
 
@@ -488,6 +490,100 @@ fn digest_alert_view(
     }
 }
 
+/// Render the M7 approval-prompt email for one job (SPEC §6.3): subject
+/// `Approval needed: <action> on <alert title>` (the action's name is the label the
+/// delivery side has — the approvals row freezes the name, not the runbook's display
+/// label), plain-text body naming the action, the step, the alert, the team and the
+/// expiry time, then the decision pointer:
+/// - `link_cfg` configured: `Review and decide: <link>` plus a line saying the link works
+///   once and expires at the request's expiry. The link is [`crate::email_link::link`]
+///   for THIS job's recipient with `exp` = the approval's `expires_at`, read here at
+///   render time — never logged.
+/// - no config: the link-less `Decide in Beacon` line only (the signed-link endpoint is
+///   disabled anyway; no UI base URL is configured on this path to point at).
+///
+/// `None` when the approval is no longer actionable at render time (decided, expired or
+/// gone): the caller then sends the channel's plain alert form — the same degradation a
+/// scrubbed SMS prompt gets, whose codeless approval object renders as a normal page.
+pub async fn render_approval_email(
+    pool: &PgPool,
+    link_cfg: Option<&EmailLinkConfig>,
+    alert: &AlertView,
+    job: &DeliveryJob,
+) -> Result<Option<OutboundMessage>, sqlx::Error> {
+    let approval = job.route_info.get("approval").filter(|a| a.is_object());
+    let id: Option<Uuid> = approval
+        .and_then(|a| a.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse().ok());
+    let Some(approval_id) = id else {
+        return Ok(None);
+    };
+    let action = approval
+        .and_then(|a| a.get("action"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("action");
+    let step_id = approval
+        .and_then(|a| a.get("step_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // State, expiry and the alert's team as they are NOW: the prompt must die with the
+    // approval, and the link's `e` parameter is this row's real `expires_at`.
+    let row: Option<(String, DateTime<Utc>, Option<String>)> = sqlx::query_as(
+        "SELECT ap.state, ap.expires_at, al.team \
+         FROM approvals ap LEFT JOIN alerts al ON al.id = ap.alert_id \
+         WHERE ap.id = $1",
+    )
+    .bind(approval_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((state, expires_at, team)) = row else {
+        return Ok(None);
+    };
+    if state != "pending" {
+        return Ok(None);
+    }
+    let expires_at_str = expires_at.to_rfc3339();
+    let mut body = format!(
+        "Your approval is needed.\n\n\
+         Action: {action}\n\
+         Step: {step_id}\n\
+         Alert: {} ({})\n\
+         Team: {}\n\
+         This request expires at {expires_at_str}.\n\n",
+        alert.title,
+        alert.id,
+        team.as_deref().unwrap_or("unknown"),
+    );
+    match link_cfg {
+        Some(cfg) => {
+            let link = crate::email_link::link(
+                cfg,
+                approval_id,
+                &job.recipient_id,
+                expires_at.timestamp(),
+            );
+            body.push_str(&format!(
+                "Review and decide: {link}\n\
+                 The link works once and expires at {expires_at_str}.\n"
+            ));
+        }
+        // No signing config: the email names the request but cannot carry a deciding
+        // link (the endpoint 404s without one either), so it just points at the UI —
+        // and no UI base URL is configured on this path to name.
+        None => body.push_str("Decide in Beacon: open the Beacon UI to review this alert.\n"),
+    }
+    Ok(Some(OutboundMessage {
+        job_id: job.id,
+        alert_id: job.alert_id,
+        recipient_id: job.recipient_id.clone(),
+        address: job.address.clone(),
+        severity: alert.severity.clone(),
+        subject: format!("Approval needed: {action} on {}", alert.title),
+        body,
+    }))
+}
+
 async fn process_job(
     pool: &PgPool,
     channel: &dyn Channel,
@@ -563,7 +659,19 @@ async fn process_job(
             },
         );
     }
-    let msg = channel.render(&alert, &job);
+    // M7 (SPEC §6.3): an email approval prompt renders its own subject/body — with the
+    // signed link when `cfg.email_link` is configured — but only while the approval is
+    // still pending; a decided, expired or gone approval degrades to the channel's plain
+    // form, exactly like a scrubbed SMS prompt renders as a normal page. SMS prompts
+    // keep rendering through the channel (`GatewayChannel::render` handles them).
+    let msg = if channel.name() == "email" && is_prompt {
+        match render_approval_email(pool, cfg.email_link.as_ref(), &alert, &job).await? {
+            Some(msg) => msg,
+            None => channel.render(&alert, &job),
+        }
+    } else {
+        channel.render(&alert, &job)
+    };
     match channel.send(&msg).await {
         Ok(receipt) => {
             let finalized = finalize_sent(pool, job.id, token, &receipt).await?;
