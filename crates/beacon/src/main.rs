@@ -214,14 +214,17 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Matcher => {
-                let snapshot = std::sync::Arc::new(
-                    beacon_core::load_config_dir(&config_dir)
-                        .with_context(|| format!("loading rules and schemas from {}", config_dir.display()))?,
-                );
+                // Rules come from Postgres (seeded from config/rules on first
+                // start) and reload live on every API edit.
+                beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
+                let snapshot = beacon_engine::config_store::watch_config(pool.clone(), config_dir.clone())
+                    .await
+                    .with_context(|| format!("loading rules and schemas ({})", config_dir.display()))?;
+                let samples = beacon_engine::matcher::SampleSink::start(pool.clone());
                 for _ in 0..workers("MATCHER_WORKERS", "2")? {
-                    let (kafka, snapshot, rx) = (kafka.clone(), snapshot.clone(), shutdown_rx.clone());
+                    let (kafka, snapshot, samples, rx) = (kafka.clone(), snapshot.clone(), samples.clone(), shutdown_rx.clone());
                     tasks.spawn(supervise("matcher", rx.clone(), move || {
-                        beacon_engine::matcher::run_matcher(kafka.clone(), snapshot.clone(), rx.clone())
+                        beacon_engine::matcher::run_matcher(kafka.clone(), snapshot.clone(), Some(samples.clone()), rx.clone())
                     }));
                 }
             }
@@ -246,8 +249,17 @@ async fn main() -> Result<()> {
                     .map(PathBuf::from)
                     .ok()
                     .or_else(|| Some(PathBuf::from("ui/dist")).filter(|p| p.join("index.html").exists()));
-                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session };
-                let app = beacon_api::router(state, ui_dir.clone());
+                beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
+                let schemas = std::sync::Arc::new(beacon_engine::config_store::load_schemas(&config_dir)?);
+                let sources = std::sync::Arc::new(beacon_ingest::kafka_source::load_sources(&config_dir.join("sources"))?);
+                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, schemas, sources };
+                // Same-origin ingest for the UI's sample replay (CSRF-gated).
+                let same_origin_ingest = {
+                    let publisher = beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
+                    let max_inflight = workers("INGEST_MAX_INFLIGHT", "20000")?;
+                    beacon_ingest::http::ingest_routes(beacon_ingest::http::IngestState::new(publisher, max_inflight))
+                };
+                let app = beacon_api::router_with(state, ui_dir.clone(), Some(same_origin_ingest));
                 let listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("binding {addr}"))?;

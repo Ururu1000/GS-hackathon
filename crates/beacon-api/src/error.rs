@@ -11,6 +11,8 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub current: Option<Value>,
+    /// `422 invalid`: `[{path, message}]`.
+    pub details: Option<Value>,
 }
 
 impl ApiError {
@@ -20,6 +22,7 @@ impl ApiError {
             code,
             message: message.into(),
             current: None,
+            details: None,
         }
     }
 
@@ -41,6 +44,7 @@ impl ApiError {
             code,
             message: message.into(),
             current: Some(current),
+            details: None,
         }
     }
 }
@@ -63,6 +67,9 @@ impl IntoResponse for ApiError {
         let mut body = json!({"error": {"code": self.code, "message": self.message}});
         if let Some(c) = self.current {
             body["error"]["current"] = c;
+        }
+        if let Some(d) = self.details {
+            body["error"]["details"] = d;
         }
         (self.status, Json(body)).into_response()
     }

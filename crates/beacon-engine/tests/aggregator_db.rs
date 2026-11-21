@@ -160,3 +160,19 @@ async fn shared_transitions_for_delivery(pool: PgPool) {
     let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE kind = 'alert_update'").fetch_one(&pool).await.unwrap();
     assert_eq!(updates, 1 + 3, "aggregator + touch + ack + resolve");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rules_reload_live(pool: PgPool) {
+    use beacon_engine::config_store::{create, seed_from_yaml, watch_config};
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config");
+    seed_from_yaml(&pool, &dir).await.unwrap();
+    let mut rx = watch_config(pool.clone(), dir).await.unwrap();
+    assert_eq!(rx.borrow().rules.len(), 4);
+    let rule = serde_json::json!({"id": "disk-full", "team": "infra", "when": {"path": "raw.used_pct", "op": "gte", "value": 95},
+        "route": [{"to": "team:infra"}], "present": {"title": "Disk full"}});
+    create(&pool, &rule, "user:test").await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx.wait_for(|s| s.rules.len() == 5)).await.unwrap().unwrap();
+    let ev = beacon_core::Event::new("e".into(), "http:x".into(), serde_json::json!({"used_pct": 97}));
+    let (_, m, _) = rx.borrow().process(ev);
+    assert_eq!(m[0].rule_id, "disk-full", "the new rule matches without a restart");
+}

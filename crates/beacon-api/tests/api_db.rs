@@ -47,7 +47,8 @@ fn harness(pool: PgPool) -> Harness {
     let (updates, _) = broadcast::channel(64);
     let (ready_tx, ready) = watch::channel(true);
     let csrf = session.csrf_token.clone();
-    let state = ApiState { pool, updates: updates.clone(), ready, session };
+    let schemas = Arc::new(beacon_engine::config_store::load_schemas(&root().join("config")).unwrap());
+    let state = ApiState { pool, updates: updates.clone(), ready, session, schemas, sources: Arc::new(vec![]) };
     Harness { app: router(state, None), updates, ready: ready_tx, csrf }
 }
 
@@ -264,4 +265,122 @@ async fn stream_snapshot_then_newer_upserts_only(pool: PgPool) {
     })
     .await;
     assert_eq!(end, Ok(true), "stream must end when the feed is not ready");
+}
+
+async fn send(app: &Router, method: &str, uri: &str, csrf: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let r = Request::builder().method(method).uri(uri).header("content-type", "application/json").header("x-csrf-token", csrf);
+    let res = app.clone().oneshot(r.body(body.map_or(Body::empty(), |b| Body::from(b.to_string()))).unwrap()).await.unwrap();
+    let s = res.status();
+    let b = res.into_body().collect().await.unwrap().to_bytes();
+    (s, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rules_crud_with_revisions(pool: PgPool) {
+    let seeded = beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
+    assert_eq!(seeded, 4);
+    let h = harness(pool.clone());
+    let (s, v) = get(&h.app, "/api/rules").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["items"].as_array().unwrap().len(), 4);
+    assert_eq!(v["items"][0]["stats"]["hourly"].as_array().unwrap().len(), 24);
+    assert_eq!(v["items"][0]["updated_by"], json!("config"));
+
+    let rule = json!({"id": "disk-full", "team": "settlements", "when": {"path": "raw.used_pct", "op": "gte", "value": 95},
+        "route": [{"to": "team:settlements"}], "present": {"title": "Disk {{ raw.mount }} full"}});
+    let (s, created) = send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": rule}))).await;
+    assert_eq!((s, created["revision"].as_i64()), (StatusCode::CREATED, Some(1)));
+    assert_eq!(created["updated_by"], json!("user:anna"));
+    let (s, e) = send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": rule}))).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("revision_conflict")));
+
+    let mut bad = rule.clone();
+    bad["route"] = json!([]);
+    let (s, e) = send(&h.app, "PUT", "/api/rules/disk-full", &h.csrf, Some(json!({"rule": bad, "expected_revision": 1}))).await;
+    assert_eq!((s, e["error"]["code"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid")));
+    assert_eq!(e["error"]["details"][0]["path"], json!("route"));
+
+    let mut v2 = rule.clone();
+    v2["present"]["title"] = json!("Disk almost full");
+    let (s, u) = send(&h.app, "PUT", "/api/rules/disk-full", &h.csrf, Some(json!({"rule": v2, "expected_revision": 1}))).await;
+    assert_eq!((s, u["revision"].as_i64()), (StatusCode::OK, Some(2)));
+    let (s, e) = send(&h.app, "PUT", "/api/rules/disk-full", &h.csrf, Some(json!({"rule": v2, "expected_revision": 1}))).await;
+    assert_eq!((s, e["error"]["current"]["revision"].as_i64()), (StatusCode::CONFLICT, Some(2)));
+
+    let (s, _) = send(&h.app, "DELETE", "/api/rules/disk-full?expected_revision=2", &h.csrf, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(get(&h.app, "/api/rules/disk-full").await.0, StatusCode::NOT_FOUND);
+    let (s, again) = send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": rule}))).await;
+    assert_eq!((s, again["revision"].as_i64()), (StatusCode::CREATED, Some(3)), "recreated rule continues the revision");
+
+    // CSRF and team ownership.
+    assert_eq!(send(&h.app, "POST", "/api/rules", "wrong", Some(json!({"rule": rule}))).await.0, StatusCode::FORBIDDEN);
+    let mut foreign = rule.clone();
+    foreign["id"] = json!("foreign");
+    foreign["team"] = json!("not-a-team");
+    assert_eq!(send(&h.app, "POST", "/api/rules", &h.csrf, Some(json!({"rule": foreign}))).await.0, StatusCode::FORBIDDEN);
+
+    let rev: i64 = sqlx::query_scalar("SELECT revision FROM config_state WHERE key = 'rules'").fetch_one(&pool).await.unwrap();
+    assert_eq!(rev, 4 + 4, "4 seeds + create, update, delete, recreate");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rule_test_panel_and_discovery(pool: PgPool) {
+    let h = harness(pool.clone());
+    let rule = json!({"id": "disk-full", "team": "settlements", "when": {"all": [{"path": "raw.event_kind", "op": "eq", "value": "disk_full"}, {"path": "raw.used_pct", "op": "gte", "value": 95}]},
+        "route": [{"to": "team:settlements"}], "present": {"title": "Disk {{ raw.mount }} on {{ raw.host }}"}});
+    let event: Value = serde_json::from_str(&std::fs::read_to_string(root().join("samples/events/unknown-shape.json")).unwrap()).unwrap();
+    let (s, r) = send(&h.app, "POST", "/api/rules/test", &h.csrf, Some(json!({"rule": rule, "event": event}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(r["matched"], json!(true));
+    assert!(r["schema"].as_str().unwrap().starts_with("unknown:"));
+    assert_eq!(r["card"]["title"], json!("Disk /var/data on batch-07"));
+    assert!(r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("No schema mapping")));
+    let big = json!({"rule": rule, "event": {"x": "y".repeat(300 * 1024)}});
+    assert_eq!(send(&h.app, "POST", "/api/rules/test", &h.csrf, Some(big)).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+    sqlx::query("INSERT INTO event_samples (event_id, source, schema, received_at, raw) VALUES ('e1', 'http:judges', 'unknown:abc', now(), $1)")
+        .bind(&event)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, d) = get(&h.app, "/api/schemas/discovered").await;
+    assert_eq!((d[0]["schema"].as_str(), d[0]["count"].as_i64()), (Some("unknown:abc"), Some(1)));
+    assert_eq!(d[0]["sample"]["host"], json!("batch-07"));
+    let (_, r) = get(&h.app, "/api/events/recent?limit=5").await;
+    assert_eq!(r["items"][0]["source"], json!("http:judges"));
+    let (_, s) = get(&h.app, "/api/sources").await;
+    assert_eq!(s[0]["kind"], json!("http"));
+    let (_, sc) = get(&h.app, "/api/schemas").await;
+    assert!(sc.as_array().unwrap().iter().any(|x| x["spec"]["schema"] == json!("prometheus.alert")));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_creates_of_one_id_conflict(pool: PgPool) {
+    let rule = json!({"id": "race", "team": "rates", "when": {"path": "raw.x", "op": "exists"},
+        "route": [{"to": "team:rates"}], "present": {"title": "t"}});
+    for _ in 0..10 {
+        let (a, b) = tokio::join!(
+            beacon_engine::config_store::create(&pool, &rule, "user:a"),
+            beacon_engine::config_store::create(&pool, &rule, "user:b")
+        );
+        let ok = [a.unwrap().is_ok(), b.unwrap().is_ok()].iter().filter(|x| **x).count();
+        assert_eq!(ok, 1, "exactly one create of the same id wins");
+        let cur = beacon_engine::config_store::get(&pool, "race").await.unwrap().unwrap();
+        beacon_engine::config_store::delete(&pool, "race", cur.revision, "user:a").await.unwrap().unwrap();
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn same_origin_ingest_needs_csrf(pool: PgPool) {
+    let session = Arc::new(Session::demo(&root().join("config"), "anna").unwrap());
+    let (updates, _) = broadcast::channel(8);
+    let (_r, ready) = watch::channel(true);
+    let csrf = session.csrf_token.clone();
+    let state = ApiState { pool, updates, ready, session, schemas: Arc::new(vec![]), sources: Arc::new(vec![]) };
+    let ingest = Router::new().route("/ingest/{source}", axum::routing::post(|| async { (StatusCode::ACCEPTED, "{\"id\":\"x\"}") }));
+    let app = beacon_api::router_with(state, None, Some(ingest));
+    assert_eq!(post(&app, "/ingest/demo", None, json!({})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post(&app, "/ingest/demo", Some(&csrf), json!({})).await.0, StatusCode::ACCEPTED);
+    assert_eq!(get(&app, "/ready").await.0, StatusCode::OK, "no route clash with the API's /ready");
 }

@@ -24,14 +24,21 @@ pub const GROUP: &str = "beacon-matcher";
 const FLUSH_EVERY: usize = 2000;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 
+/// `config` is live: rule edits published through the API arrive here without
+/// a restart (see `config_store::watch_config`). `samples`, when given,
+/// receives a few recent events per schema for the test panel and discovery.
 pub async fn run_matcher(
     bootstrap: String,
-    config: Arc<ConfigSnapshot>,
+    config: watch::Receiver<Arc<ConfigSnapshot>>,
+    samples: Option<SampleSink>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let consumer = kafka::consumer(&bootstrap, GROUP, &[EVENTS_RAW], true)?;
     let producer = kafka::producer(&bootstrap)?;
-    info!(rules = config.rules.len(), schemas = config.mappings.len(), "matcher started");
+    {
+        let c = config.borrow();
+        info!(revision = c.revision, rules = c.rules.len(), schemas = c.mappings.len(), "matcher started");
+    }
 
     let mut pending: Vec<DeliveryFuture> = Vec::new();
     let mut offsets: HashMap<i32, i64> = HashMap::new();
@@ -59,7 +66,11 @@ pub async fn run_matcher(
                 offsets.insert(m.partition(), m.offset());
                 match m.payload().map(serde_json::from_slice::<Event>) {
                     Some(Ok(event)) => {
-                        let (_, matches, diags) = config.process(event);
+                        let snapshot = config.borrow().clone();
+                        let (event, matches, diags) = snapshot.process(event);
+                        if let Some(s) = &samples {
+                            s.offer(&event);
+                        }
                         if !diags.is_empty() {
                             debug!(?diags, "mapping diagnostics");
                         }
@@ -83,6 +94,103 @@ pub async fn run_matcher(
     flush(&consumer, &mut pending, &mut offsets).await?;
     let _ = consumer.commit_consumer_state(CommitMode::Sync);
     Ok(())
+}
+
+/// Rate-limited, lossy sampling of recent events into `event_samples`: at most
+/// one event per schema every [`SAMPLE_EVERY`], written off the hot path.
+#[derive(Clone)]
+pub struct SampleSink {
+    tx: tokio::sync::mpsc::Sender<Event>,
+    last: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+}
+
+pub const SAMPLE_EVERY: Duration = Duration::from_secs(2);
+const MAX_TRACKED_SCHEMAS: usize = 10_000;
+
+/// Samples are shown in the UI, so values under secret-looking keys are masked.
+fn redact(v: serde_json::Value) -> serde_json::Value {
+    const SECRET: &[&str] = &["password", "passwd", "secret", "token", "authorization", "api_key", "apikey", "cookie", "private_key", "credential"];
+    match v {
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.into_iter()
+                .map(|(k, v)| {
+                    let lk = k.to_ascii_lowercase();
+                    if SECRET.iter().any(|s| lk.contains(s)) { (k, serde_json::Value::String("[redacted]".into())) } else { (k, redact(v)) }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(redact).collect()),
+        other => other,
+    }
+}
+const SAMPLES_KEPT: i64 = 2000;
+
+impl SampleSink {
+    /// Spawn the writer task.
+    pub fn start(pool: sqlx::PgPool) -> SampleSink {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(256);
+        tokio::spawn(async move {
+            let mut since_prune = 0usize;
+            while let Some(e) = rx.recv().await {
+                let raw = beacon_core::matcher::bounded_to(redact(e.raw), beacon_core::model::MAX_NOTIFY_RAW);
+                let fields = beacon_core::matcher::bounded_to(serde_json::Value::Object(e.fields), 4096);
+                let res = sqlx::query(
+                    "INSERT INTO event_samples (event_id, source, schema, received_at, fields, raw) VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(&e.id)
+                .bind(&e.source)
+                .bind(&e.schema)
+                .bind(e.ingested_at)
+                .bind(strip_nul(fields))
+                .bind(strip_nul(raw))
+                .execute(&pool)
+                .await;
+                if let Err(err) = res {
+                    warn!(error = %err, "event sample not stored");
+                }
+                since_prune += 1;
+                if since_prune >= 100 {
+                    since_prune = 0;
+                    let _ = sqlx::query("DELETE FROM event_samples WHERE id < (SELECT max(id) FROM event_samples) - $1")
+                        .bind(SAMPLES_KEPT)
+                        .execute(&pool)
+                        .await;
+                }
+            }
+        });
+        SampleSink { tx, last: Default::default() }
+    }
+
+    pub fn offer(&self, e: &Event) {
+        let now = Instant::now();
+        {
+            let mut last = self.last.lock().unwrap();
+            if last.get(&e.schema).is_some_and(|t| now.duration_since(*t) < SAMPLE_EVERY) {
+                return;
+            }
+            // Senders control unknown shapes, so the map is capped: past the
+            // cap, stale entries are dropped (worst case: a few extra samples).
+            if last.len() >= MAX_TRACKED_SCHEMAS {
+                last.retain(|_, t| now.duration_since(*t) < SAMPLE_EVERY);
+                if last.len() >= MAX_TRACKED_SCHEMAS {
+                    return;
+                }
+            }
+            last.insert(e.schema.clone(), now);
+        }
+        // Lossy by design: never block matching on sample storage.
+        let _ = self.tx.try_send(e.clone());
+    }
+}
+
+/// Postgres jsonb rejects \u0000; samples are display-only, so drop NULs.
+fn strip_nul(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => serde_json::Value::String(s.replace('\0', "")),
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(strip_nul).collect()),
+        serde_json::Value::Object(o) => serde_json::Value::Object(o.into_iter().map(|(k, v)| (k.replace('\0', ""), strip_nul(v))).collect()),
+        other => other,
+    }
 }
 
 /// Stay well under the broker's 1 MiB record limit, including JSON escaping.
