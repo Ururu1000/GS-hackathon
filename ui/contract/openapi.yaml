@@ -452,6 +452,19 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Error' }
+  /api/runbooks/{id}:
+    get:
+      operationId: getRunbook
+      summary: A runbook's current revision as templates (for post-incident diffs against an alert's frozen copy)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunbookDetail' }
+        '404': { $ref: '#/components/responses/Error' }
   /api/runbooks/import:
     post:
       operationId: previewRunbookImport
@@ -832,6 +845,32 @@ components:
         format: { type: string, examples: [yaml, markdown, link, text] }
         team: { type: [string, 'null'] }
         steps: { type: integer, minimum: 0, description: Number of steps }
+        revision: { type: integer, minimum: 1, description: Current published revision }
+    RunbookDetail:
+      type: object
+      required: [id, revision, title, format, team, steps]
+      properties:
+        id: { type: string }
+        revision: { type: integer, minimum: 1 }
+        title: { type: string }
+        format: { type: string, examples: [yaml, markdown, link, text] }
+        team: { type: [string, 'null'] }
+        steps:
+          type: array
+          items:
+            type: object
+            required: [id, kind, text, action, approval]
+            properties:
+              id: { type: string, description: Stable across revisions }
+              kind: { type: string, enum: [manual, condition, action] }
+              text: { type: string, description: 'Template, not rendered (an alert''s frozen copy has `{{…}}` filled in)' }
+              action:
+                oneOf:
+                  - type: object
+                    required: [name, label]
+                    properties: { name: { type: string }, label: { type: string } }
+                  - type: 'null'
+              approval: { type: string, enum: [none, required], description: Effective value (required for high-risk actions) }
     SimulatorMessage:
       type: object
       required: [id, receipt_id, job_id, alert_id, channel, recipient, to, text, approval_challenge, duplicates, received_at]
