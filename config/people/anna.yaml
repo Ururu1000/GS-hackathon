@@ -1,0 +1,11 @@
+user: anna
+name: Anna Example
+contact: { email: anna@example.test, phone: "+44 7700 900123" }
+preferences:                                # first match wins
+  - match: { severity: critical, service: payments-api }
+    channels: [sms]
+    when: { between: "08:00-20:00", tz: Europe/London }    # half-open [08:00, 20:00)
+    otherwise: [email]
+  - match: { severity: warning }
+    channels: [email]
+  - default: [ui]

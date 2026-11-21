@@ -1,0 +1,23 @@
+[package]
+name = "beacon-delivery"
+description = "Delivery: router (outbox -> delivery_jobs), channel workers, email via lettre"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+sqlx.workspace = true
+lettre.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
