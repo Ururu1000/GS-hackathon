@@ -3,7 +3,8 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # ci-run/* branches run CI on any commit without opening a PR.
+    branches: [main, "ci-run/**"]
   workflow_dispatch:
 
 permissions:
