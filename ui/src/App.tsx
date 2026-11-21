@@ -1,4 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { countPendingProposals, errorText, getAlert, getSession, listDirectory, transition, type TransitionOp } from './api/client'
 import type { DiscoveredSchema } from './api/screens'
 import type { FeedAlert, PersonDirectoryEntry, Session } from './api/types'
@@ -64,6 +65,23 @@ function loadTheme(): ThemePref {
   }
 }
 
+// Change the theme so the whole page moves together. Element transitions are
+// suppressed for the swap (otherwise buttons fade at their own 110–120ms while
+// the body background snaps), and where View Transitions exist the old and new
+// pages cross-fade as one snapshot.
+function switchTheme(apply: () => void) {
+  const root = document.documentElement
+  const swap = () => {
+    root.classList.add('theme-switching')
+    flushSync(apply)
+    void root.offsetHeight // commit the new colours while transitions are off
+    root.classList.remove('theme-switching')
+  }
+  const reduceMotion = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
+  if (typeof document.startViewTransition === 'function' && !reduceMotion) document.startViewTransition(swap)
+  else swap()
+}
+
 function useTheme(): ['light' | 'dark', () => void] {
   const [pref, setPref] = useState<ThemePref>(loadTheme)
   const [systemDark, setSystemDark] = useState(() =>
@@ -73,14 +91,14 @@ function useTheme(): ['light' | 'dark', () => void] {
   useEffect(() => {
     if (typeof matchMedia !== 'function') return
     const mq = matchMedia('(prefers-color-scheme: dark)')
-    const on = () => setSystemDark(mq.matches)
+    const on = () => switchTheme(() => setSystemDark(mq.matches))
     mq.addEventListener('change', on)
     return () => mq.removeEventListener('change', on)
   }, [])
 
   const resolved: 'light' | 'dark' = pref === 'system' ? (systemDark ? 'dark' : 'light') : pref
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = document.documentElement
     if (pref === 'system') delete root.dataset.theme
     else root.dataset.theme = pref
@@ -95,7 +113,7 @@ function useTheme(): ['light' | 'dark', () => void] {
   // Flipping to the theme the OS already uses drops the override, so "system" is reachable again.
   const toggle = useCallback(() => {
     const next = resolved === 'dark' ? 'light' : 'dark'
-    setPref(next === (systemDark ? 'dark' : 'light') ? 'system' : next)
+    switchTheme(() => setPref(next === (systemDark ? 'dark' : 'light') ? 'system' : next))
   }, [resolved, systemDark])
 
   return [resolved, toggle]
