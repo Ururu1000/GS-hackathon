@@ -2,10 +2,13 @@
 //! `GET /api/teams` — shapes per ui/contract/openapi.yaml v0.2.0, redaction of other
 //! users' contact details and preferences, and the lead/admin `can_edit` rules.
 //!
-//! Needs NO Postgres: the routes only read the in-memory `Directory`, so the pool is a
-//! lazy `PgPool` pointed at a port nothing listens on, and the router is driven
-//! in-process with `tower::ServiceExt::oneshot` (the middleware layer inserting the
-//! `Actor` / `Admin` extensions stands in for beacon-api's session layer).
+//! Needs NO Postgres: the views read the router's effective directory, whose override
+//! stamp query fails fast against the pool below (a lazy `PgPool` pointed at a port
+//! nothing listens on, with a short acquire timeout) and falls back to the startup
+//! base — exactly the "never fail a read because of an override" path. With no
+//! overrides to apply, every view equals the base one (revisions all 1). The router is
+//! driven in-process with `tower::ServiceExt::oneshot` (the middleware layer inserting
+//! the `Actor` / `Admin` extensions stands in for beacon-api's session layer).
 //!
 //! Run: `cargo test -p beacon-delivery --test people_api`
 
@@ -107,10 +110,13 @@ fn fixture_dir() -> Directory {
     dir
 }
 
-/// An `ApiState` that never touches Postgres (a lazy pool pointed at a dead port).
+/// An `ApiState` that never touches Postgres: a lazy pool pointed at a dead port, with
+/// a short acquire timeout so the effective directory's stamp query fails (and falls
+/// back to the base) in milliseconds instead of sqlx's 30 s default.
 fn api_state(dir: Directory) -> ApiState {
     ApiState {
         pool: sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(250))
             .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .unwrap(),
         dir: Arc::new(dir),

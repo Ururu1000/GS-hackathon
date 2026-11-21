@@ -338,8 +338,13 @@ fn team_for_target<'a>(
 
 /// Loop `route_once` until shutdown. Polls again immediately after a full batch, otherwise
 /// sleeps `cfg.poll_interval`. Logs and backs off on DB errors instead of exiting.
+///
+/// The startup directory is wrapped in an [`crate::overrides::EffectiveDirectory`] and
+/// re-read (one cheap stamp query) every pass, so a saved preference or team change
+/// applies to the next notification.
 pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, shutdown: Shutdown) {
     let mut shutdown = shutdown;
+    let effective = Arc::new(crate::overrides::EffectiveDirectory::new(dir));
     while !*shutdown.borrow() {
         // Throttle digests ride along with routing: cheap when nothing is parked.
         match throttle::digest_once(&pool, 100).await {
@@ -347,6 +352,7 @@ pub async fn run_router(pool: PgPool, dir: Arc<Directory>, cfg: RouterConfig, sh
             Ok(_) => {}
             Err(err) => error!(%err, "throttle digest pass failed"),
         }
+        let dir = effective.get(&pool).await;
         let wait = match route_once(&pool, &dir, &cfg).await {
             Ok(stats) => {
                 if stats != RouteStats::default() {
