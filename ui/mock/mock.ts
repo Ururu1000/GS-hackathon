@@ -531,7 +531,11 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         if (e instanceof BodyTooLargeError) return err(res, 413, 'bad_request', e.message)
         return err(res, 400, 'bad_request', 'Body is not JSON')
       }
-      fn(b ?? {})
+      try {
+        fn(b ?? {})
+      } catch (e) {
+        err(res, 500, 'internal', `Mock error: ${(e as Error).message}`)
+      }
     })()
     return true
   }
@@ -716,7 +720,7 @@ export function createMock({ demoUserId = 'erop' }: { demoUserId?: string } = {}
         const problems = validateRule(b.rule)
         if (problems.length) return err(res, 422, 'invalid', 'The rule has problems', { details: problems })
         if (!isTeamMember(b.rule.team)) return err(res, 403, 'forbidden', `Only members of team "${b.rule.team}" can create rules for it`)
-        if (rules.has(b.rule.id)) return err(res, 409, 'revision_conflict', `A rule with id "${b.rule.id}" already exists`, { current: ruleItem(rules.get(b.rule.id)!) })
+        if (rules.has(b.rule.id)) return err(res, 409, 'already_exists', `A rule with id "${b.rule.id}" already exists`, { details: [{ path: 'id', message: 'another rule already uses this ID' }] })
         const revision = (deletedRuleRevisions.get(b.rule.id) ?? 0) + 1
         const rec: RuleRec = { rule: clone(b.rule), revision, updated_at: new Date().toISOString(), updated_by: ME, fires: new Map() }
         rules.set(b.rule.id, rec)

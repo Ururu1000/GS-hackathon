@@ -301,7 +301,7 @@ export const TEMPLATES: RuleTemplate[] = [
     description: 'A workflow or job failed in production.',
     sample: 'workflow-failed',
     make: (team) => ({
-      id: `${team}-workflow-failed`,
+      id: `${team}-workflow-failed-prod`,
       name: 'Workflow failed (prod)',
       team,
       enabled: true,

@@ -161,7 +161,7 @@ export function RuleEditor({ id, from, team, onNavigate, onDirtyChange, onToast 
       if (isConflict(e) && e.body?.error.code === 'revision_conflict' && e.body.error.current) setConflict(e.body.error.current as RuleItem)
       else if (e instanceof HttpError && e.body?.error.details) {
         setSaveProblems(e.body.error.details)
-        onToast('error', 'The rule has problems; they’re marked below.')
+        onToast('error', `The rule has problems: ${e.body.error.details.map((d) => `${d.path}: ${d.message}`).join('; ')}`)
       } else onToast('error', errorText(e))
     } finally {
       setSaving(false)

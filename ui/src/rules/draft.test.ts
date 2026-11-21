@@ -78,6 +78,15 @@ describe('YAML', () => {
     const r = fromYaml('id: x\nteam: y\n')
     expect(r.ok === false && r.message).toContain('when')
   })
+
+  it('keeps half-typed shapes out of the draft', () => {
+    const base = 'id: x\nteam: y\nroute: [{ to: "team:y" }]\npresent: { title: t }\n'
+    expect(fromYaml(`${base}when:\n`).ok).toBe(false)
+    expect(fromYaml(`${base}when:\n  all:\n    - \n`).ok).toBe(false)
+    expect(fromYaml(base.replace('present: { title: t }', 'present: { title: t, fields: raw.a }') + 'when: { all: [] }\n').ok).toBe(false)
+    expect(fromYaml(`${base}when: { all: [] }\ndedup: { key: , window: 10m }\n`).ok).toBe(false)
+    expect(fromYaml(`${base}when: { all: [] }\n`).ok).toBe(true)
+  })
 })
 
 describe('diff', () => {
