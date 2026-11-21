@@ -88,8 +88,21 @@ All measured on one laptop with `docker compose`, debug build.
 | Escalation (4 s override) | unacked alert: carol (next on call) paged by phone + SMS; acked alert: timer cancelled, nobody else paged |
 | Throttle `{max: 2, per: 1m}`, 5 trades | 2 emails per person, 3 held back, then one digest each: "3 more alert(s) … were held back by throttling" |
 | Settlement-timeout runbook (SPEC M5) | health check ok → `retry_workflow` fails twice → `escalate` unlocks → approval SMS to carol → her `Y <code>` approves → `counterparty-support` (gina) emailed with the runbook steps; full audit timeline; no approval code left at rest |
+| **Ingest → delivery latency** (SPEC §9, M6), `./scripts/demo_latency.sh --events 200 --rate 20` | to be measured |
 
 Run the settlement-timeout flow by hand against the stack above. The mock workflow engine is set to fail with `POST :8070/api/simulator/mock {"target":"workflows","mode":"fail"}` plus the gateway token. Post `samples/events/workflow-failed.json` to `:8090/ingest/webhook`, then run the steps with `POST :8071/api/alerts/<id>/steps/<s1|s2|s3>/run`, and answer the approval SMS through `POST :8070/api/simulator/reply`.
+
+### Measuring ingest → delivery latency
+
+`./scripts/demo_latency.sh` (SPEC §9, M6, runs `beacon-delivery/examples/latency_bench.rs`) drives the running stack with an **open-loop** load: it posts unique `workflow-failed` (→ `oncall:settlements-primary`, phone + sms through the fake gateway) and `trade-rejected` (→ `team:rates`, email through Mailpit) sample events on a fixed schedule — never waiting for a response before the next send — and reports count/p50/p90/p99/max in ms (nearest-rank percentiles) per metric:
+
+- **ingest → gateway receipt**: `gateway_receipts.received_at − t0` for each alert's phone and sms jobs,
+- **ingest → email receipt**: the Mailpit message `Created` time − t0, falling back to `delivery_jobs.sent_at` when the message cannot be found,
+- **the internal split**: **ingest → alert** (`alerts.first_seen − t0`) and **alert → delivered** (`sent_at − first_seen`).
+
+`t0` is the client clock just before each POST; `--warmup` events prime the caches and are excluded from the stats. The report carries its workload parameters (events, rate, mix, warmup, timestamp, git commit, host CPUs) and the command exits non-zero when any expected receipt is missing or any POST failed. CI-friendly example: `./scripts/demo_latency.sh --events 200 --rate 20`; add `--out results.json` for the same report as JSON.
+
+Caveat: gateway receipts are timestamped by Postgres and email by Mailpit, so the numbers are only valid when the client, Postgres and Mailpit share a clock (same machine / NTP-synced) — the benchmark prints that warning with every run.
 
 ## What is mocked
 
