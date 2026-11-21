@@ -14,6 +14,7 @@ pub mod config_store;
 pub mod feed;
 pub mod matcher;
 pub mod relay;
+pub mod suggest;
 
 /// Postgres channel the aggregator notifies after committing outbox rows.
 pub const OUTBOX_CHANNEL: &str = "beacon_outbox";
