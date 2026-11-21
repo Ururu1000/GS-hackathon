@@ -56,6 +56,50 @@ Demos, with `DATABASE_URL` set and infrastructure from `docker compose -f deploy
 DELIVERY_LOAD_TEST=1 cargo test -p beacon-delivery --test delivery_m0
 ```
 
+## Measured performance
+
+Everything below was measured, not estimated. Each row lists its hardware, workload and run. Every run uses a release build, with the client, Postgres, Redpanda and Mailpit on one machine so all timestamps share a clock. Percentiles are nearest-rank. Methods, caveats and the full tables are in [docs/DELIVERY.md](docs/DELIVERY.md#demos-and-measured-results).
+
+**Hardware**
+- *CI*: GitHub Actions `ubuntu-latest` (2 vCPU), [`.github/workflows/loadtest.yml`](.github/workflows/loadtest.yml).
+- *Mac*: Apple M5 Mac with 10 cores, stack via `docker compose`.
+
+### Throughput
+
+| Workload | Hardware, run | Accepted ev/s | Processed ev/s | Ingest → gateway p50 / p99 | Ingest → Mailpit p50 / p99 |
+|---|---|---:|---:|---:|---:|
+| `beacon-loadgen --rate 200 --duration 30` | *CI*, run _TBD_ (`.github/workflows/loadgen.yml`) | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `beacon-loadgen --rate 2000 --duration 30` | *CI*, run _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+
+<!-- M6: filled from loadgen run 44869239778 -->
+
+### Ingest → delivery latency
+
+The workload is `./scripts/demo_latency.sh`. It sends open-loop unique events, half routed to phone and SMS through the fake gateway and half to email through Mailpit. The figures are milliseconds from the client's POST to the gateway receipt or the Mailpit message.
+
+| Workload | Hardware, commit, run | Delivered | Gateway p50 / p90 / p99 / max | Mailpit p50 / p90 / p99 / max |
+|---|---|---|---:|---:|
+| 500 events at 50 ev/s (+20 warm-up) | *CI*, main `b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383) | 500/500, 0 missing | 952 / 1225 / 1606 / 1804 | 936 / 1204 / 1391 / 1556 |
+| 500 events at 50 ev/s (+20 warm-up) | *CI*, `9140087`, [run 44867217055](https://github.com/Ururu1000/GS-hackathon/actions/runs/44867217055) | 500/500, 0 missing | 862 / 1361 / 1751 / 1970 | 904 / 1317 / 1542 / 1578 |
+| 500 events at 50 ev/s | *Mac*, main `6f01c42` | 500/500, 0 missing | 464 / 618 / 743 / 765 | 380 / 491 / 549 / 618 |
+| 2,000 events at 200 ev/s | *Mac*, main `6f01c42` | 2000/2000, 0 missing, 0 dead | 653 / 833 / 959 / 1085 | 650 / 819 / 944 / 1030 |
+
+Client → ingest accept takes under 5 ms at p99. Nearly all of the median is in the pipeline after that: Kafka → matcher → aggregator → outbox relay → router → delivery worker → provider.
+
+### Channel outage (SPEC §9 c)
+
+The workload is `./scripts/demo_sms_outage.sh --events 50 --outage-secs 60`. The fake SMS gateway goes down for 60 s while alerts keep arriving.
+
+| Hardware, commit, run | Result |
+|---|---|
+| *CI*, main `b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383) | **PASS**: 50/50 SMS sent, 0 lost, 0 dead, 0 duplicates, at most 3 attempts per job, last SMS 1.7 s after recovery |
+| *Mac*, main `6f01c42` | **PASS**: 50/50 SMS sent, 0 lost, 0 dead, 0 duplicates, at most 3 attempts per job, last SMS 2.3 s after recovery |
+| *Mac*, main `6f01c42`, single SMS (`--events 1`), the worst case for retries | sent, 0 dead, 0 duplicates; all 8 attempts used, sent 28.8 s after recovery |
+
+Email alone sustained ~47–163 messages/s into Mailpit (1,000 emails over 8 workers, each delivered exactly once; Mailpit is the limit).
+
+**Re-run:** Actions → `loadtest` → Run workflow, or push to a `ci-run/loadtest-<name>` branch.
+
 ## Status
 
-Work in progress. Setup instructions, architecture and load-test results will be added here.
+Work in progress. Setup instructions and architecture will be added here.
