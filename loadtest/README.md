@@ -67,3 +67,18 @@ How this works:
 - **Aggregator:** it advances an epoch-fenced checkpoint in the same Postgres transaction as its alert writes, and skips anything below the checkpoint on replay.
 
 Latency percentiles in this run include the crash and the recovery, so they are not comparable with the steady-state rows above.
+
+## Exactly-once vs at-least-once at 20,000 events/s
+
+The matcher runs exactly-once by default: it uses Kafka transactions, plus the fenced aggregator checkpoints above. Each matcher worker blocks on a transaction commit every `MATCHER_TXN_FLUSH_MS` (default 50 ms), so it needs more workers to keep up.
+
+These runs used the same laptop as the first table, while another load test was running on it, so the absolute numbers are higher than in that table. Compare the rows with each other.
+
+| Mode | Matcher workers | p50 | p99 | max |
+|---|---|---|---|---|
+| At-least-once (`MATCHER_TRANSACTIONS=false`) | 4 | 165 ms | 321 ms | 487 ms |
+| **Exactly-once (default)**, 50 ms commits | 8 | 329 ms | **487 ms** | 607 ms |
+| Exactly-once, 100 ms commits | 12 | 429 ms | 673 ms | 871 ms |
+| Exactly-once, 20 ms commits | 4 | 334 ms | 2,894 ms | 3,396 ms (backlog) |
+
+The trade-off: exactly-once costs about 170 ms of p99 at this rate. Here the results are latency from intended send until the alert update, as above.

@@ -120,6 +120,9 @@ async fn run_transactional(
         info!(revision = c.revision, rules = c.rules.len(), schemas = c.mappings.len(), "matcher started (transactional)");
     }
     let mut recent = RecentIds::new(RECENT_ID_TTL, RECENT_ID_CAP);
+    // Transaction commit cadence: longer means fewer blocking commits (more
+    // throughput per worker) at the cost of a higher latency floor.
+    let txn_flush = Duration::from_millis(std::env::var("MATCHER_TXN_FLUSH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50));
     let mut offsets: HashMap<i32, i64> = HashMap::new();
     let (mut in_txn, mut in_batch, mut batch_start) = (false, 0usize, Instant::now());
     let (mut seen, mut matched, mut dupes, mut last_stats) = (0u64, 0u64, 0u64, Instant::now());
@@ -167,7 +170,7 @@ async fn run_transactional(
                 }
             }
         }
-        if in_txn && (in_batch >= FLUSH_EVERY || batch_start.elapsed() >= FLUSH_INTERVAL) {
+        if in_txn && (in_batch >= FLUSH_EVERY || batch_start.elapsed() >= txn_flush) {
             commit_txn(&consumer, &producer, &mut offsets)?;
             in_txn = false;
         }
