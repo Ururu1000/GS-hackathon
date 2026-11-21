@@ -66,6 +66,9 @@ pub struct MatchRecord {
     /// A recovery resolves every open digest with this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_key: Option<String>,
+    /// The rule's delivery settings, copied into the notify payload.
+    #[serde(default)]
+    pub policy: crate::model::NotifyPolicy,
 }
 
 /// Values copied from the event into a match (dedup key values, card fields)
@@ -521,6 +524,7 @@ impl ConfigSnapshot {
             body,
             fields,
             route: rule.spec.route.clone(),
+            policy: crate::model::NotifyPolicy::from_rule(&rule.spec),
             event_id: event.id.clone(),
             source: event.source.clone(),
             schema: event.schema.clone(),

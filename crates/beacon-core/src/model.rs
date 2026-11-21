@@ -44,6 +44,56 @@ pub struct NotifyContext {
     pub schema: Option<String>,
 }
 
+/// The matched rule revision's delivery settings (board #132), so rules edited
+/// through the API reach delivery without a restart. Delivery prefers these
+/// over its startup copy of the rule files; an absent key falls back to it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NotifyPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle: Option<NotifyThrottle>,
+    /// The rule's runbook id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runbook: Option<String>,
+}
+
+/// `throttle: {max, per}` normalised to milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyThrottle {
+    pub max: u32,
+    pub per_ms: u64,
+}
+
+impl NotifyThrottle {
+    /// From a rule's `throttle: {max: 20, per: "1m" | <seconds>}`. `None` for
+    /// a malformed value: delivery then keeps the rule file's throttle.
+    pub fn from_rule_value(v: &Value) -> Option<Self> {
+        let max = u32::try_from(v.get("max")?.as_u64()?).ok().filter(|&m| m >= 1)?;
+        let per = v.get("per")?;
+        let per_ms = if let Some(s) = per.as_str() {
+            humantime_serde::re::humantime::parse_duration(s.trim()).ok()?.as_millis()
+        } else if let Some(n) = per.as_u64() {
+            u128::from(n) * 1000
+        } else {
+            let f = per.as_f64().filter(|f| f.is_finite() && *f > 0.0)?;
+            (f * 1000.0) as u128
+        };
+        let per_ms = u64::try_from(per_ms).ok().filter(|&ms| ms > 0)?;
+        Some(Self { max, per_ms })
+    }
+}
+
+impl NotifyPolicy {
+    pub fn from_rule(rule: &crate::rule::RuleSpec) -> Self {
+        Self {
+            escalate_after_ms: rule.escalate_after.and_then(|d| u64::try_from(d.as_millis()).ok()),
+            throttle: rule.throttle.as_ref().and_then(NotifyThrottle::from_rule_value),
+            runbook: rule.runbook.clone(),
+        }
+    }
+}
+
 /// The event that opened an alert, pinned for runbook templates such as
 /// `{{workflowId}}` (board #172). `raw` is capped at [`MAX_NOTIFY_RAW`] bytes;
 /// a larger payload becomes a truncated string preview.
@@ -74,6 +124,10 @@ pub struct NotifyPayload {
     /// Opening event for explicit or team-matched runbooks, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<NotifyEvent>,
+    /// `escalate_after_ms`, `throttle`, `runbook` of the matched rule revision,
+    /// as top-level keys (absent when the rule has none).
+    #[serde(flatten)]
+    pub policy: NotifyPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

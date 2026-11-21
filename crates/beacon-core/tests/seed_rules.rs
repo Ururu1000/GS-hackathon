@@ -194,3 +194,49 @@ fn index_never_changes_results() {
         assert_eq!(indexed, exhaustive, "{name}");
     }
 }
+
+#[test]
+fn matches_carry_the_rules_delivery_policy() {
+    use beacon_core::model::{NotifyPolicy, NotifyThrottle};
+    let cfg = snapshot();
+    let (_, m) = run(&cfg, "kafka:workflows", sample("workflow-failed.json"));
+    assert_eq!(
+        m[0].policy,
+        NotifyPolicy { escalate_after_ms: Some(600_000), throttle: None, runbook: Some("settlement-timeout".into()) }
+    );
+
+    // Throttle: duration strings and plain seconds both normalise to ms; junk is dropped.
+    assert_eq!(NotifyThrottle::from_rule_value(&json!({"max": 20, "per": "1m"})), Some(NotifyThrottle { max: 20, per_ms: 60_000 }));
+    assert_eq!(NotifyThrottle::from_rule_value(&json!({"max": 3, "per": 90})), Some(NotifyThrottle { max: 3, per_ms: 90_000 }));
+    assert_eq!(NotifyThrottle::from_rule_value(&json!({"max": 0, "per": "1m"})), None);
+    assert_eq!(NotifyThrottle::from_rule_value(&json!({"max": 2, "per": "soon"})), None);
+}
+
+#[test]
+fn notify_payload_puts_policy_keys_at_the_top_level() {
+    use beacon_core::model::{NotifyPayload, NotifyPolicy, NotifyReason, NotifyThrottle};
+    let p = NotifyPayload {
+        alert_id: uuid::Uuid::nil(),
+        notify_seq: 1,
+        rule_id: "r".into(),
+        rule_revision: 2,
+        team: "t".into(),
+        severity: "critical".into(),
+        reason: NotifyReason::New,
+        route: vec![],
+        created_at: chrono::Utc::now(),
+        context: Default::default(),
+        event: None,
+        policy: NotifyPolicy { escalate_after_ms: Some(5000), throttle: Some(NotifyThrottle { max: 2, per_ms: 1000 }), runbook: Some("rb".into()) },
+    };
+    let v = serde_json::to_value(&p).unwrap();
+    // The keys delivery's RulePolicies::for_payload reads.
+    assert_eq!(v["escalate_after_ms"], json!(5000));
+    assert_eq!(v["throttle"], json!({"max": 2, "per_ms": 1000}));
+    assert_eq!(v["runbook"], json!("rb"));
+    let back: NotifyPayload = serde_json::from_value(v).unwrap();
+    assert_eq!(back.policy, p.policy);
+    // A rule without them adds no keys, so delivery keeps its rule-file values.
+    let none = serde_json::to_value(NotifyPayload { policy: NotifyPolicy::default(), ..p }).unwrap();
+    assert!(none.get("throttle").is_none() && none.get("runbook").is_none() && none.get("escalate_after_ms").is_none());
+}
