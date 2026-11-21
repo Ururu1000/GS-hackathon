@@ -136,10 +136,10 @@ fn severity_abbr(severity: &str) -> String {
     }
 }
 
-/// `[SEV] <title> <public_url>/a/<alert_id>`, title truncated on a char boundary (with `…`)
+/// `[SEV] <title> <public_url>/#/alerts/<alert_id>`, title truncated on a char boundary (with `…`)
 /// so the whole text is `<= SMS_MAX_CHARS` chars (counted in chars, not bytes).
 fn render_sms(severity: &str, title: &str, alert_id: &Uuid, public_url: &str) -> String {
-    let link = format!("{}/a/{}", public_url.trim_end_matches('/'), alert_id);
+    let link = format!("{}/#/alerts/{}", public_url.trim_end_matches('/'), alert_id);
     let prefix = format!("[{}] ", severity_abbr(severity));
     // Chars taken by everything except the title.
     let fixed = prefix.chars().count() + 1 + link.chars().count();
@@ -167,11 +167,13 @@ fn render_sms(severity: &str, title: &str, alert_id: &Uuid, public_url: &str) ->
     body
 }
 
-/// Short TTS script; no URL (a phone call cannot carry a link).
+/// Short TTS script; no URL (a phone call cannot carry a link). The title is cut to 1000 chars
+/// so the script stays under the gateway's 1600-char `text` limit.
 fn render_phone(severity: &str, title: &str) -> String {
     format!(
         "Beacon alert. Severity {}. {}. Details were sent to the Beacon app.",
-        severity, title
+        severity,
+        title.chars().take(1000).collect::<String>()
     )
 }
 
@@ -277,7 +279,7 @@ impl Channel for GatewayChannel {
         self.kind.as_str()
     }
 
-    /// SMS: `[SEV] <title> <public_url>/a/<alert_id>`, title truncated (with `…`) so the whole
+    /// SMS: `[SEV] <title> <public_url>/#/alerts/<alert_id>`, title truncated (with `…`) so the whole
     /// text is <= SMS_MAX_CHARS chars; SEV = CRIT|ERR|WARN|INFO. Phone: a short TTS script,
     /// e.g. "Beacon alert. Severity critical. <title>. Details were sent to the Beacon app."
     /// `subject` is empty for both.
@@ -419,7 +421,7 @@ mod tests {
                 msg.body
             );
             assert!(
-                msg.body.ends_with(&format!("/a/{alert_id}")),
+                msg.body.ends_with(&format!("/#/alerts/{alert_id}")),
                 "body: {}",
                 msg.body
             );
@@ -459,7 +461,7 @@ mod tests {
         );
         assert!(msg.body.contains('…'), "expected ellipsis: {}", msg.body);
         assert!(
-            msg.body.ends_with(&format!("/a/{alert_id}")),
+            msg.body.ends_with(&format!("/#/alerts/{alert_id}")),
             "link must survive truncation: {}",
             msg.body
         );
@@ -496,7 +498,7 @@ mod tests {
         assert_eq!(msg.address, "+15550001111");
         assert!(msg.body.contains("DB down in prod"), "body: {}", msg.body);
         assert!(
-            !msg.body.contains("http") && !msg.body.contains("/a/"),
+            !msg.body.contains("http") && !msg.body.contains("#/alerts/"),
             "phone script must not contain a URL: {}",
             msg.body
         );

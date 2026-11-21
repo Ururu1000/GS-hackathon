@@ -96,7 +96,7 @@ async fn run() -> Result<(), String> {
         .acquire_timeout(Duration::from_secs(10))
         .connect(&db_url)
         .await
-        .map_err(|e| format!("cannot connect to Postgres ({db_url}): {e}"))?;
+        .map_err(|e| format!("cannot connect to Postgres (DATABASE_URL): {e}"))?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()

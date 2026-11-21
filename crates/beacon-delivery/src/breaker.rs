@@ -225,6 +225,23 @@ pub async fn record_failure(
     }
 }
 
+/// The probe holder finished without a send result (nothing to claim, alert cancelled,
+/// permanent error): hand the probe back (`open`, `open_until` unchanged and already past) so
+/// the next `acquire` can take it at once instead of waiting out `probe_lease`. No-op once
+/// the token no longer matches (the probe already closed or reopened the breaker).
+pub async fn release_probe(pool: &PgPool, channel: &str, token: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE channel_breakers \
+         SET state = 'open', probe_token = NULL, probe_until = NULL, updated_at = now() \
+         WHERE channel = $1 AND state = 'half_open' AND probe_token = $2",
+    )
+    .bind(channel)
+    .bind(token)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Current row for diagnostics/tests: `(state, consecutive_failures)`; `("closed", 0)` if none.
 pub async fn status(pool: &PgPool, channel: &str) -> Result<(String, i32), sqlx::Error> {
     let row: Option<(String, i32)> = sqlx::query_as(
@@ -237,7 +254,7 @@ pub async fn status(pool: &PgPool, channel: &str) -> Result<(String, i32), sqlx:
 }
 
 /// Whether the channel's breaker is currently not `closed` (a missing row is `closed`).
-async fn is_not_closed(pool: &PgPool, channel: &str) -> Result<bool, sqlx::Error> {
+pub async fn is_not_closed(pool: &PgPool, channel: &str) -> Result<bool, sqlx::Error> {
     let state: Option<(String,)> =
         sqlx::query_as("SELECT state FROM channel_breakers WHERE channel = $1")
             .bind(channel)
