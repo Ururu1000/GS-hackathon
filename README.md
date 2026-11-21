@@ -6,6 +6,37 @@ A service that ingests events of any shape from many sources, matches them again
 
 - Problem statement: [docs/PROBLEM_STATEMENT.md](docs/PROBLEM_STATEMENT.md)
 - Delivery (routing, channels, escalation, throttles, runbooks, approvals, outage results): [docs/DELIVERY.md](docs/DELIVERY.md)
+- Ingest, engine and API (part a), with every review and limit: [progress.md](progress.md); engine load tests: [loadtest/README.md](loadtest/README.md)
+
+## Quick start
+
+Needs Docker with Compose. Nothing else: the image builds the Rust binaries and the UI.
+
+```sh
+git clone https://github.com/Ururu1000/GS-hackathon && cd GS-hackathon
+docker compose up --build -d      # first build takes a few minutes
+docker compose ps -a              # beacon healthy, demo-seed exited 0
+```
+
+| What | Where |
+|---|---|
+| UI + API | http://localhost:8080 |
+| Webhook ingest | `POST http://localhost:8090/ingest/{source}` |
+| Email inbox (Mailpit) | http://localhost:8025 |
+
+`demo-seed` sends the brief's sample events once: two through Kafka (`workflow-events`, `trade-events`) and three over the webhook. The feed shows four alerts (the unknown shape raises none until a rule matches it), and Mailpit gets three emails.
+
+**Things to try**
+1. **New schema at runtime.** Post any JSON to `:8090/ingest/demo`. The Sources tab shows its shape; write a rule in the Rules tab, dry-run it in the test panel, save. The next event raises an alert, with no restart.
+2. **Runbook + approval.** Open the settlement-workflow alert, run the steps, and ask for approval on *escalate*. The Devices tab (simulated phone) gets the approval SMS; reply `Y <code>`. To make the retry step fail so escalate unlocks:
+   `docker compose exec beacon curl -s -X POST -H 'Authorization: Bearer beacon-demo-gateway-token' -H 'content-type: application/json' -d '{"target":"workflows","mode":"fail"}' http://127.0.0.1:8070/api/simulator/mock`
+3. **Channel outage.** Take the fake SMS gateway down for 60 s, then trigger alerts. The SMS are held, the breaker opens, and every SMS arrives exactly once after recovery:
+   `docker compose exec beacon curl -s -X POST -H 'Authorization: Bearer beacon-demo-gateway-token' -H 'content-type: application/json' -d '{"channel":"sms","mode":"down","seconds":60}' http://127.0.0.1:8070/api/simulator/outage`
+4. **Preferences.** Change a person's channels in Preferences; the next notification follows them.
+
+Stop with `docker compose down` (`-v` also deletes the data).
+
+The demo session is a fixed admin user (`BEACON_DEMO_USER`, default `anna`). There is no real login, so every port binds to localhost only.
 
 ## UI
 
@@ -105,6 +136,37 @@ Email alone sustained ~47–163 messages/s into Mailpit (1,000 emails over 8 wor
 
 **Re-run:** Actions → `loadtest` → Run workflow, or push to a `ci-run/loadtest-<name>` branch.
 
-## Status
+## Architecture
 
-Work in progress. Setup instructions and architecture will be added here.
+```
+webhook :8090 ─┐
+Kafka sources ─┴─► events.raw ─► matcher ─► alerts.matches ─► aggregator ─► Postgres: alerts + outbox (one tx)
+                                 (rules reload live from Postgres)                 │
+                                         relay ◄── alert_update ──────────────────┤
+                                           ▼                                       └── notify ─► router ─► delivery_jobs
+                                  alerts.updates ─► api (SSE) ─► UI                              ▼
+                                                                    email / sms / phone workers, escalation scheduler,
+                                                                    runbook actions, approvals, audit log
+```
+
+One binary, `beacon`, runs any mix of roles (`--role ingest,matcher,...`); the compose demo runs them all in one container.
+
+**Where state lives**
+- **Redpanda (Kafka API):** `events.raw`, `alerts.matches`, `alerts.updates`. Matcher → aggregator is exactly-once: Kafka transactions plus fenced checkpoints in Postgres.
+- **Postgres:** everything durable. Alerts, the outbox, rules, schema mappings, proposals, delivery jobs, escalation timers, throttles, approvals, runbook copies and the audit log.
+- **In memory only:** dedup id windows (rebuilt from the log), SSE fan-out, the fake gateway's outage/mock switches.
+
+**Scaling.** Every role is a replica set. Matchers and aggregators share Kafka consumer groups (aggregators fence by partition). Each API replica consumes `alerts.updates` in its own group for SSE. Router, delivery workers, scheduler and actions claim rows with `FOR UPDATE SKIP LOCKED` and leases. A crashed worker's jobs are picked up when their lease expires.
+
+**Single points of failure, by design for the hackathon:** one Postgres and one broker. Everything else can run several copies. Measured limits are in [Measured performance](#measured-performance); at 2,000 ev/s the single routing task is the bottleneck.
+
+## Security and privacy
+
+- **Ports:** every port binds to `127.0.0.1`. The demo session has no login, and writes need its `X-CSRF-Token`.
+- **Redaction:** secret-looking fields are redacted before they reach alerts, samples or notifications. Delivery addresses and provider errors are masked in alert detail.
+- **Logs:** no message text, SMS codes or approval challenges. Phone numbers are masked.
+- **Approvals:** codes are stored hashed, single-use, expire after 15 min, and allow 5 attempts. Nobody approves their own request.
+- **SMS replies:** they reach the API signed with `REPLY_SECRET` (HMAC with a timestamp). `GATEWAY_TOKEN` stays on the server, and the API adds it to the UI's simulator calls.
+- **Demo caveat:** the device simulator is a fake phone for the demo. Any session can read the SMS it holds, approval codes included, and reply as any number. A real SMS provider replaces it.
+- **Limits:** bodies, rule sizes, regexes, templates, SSE streams and pending proposals are all capped, and every request is validated.
+
