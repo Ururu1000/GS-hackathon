@@ -29,6 +29,7 @@ pub mod config;
 pub mod escalation;
 pub mod gateway;
 pub mod model;
+pub mod overrides;
 pub mod prefs;
 pub mod router;
 pub mod rules;

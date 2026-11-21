@@ -685,12 +685,16 @@ pub async fn run_actions(
 ) {
     let mut shutdown = shutdown;
     info!(worker_id = %cfg.worker_id, "actions worker started");
+    // Saved people/teams edits (directory_overrides) reach `escalate` and `notify`
+    // actions on the next pass, as they do in the router and the scheduler.
+    let effective = crate::overrides::EffectiveDirectory::new(dir);
     while !*shutdown.borrow() {
         // Audit #11: sweep pending approvals past their expiry (and scrub their codes at
         // rest) once per iteration — one cheap indexed UPDATE when there is nothing to do.
         if let Err(err) = crate::approvals::expire_stale(&pool).await {
             error!(error = %err, "stale approval expiry failed");
         }
+        let dir = effective.get(&pool).await;
         let wait = match run_once(&pool, &dir, &registry, alert_ops.as_ref(), &cfg).await {
             Ok(stats) => {
                 if stats.claimed > 0 || stats.uncertain > 0 {

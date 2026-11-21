@@ -742,6 +742,10 @@ pub async fn escalate_once(
 
 /// Loop `escalate_once` until shutdown (true or sender dropped); immediately again after a
 /// full batch, else sleep `poll_interval`; DB errors are logged and retried after 1 s.
+///
+/// The startup directory is wrapped in an [`crate::overrides::EffectiveDirectory`] and
+/// re-read (one cheap stamp query) every pass, so a saved team change applies to the
+/// next escalation step.
 pub async fn run_scheduler(
     pool: PgPool,
     dir: Arc<Directory>,
@@ -750,7 +754,9 @@ pub async fn run_scheduler(
 ) {
     let mut shutdown = shutdown;
     info!(worker_id = %cfg.worker_id, "escalation scheduler started");
+    let effective = Arc::new(crate::overrides::EffectiveDirectory::new(dir));
     while !*shutdown.borrow() && shutdown.has_changed().is_ok() {
+        let dir = effective.get(&pool).await;
         let wait = match escalate_once(&pool, &dir, &cfg).await {
             Ok(stats) => {
                 if stats != EscalationStats::default() {
