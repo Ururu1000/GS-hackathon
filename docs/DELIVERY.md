@@ -108,7 +108,7 @@ Run the settlement-timeout flow by hand against the stack above. The mock workfl
 - **ingest → email receipt**: the Mailpit message `Created` time − t0, falling back to `delivery_jobs.sent_at` when the message cannot be found,
 - **the internal split**: **ingest → alert** (`alerts.first_seen − t0`) and **alert → delivered** (`sent_at − first_seen`).
 
-`t0` is the client clock just before each POST; `--warmup` events prime the caches and are excluded from the stats. The report carries its workload parameters (events, rate, mix, warmup, timestamp, git commit, host CPUs) and the command exits non-zero when any expected receipt is missing or any POST failed. CI-friendly example: `./scripts/demo_latency.sh --events 200 --rate 20`; add `--out results.json` for the same report as JSON.
+`t0` is the client clock just before each POST. The `--warmup` events (default 50) are excluded from the stats, and the measured stream starts only once their deliveries have drained (at most 60 s), so the numbers describe a warm pipeline rather than the stack's cold start (Kafka consumer groups joining). The report carries its workload parameters (events, rate, mix, warmup, timestamp, git commit, host CPUs) and the command exits non-zero when any expected receipt is missing or any POST failed. CI-friendly example: `./scripts/demo_latency.sh --events 200 --rate 20`; add `--out results.json` for the same report as JSON.
 
 Caveat: gateway receipts are timestamped by Postgres and email by Mailpit, so the numbers are only valid when the client, Postgres and Mailpit share a clock (same machine / NTP-synced) — the benchmark prints that warning with every run.
 
