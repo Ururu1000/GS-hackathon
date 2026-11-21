@@ -171,7 +171,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes, what: &str) -> Resul
 
 /// Writers must be able to see (own) the rule's team, before and after, and
 /// may only route to teams/schedules they can see (or themselves).
-fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
+pub(crate) fn check_team(state: &ApiState, spec: &Value) -> Result<(), ApiError> {
     let t = team_of(spec);
     if !(t.is_empty() || state.session.can_see(&t)) {
         return Err(ApiError::forbidden(format!("you can't publish rules for team `{t}`")));
@@ -205,17 +205,17 @@ const MAX_WRITE_BODY: usize = 128 * 1024;
 /// Bound concurrent blocking rule-test evaluations per replica.
 static TEST_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 
-async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
+pub(crate) async fn read_body(body: Body, limit: usize) -> Result<Bytes, ApiError> {
     axum::body::to_bytes(body, limit)
         .await
         .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {limit} bytes")))
 }
 
-fn require_admin(state: &ApiState) -> Result<(), ApiError> {
+fn require_admin(state: &ApiState, what: &str) -> Result<(), ApiError> {
     if state.session.admin {
         Ok(())
     } else {
-        Err(ApiError::forbidden("events from every source are visible to admins only"))
+        Err(ApiError::forbidden(format!("{what} is limited to admins")))
     }
 }
 
@@ -242,7 +242,7 @@ async fn map_write(state: &ApiState, e: WriteError) -> ApiError {
     }
 }
 
-fn visible_teams(state: &ApiState) -> Vec<String> {
+pub(crate) fn visible_teams(state: &ApiState) -> Vec<String> {
     state.session.teams.iter().map(|t| t.id.clone()).collect()
 }
 
@@ -301,9 +301,11 @@ pub async fn test(State(state): State<ApiState>, headers: HeaderMap, body: Body)
     };
     // Compiling and evaluating is CPU work: keep it off the async workers, and
     // hold the concurrency permit inside the blocking task even if the request cancels.
-    let schemas = state.schemas.clone();
+    // The live mappings (Postgres), so a just-published mapping is used.
+    let stored = config_store::list_schemas(&state.pool).await?;
     let out = tokio::task::spawn_blocking(move || {
         let _slot = slot;
+        let schemas = config_store::valid_schema_specs(stored);
         run_test(&schemas, b.rule, b.event, b.source)
     })
         .await
@@ -368,7 +370,7 @@ fn render(v: &Value) -> String {
 }
 
 pub async fn recent_events(State(state): State<ApiState>, RawQuery(raw): RawQuery) -> Result<Json<Value>, ApiError> {
-    require_admin(&state)?;
+    require_admin(&state, "seeing events from every source")?;
     let limit: i64 = query_param(raw.as_deref(), "limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 50);
     let rows = sqlx::query(
         "SELECT event_id, source, schema, received_at, raw FROM event_samples ORDER BY id DESC LIMIT $1",
@@ -391,13 +393,105 @@ pub async fn recent_events(State(state): State<ApiState>, RawQuery(raw): RawQuer
     Ok(Json(json!({"items": items})))
 }
 
-pub async fn schemas(State(state): State<ApiState>) -> Json<Value> {
-    let items: Vec<Value> = state.schemas.iter().map(|s| json!({"spec": s, "revision": 1})).collect();
-    Json(Value::Array(items))
+pub async fn schemas(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let items: Vec<Value> = config_store::list_schemas(&state.pool)
+        .await?
+        .iter()
+        .map(|s| json!({"spec": s.spec, "revision": s.revision, "updated_at": ts(s.updated_at), "updated_by": s.updated_by}))
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
+#[derive(Deserialize)]
+struct SchemaWrite {
+    spec: Value,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+    /// The mapping being edited; required with `expected_revision`, so an
+    /// edited `spec.schema` can't overwrite a different mapping.
+    #[serde(default)]
+    schema: Option<String>,
+}
+
+/// Publish a schema mapping (create, or compare-and-set with expected_revision).
+/// Mappings are global (they recognise shapes, not team data), so publishing
+/// is limited to admins.
+pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Response, ApiError> {
+    state.session.check_csrf(&headers)?;
+    require_admin(&state, "publishing schema mappings")?;
+    let body = read_body(body, MAX_WRITE_BODY).await?;
+    let b: SchemaWrite = parse_body(&body, "{\"spec\": {...}, \"expected_revision\"?: <int>, \"schema\"?: \"...\"}")?;
+    if b.expected_revision.is_some() {
+        let name = b.spec.get("schema").and_then(Value::as_str);
+        match b.schema.as_deref() {
+            None => return Err(ApiError::bad_request("schema (the mapping being edited) is required with expected_revision")),
+            Some(target) if Some(target) != name => {
+                return Err(invalid(vec![config_store::Invalid {
+                    path: "schema".into(),
+                    message: format!("a mapping can't be renamed; publish `{}` as a new mapping", name.unwrap_or("")),
+                }]));
+            }
+            Some(_) => {}
+        }
+    }
+    match config_store::save_schema(&state.pool, &b.spec, b.expected_revision, &state.session.actor()).await? {
+        Ok((s, created)) => {
+            let v = json!({"spec": s.spec, "revision": s.revision, "updated_at": ts(s.updated_at), "updated_by": s.updated_by});
+            let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+            Ok((status, Json(v)).into_response())
+        }
+        Err(WriteError::Invalid(d)) => Err(invalid(d)),
+        Err(WriteError::NotFound | WriteError::Forbidden) => Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no mapping with that schema name to update")),
+        Err(WriteError::Conflict(_)) => {
+            let name = b.spec.get("schema").and_then(Value::as_str).unwrap_or("");
+            let current = config_store::get_schema(&state.pool, name)
+                .await?
+                .map(|s| json!({"spec": s.spec, "revision": s.revision}))
+                .unwrap_or(Value::Null);
+            Err(ApiError::conflict("revision_conflict", "the mapping changed since you loaded it (or already exists)", current))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SchemaPreview {
+    spec: Value,
+    event: Value,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Evaluate a mapping against one event, without changing config.
+pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Json<Value>, ApiError> {
+    state.session.check_csrf(&headers)?;
+    let body = read_body(body, MAX_TEST_BODY).await?;
+    let b: SchemaPreview = parse_body(&body, "{\"spec\": {...}, \"event\": {...}, \"source\": \"...\"}")?;
+    let Ok(slot) = TEST_SLOTS.try_acquire() else {
+        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "too_many_tests", "too many previews in flight, retry"));
+    };
+    // Validating compiles the detector's regexes: CPU work, so it runs under
+    // the permit on a blocking thread too.
+    let out = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        let spec = config_store::validate_schema(&b.spec)?;
+        let m = beacon_core::mapping::SchemaMapping::compile(&spec).expect("validated above");
+        let event = Event::new("preview".into(), b.source.unwrap_or_else(|| "http:preview".into()), b.event);
+        let matched = m.detects(&event);
+        let (fields, diags) = if matched { m.extract(&event) } else { (Default::default(), vec![]) };
+        let mut warnings: Vec<String> = diags.iter().map(|d| format!("{}: {}", d.field, d.message)).collect();
+        if !matched {
+            warnings.push("The detector does not recognise this event".into());
+        }
+        Ok(json!({"matched": matched, "fields": fields, "warnings": warnings}))
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!("preview task failed: {e}")))?
+    .map_err(invalid)?;
+    Ok(Json(out))
 }
 
 pub async fn discovered(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    require_admin(&state)?;
+    require_admin(&state, "seeing events from every source")?;
     let rows = sqlx::query(
         "SELECT DISTINCT ON (schema) schema, source, raw,
                 count(*) OVER (PARTITION BY schema) AS count,
