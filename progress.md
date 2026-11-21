@@ -5,7 +5,7 @@ Owner: **alexey**. The team split is in [docs/SPEC.md](docs/SPEC.md) §12:
 - **(b)** delivery: ilyaarch.
 - **(c)** UI: erop-laptop.
 
-Last updated: 2026-11-21.
+Last updated: 2026-11-21 (after PR #30).
 
 ## Status at a glance
 
@@ -21,14 +21,17 @@ Last updated: 2026-11-21.
 | Shared ack/resolve transitions for delivery | Done | PR #12 |
 | Rules in Postgres, live reload, rules / test panel / schemas API | Done | PR #13 |
 | One-command `docker compose up --build` | Done, verified end to end | PR #13 |
-| Proposals (suggest change → accept/reject) + schema preview/publish | Done | branch api/proposals |
-| Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
+| Proposals (suggest change → accept/reject) + schema preview/publish | Done | PR #22 |
+| Mount delivery routes in beacon-api (runbooks, approvals, people/teams, simulator) | Done | PR #27 |
+| Rule's escalate_after / throttle / runbook in the notify payload (#132) | Done | PR #28 |
+| Compose image runs scheduler + actions, demo GATEWAY_TOKEN / REPLY_SECRET | Done | PR #27 |
+| Ingest → delivery p50/p99 (M6), CI + Mac | Done | PR #26, #29, #30; [README](README.md#measured-performance) |
 | Exact counts under replay and crashes (M1) | Done: scenario e exact | PR #15 |
 | Grouping digests + quiet-for auto-resolve (M3) | Done | PR #16 |
 | Second source type: Kafka sources + Kafka-mode load test | Done | PR #17 |
 | Load scenario d (500 dupes/s on one key) | Done: exact | PR #17 |
 
-PR merge order: #5 → #8 → #7 → #9 → #11 → #12 → #13. Each PR is stacked on the previous one.
+Everything above is merged to `main`.
 
 ## What the pipeline does
 
@@ -198,7 +201,9 @@ Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
 
 ## Next
 
-1. Merge the PR stack, then mount delivery M5b: runbooks, approvals, the SMS/phone simulator.
-2. Schema write endpoints (`POST /api/schemas`, `/api/schemas/preview`), the recipient feed, and occurrence charts.
-3. Kafka-mode load test, and exact counts under replay (M1).
-4. README, the "what is mocked" list, and the demo video script.
+- **M7, auto-suggested proposals:** the engine proposes rule tweaks (a longer dedup window, a throttle, a narrower condition) for noisy or flapping rules. They go into the existing proposals flow with `source: auto`, and the owning team accepts or rejects them.
+- **M7, LLM mapping proposals:** an optional, off-by-default helper that drafts a schema mapping for an unknown event shape, from synthetic samples only. It becomes a proposal with `source: llm` and still goes through the same validator and review.
+- **Open from reviews:**
+  - quiet_for overflow, and the shared group key when a group field is missing (audit #16)
+  - a check that a proposal's `alert_id` exists, proposal pruning, and `GET /api/proposals/{id}` (PR #22)
+- **Runbook import/save:** the UI calls `POST /api/runbooks/import` and `POST /api/runbooks`, and the backend doesn't have them yet. To be agreed with delivery.
