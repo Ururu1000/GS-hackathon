@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from 'react'
 import { COND_OPS, type Condition, type CondOp, type Leaf, type NodeDiagnostic, type Scalar } from '../api/types'
-import { CloseIcon } from '../lib/icons'
+import { ChevronDownIcon, ChevronUpIcon, CloseIcon } from '../lib/icons'
 import {
   addChild,
   isGroup,
@@ -81,8 +81,8 @@ function NodeMenu({ node, root, onRoot, negated, notNode, siblings }: { node: st
       <button type="button" className={`btn btn-xs ${negated ? 'is-on' : ''}`} aria-pressed={!!negated} onClick={() => onRoot(toggleNot(root, self))} title="Match when this is NOT true">
         Not
       </button>
-      <button type="button" className="icon-btn sm" disabled={idx === 0} onClick={() => onRoot(moveChild(root, self, -1))} aria-label="Move up" title="Move up">↑</button>
-      <button type="button" className="icon-btn sm" disabled={siblings !== undefined && idx >= siblings - 1} onClick={() => onRoot(moveChild(root, self, 1))} aria-label="Move down" title="Move down">↓</button>
+      <button type="button" className="icon-btn sm move-btn" disabled={idx === 0} onClick={() => onRoot(moveChild(root, self, -1))} aria-label="Move up" title="Move up"><ChevronUpIcon size={14} /></button>
+      <button type="button" className="icon-btn sm move-btn" disabled={siblings !== undefined && idx >= siblings - 1} onClick={() => onRoot(moveChild(root, self, 1))} aria-label="Move down" title="Move down"><ChevronDownIcon size={14} /></button>
       <button type="button" className="icon-btn sm" onClick={() => onRoot(removeNode(root, self))} aria-label="Remove" title="Remove">
         <CloseIcon size={13} />
       </button>

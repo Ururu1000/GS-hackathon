@@ -103,7 +103,7 @@ export function RulesList({ team, teamName, onNavigate }: Props) {
                         {r.rule.severity ? <SeverityIcon severity={r.rule.severity} /> : <span className="sev-any" role="img" aria-label="Severity comes from the event" title="Severity comes from the event" />}
                         <div className="rule-cell-text">
                           <a href={href} onClick={(e) => e.stopPropagation()}>{r.rule.name || r.rule.id}</a>
-                          <span className="muted small mono">{r.rule.id}{r.rule.enabled === false ? ' · disabled' : ''}{r.rule.runbook ? ' · runbook' : ''}</span>
+                          <span className="muted small">{r.rule.id}{r.rule.enabled === false ? ' · disabled' : ''}{r.rule.runbook ? ' · runbook' : ''}</span>
                         </div>
                       </div>
                     </td>

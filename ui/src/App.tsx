@@ -8,7 +8,7 @@ import { FilterChips, SearchBox } from './feed/FilterBar'
 import { defaultFilters, facetCounts, loadFilters, matches, saveFilters, type Filters } from './feed/filters'
 import { compareFeed } from './feed/feedStore'
 import { useFeedStream, type Connection } from './feed/useFeedStream'
-import { BeaconLogo, KeyboardIcon, MoonIcon, SunIcon } from './lib/icons'
+import { BeaconLogo, MoonIcon, SunIcon } from './lib/icons'
 import { useRoute, type Route } from './lib/router'
 import { useNow } from './lib/time'
 
@@ -131,7 +131,6 @@ export function App() {
   }, [team])
   useEffect(refreshProposals, [refreshProposals, route.view])
   const [pending, setPending] = useState<{ id: string; op: TransitionOp } | null>(null)
-  const [help, setHelp] = useState(false)
   const [theme, toggleTheme] = useTheme()
   const searchRef = useRef<HTMLInputElement>(null)
   const { toasts, push } = useToasts()
@@ -228,7 +227,7 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return
       // A dialog owns the keyboard while it's open.
-      if (document.querySelector('.modal-backdrop') && !help) return
+      if (document.querySelector('.modal-backdrop')) return
       const t = e.target as HTMLElement | null
       if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return
       const idx = selectedId ? visible.findIndex((a) => a.id === selectedId) : -1
@@ -251,14 +250,10 @@ export function App() {
           else void act(selected, e.key === 'a' ? 'ack' : 'resolve')
           break
         case 'Escape':
-          if (help) setHelp(false)
-          else select(null)
+          select(null)
           break
         case '/':
           searchRef.current?.focus()
-          break
-        case '?':
-          setHelp((h) => !h)
           break
         default:
           return
@@ -267,7 +262,7 @@ export function App() {
     }
     addEventListener('keydown', onKey)
     return () => removeEventListener('keydown', onKey)
-  }, [route.view, visible, selectedId, selected, select, act, push, help])
+  }, [route.view, visible, selectedId, selected, select, act, push])
 
   const teamName = team ? session?.teams.find((t) => t.id === team)?.name ?? team : 'All teams'
 
@@ -308,14 +303,6 @@ export function App() {
             title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
           >
             {theme === 'dark' ? <SunIcon size={15} /> : <MoonIcon size={15} />}
-          </button>
-          <button
-            className="icon-btn"
-            onClick={() => setHelp((h) => !h)}
-            aria-label="Keyboard shortcuts (?)"
-            title="Keyboard shortcuts (?)"
-          >
-            <KeyboardIcon size={15} />
           </button>
         </div>
       </header>
@@ -411,23 +398,6 @@ export function App() {
           <div key={t.id} className={`toast toast-${t.kind}`}>{t.text}</div>
         ))}
       </div>
-
-      {help && (
-        <div className="modal-backdrop" onClick={() => setHelp(false)}>
-          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="help-title" onClick={(e) => e.stopPropagation()}>
-            <h2 id="help-title">Keyboard shortcuts</h2>
-            <dl className="shortcuts">
-              <dt><kbd>j</kbd> <kbd>↓</kbd></dt><dd>Next alert</dd>
-              <dt><kbd>k</kbd> <kbd>↑</kbd></dt><dd>Previous alert</dd>
-              <dt><kbd>a</kbd></dt><dd>Acknowledge</dd>
-              <dt><kbd>r</kbd></dt><dd>Resolve</dd>
-              <dt><kbd>/</kbd></dt><dd>Search</dd>
-              <dt><kbd>Esc</kbd></dt><dd>Close</dd>
-            </dl>
-            <button className="btn btn-primary" onClick={() => setHelp(false)} autoFocus>Close</button>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
