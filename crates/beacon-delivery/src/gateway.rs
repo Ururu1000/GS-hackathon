@@ -138,6 +138,8 @@ pub struct GatewayState {
     /// M5b (agent B): mock action-target outcomes + call log (see the **Mock targets**
     /// section of `crate::actions`). In-memory only, shared by every handler.
     mocks: Arc<RwLock<MockState>>,
+    /// Set by [`serve`]; ends open SSE streams on shutdown.
+    shutdown: Option<Shutdown>,
 }
 
 impl GatewayState {
@@ -151,6 +153,7 @@ impl GatewayState {
             reply_forward_url: None,
             reply_secret: None,
             mocks: Arc::new(RwLock::new(MockState::default())),
+            shutdown: None,
         }
     }
 
@@ -292,7 +295,7 @@ pub fn router(state: GatewayState) -> axum::Router {
 /// Bind `addr` and serve `router(state)` until shutdown. Returns the bound address (so tests can
 /// pass port 0) through `on_bound` before serving.
 pub async fn serve(
-    state: GatewayState,
+    mut state: GatewayState,
     addr: SocketAddr,
     mut shutdown: Shutdown,
     on_bound: impl FnOnce(SocketAddr) + Send,
@@ -306,6 +309,7 @@ pub async fn serve(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     on_bound(listener.local_addr()?);
+    state.shutdown = Some(shutdown.clone());
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             let _ = shutdown.wait_for(|v| *v).await;
@@ -720,6 +724,9 @@ async fn messages_handler(
 // ---------------------------------------------------------------------------------------------
 
 async fn stream_handler(State(state): State<GatewayState>) -> Response {
+    // Subscribe before the snapshot query so a receipt committed in between is not lost; it
+    // may then appear in both, and clients upsert by id anyway (duplicates re-broadcast).
+    let rx = state.tx.subscribe();
     let (items, next_cursor) =
         match fetch_page(&state.pool, None, None, None, SNAPSHOT_LIMIT, None).await {
             Ok(page) => page,
@@ -730,8 +737,7 @@ async fn stream_handler(State(state): State<GatewayState>) -> Response {
         };
     let snapshot = serde_json::json!({ "items": items, "next_cursor": next_cursor }).to_string();
 
-    let rx = state.tx.subscribe();
-    // Skip broadcast-lag gaps; the stream only ends when the gateway state is dropped.
+    // Skip broadcast-lag gaps; the stream ends on gateway shutdown.
     let live = BroadcastStream::new(rx).filter_map(|res| async move {
         match res {
             Ok(msg) => {
@@ -746,7 +752,14 @@ async fn stream_handler(State(state): State<GatewayState>) -> Response {
     let first = futures::stream::once(async move {
         Ok::<Event, Infallible>(Event::default().event("snapshot").data(snapshot))
     });
-    let stream = first.chain(live);
+    // Graceful shutdown waits for open connections, so a live SSE stream must end by itself.
+    let mut shutdown = state.shutdown.clone();
+    let stream = first.chain(live).take_until(async move {
+        match shutdown.as_mut() {
+            Some(rx) => drop(rx.wait_for(|v| *v).await),
+            None => std::future::pending().await,
+        }
+    });
     let sse = Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))

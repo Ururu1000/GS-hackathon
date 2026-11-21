@@ -1042,3 +1042,70 @@ async fn sms_outage_down_mode_loses_nothing_and_duplicates_nothing(pool: PgPool)
 async fn sms_outage_lose_response_persists_before_the_outage_reply(pool: PgPool) {
     run_outage_scenario(pool, OutageMode::LoseResponse, 2).await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes: breaker re-checked before each send; an idle probe is released
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn jobs_queued_behind_a_send_slot_do_not_send_once_the_breaker_opens(pool: PgPool) {
+    let cfg = WorkerConfig {
+        worker_id: "w-slot".into(),
+        concurrency: 1,
+        breaker: BreakerPolicy {
+            threshold: 1,
+            cooldown: Duration::from_secs(30),
+            probe_lease: Duration::from_secs(30),
+        },
+        ..WorkerConfig::default()
+    };
+    let alert = insert_alert(&pool, "open", &format!("slot {}", unique_tag())).await;
+    for (who, to) in [("anna", "+44111"), ("bob", "+44222"), ("carol", "+44333")] {
+        insert_sms_job(&pool, alert, who, to, json!({})).await;
+    }
+    let (fake, bad) = Scripted::new("sms")
+        .always_failing(SendError::Transient("sms provider 503".into()))
+        .into_channel();
+
+    let stats = work_once_bounded(&pool, &bad, &cfg).await;
+    assert_eq!(stats.claimed, 3, "{stats:?}");
+    assert_eq!(stats.deferred, 3, "{stats:?}");
+    assert_eq!(fake.calls(), 1, "only the send that opened the breaker goes out");
+    let jobs = job_rows(&pool, alert).await;
+    assert!(jobs.iter().all(|j| j.status == "pending" && j.attempts == 0), "{jobs:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_probe_with_nothing_to_send_is_released_at_once(pool: PgPool) {
+    let cfg = WorkerConfig {
+        worker_id: "w-idle-probe".into(),
+        breaker: BreakerPolicy {
+            threshold: 1,
+            cooldown: Duration::from_secs(30),
+            probe_lease: Duration::from_secs(30),
+        },
+        ..WorkerConfig::default()
+    };
+    sqlx::query(
+        "INSERT INTO channel_breakers (channel, state, consecutive_failures, opened_at, open_until) \
+         VALUES ('sms', 'open', 1, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .expect("open breaker past its cooldown");
+    let (_fake, good) = Scripted::new("sms").into_channel();
+
+    // The probe is taken, but nothing is due.
+    let idle = work_once_bounded(&pool, &good, &cfg).await;
+    assert_eq!(idle.claimed, 0, "{idle:?}");
+
+    // A job arriving right after is probed at once, not after the 30 s probe lease.
+    let alert = insert_alert(&pool, "open", &format!("idle probe {}", unique_tag())).await;
+    insert_sms_job(&pool, alert, "anna", "+44111", json!({})).await;
+    let probe = work_once_bounded(&pool, &good, &cfg).await;
+    assert_eq!(probe.sent, 1, "{probe:?}");
+    assert_eq!(
+        breaker::status(&pool, "sms").await.expect("status").0,
+        "closed"
+    );
+}

@@ -1128,3 +1128,36 @@ async fn gateway_channel_stops_reading_huge_error_bodies_early() {
         started.elapsed()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// 13. An open simulator stream does not block graceful shutdown.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn open_simulator_stream_does_not_block_shutdown(pool: PgPool) {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(gateway::serve(
+        GatewayState::new(pool),
+        "127.0.0.1:0".parse().unwrap(),
+        shutdown_rx,
+        |addr| {
+            let _ = bound_tx.send(addr);
+        },
+    ));
+    let addr = bound_rx.await.expect("gateway bound");
+    let mut stream = reqwest::Client::new()
+        .get(format!("http://{addr}/api/simulator/stream"))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("GET stream");
+    stream.chunk().await.expect("snapshot chunk").expect("snapshot");
+
+    shutdown_tx.send(true).expect("signal shutdown");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("serve must return while a stream is open")
+        .expect("serve task")
+        .expect("serve");
+}

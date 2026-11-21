@@ -219,9 +219,9 @@ pub async fn finalize_cancelled(
 
 /// Permanent errors, or any error when `attempts >= max_attempts`, -> `dead`; every death
 /// also inserts at most one fallback job (SPEC §5.6) in the same transaction. Otherwise ->
-/// `pending` with `due_at = now() + min(max(backoff_delay(policy, attempts), retry_after),
-/// MAX_RETRY_AFTER)`: the provider's requested minimum delay wins when larger, but no delay
-/// can exceed the 10-minute cap. Returns `Some(new_status)` or `None` if the lease was lost.
+/// `pending` with `due_at = now() + max(backoff_delay(policy, attempts), min(retry_after,
+/// MAX_RETRY_AFTER))`: the provider's requested minimum delay wins when larger, but it can
+/// never exceed the 10-minute cap. Returns `Some(new_status)` or `None` if the lease was lost.
 pub async fn finalize_failed(
     pool: &PgPool,
     job: &DeliveryJob,
@@ -266,13 +266,12 @@ async fn finalize_failed_inner(
         .await?
     } else {
         // The provider's requested minimum delay wins over our own backoff when it is
-        // larger, but the final delay is clamped to MAX_RETRY_AFTER (10 minutes): a hostile
+        // larger, but it is clamped to MAX_RETRY_AFTER (10 minutes): a hostile
         // or broken Retry-After must not park a job for years, whatever any channel
         // produced (the gateway channel clamps its own values as well; this is defence in
         // depth for every other channel).
         let delay = backoff_delay(policy, job.attempts)
-            .max(err.retry_after().unwrap_or_default())
-            .min(MAX_RETRY_AFTER);
+            .max(err.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
         sqlx::query(
             "UPDATE delivery_jobs \
              SET status = 'pending', last_error = $3, last_error_class = $4, \
@@ -470,6 +469,17 @@ async fn process_job(
     {
         alert.body = format!("{}\n\n{}", alert.body, section);
     }
+    // A job that waited for a send slot must not send if the breaker opened meanwhile.
+    if probe.is_none() && breaker::is_not_closed(pool, channel.name()).await? {
+        let err = SendError::Transient("channel breaker open".into());
+        return Ok(
+            if finalize_deferred(pool, &job, token, &err, cfg.breaker.cooldown).await? {
+                Outcome::Deferred
+            } else {
+                Outcome::LostLease
+            },
+        );
+    }
     let msg = channel.render(&alert, &job);
     match channel.send(&msg).await {
         Ok(receipt) => {
@@ -498,10 +508,15 @@ async fn process_job(
                     breaker::record_failure(pool, channel.name(), probe, &cfg.breaker).await?;
                 if open {
                     // The breaker is open (this failure may have opened it): park the job
-                    // until the cooldown ends instead of consuming its attempt.
-                    if finalize_deferred(pool, &job, token, &err, cfg.breaker.cooldown).await? {
+                    // until the cooldown (or a longer Retry-After) ends instead of consuming
+                    // its attempt.
+                    let delay = cfg
+                        .breaker
+                        .cooldown
+                        .max(err.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
+                    if finalize_deferred(pool, &job, token, &err, delay).await? {
                         info!(job_id = %job.id, alert_id = %job.alert_id, channel = channel.name(),
-                              delay = ?cfg.breaker.cooldown, class = err.class().as_str(),
+                              delay = ?delay, class = err.class().as_str(),
                               error = err.message(), "delivery deferred: channel breaker open");
                         Ok(Outcome::Deferred)
                     } else {
@@ -641,6 +656,9 @@ pub async fn work_once(
     }
     while let Some(res) = set.join_next().await {
         tally(&mut stats, &mut first_err, res);
+    }
+    if let Some(token) = probe {
+        breaker::release_probe(pool, channel.name(), token).await?;
     }
 
     match first_err {
