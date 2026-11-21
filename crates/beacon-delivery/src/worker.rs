@@ -221,6 +221,10 @@ pub async fn finalize_cancelled(
 /// `pending` with `due_at = now() + max(backoff_delay(policy, attempts), min(retry_after,
 /// MAX_RETRY_AFTER))`: the provider's requested minimum delay wins when larger, but it can
 /// never exceed the 10-minute cap. Returns `Some(new_status)` or `None` if the lease was lost.
+///
+/// `extra_floor` is an additional minimum delay (the channel breaker's cooldown for a real
+/// send that failed while the breaker is open): the retry waits out the cooldown as well as
+/// its own backoff, so the next attempt cannot come back before the next probe window.
 pub async fn finalize_failed(
     pool: &PgPool,
     job: &DeliveryJob,
@@ -228,9 +232,50 @@ pub async fn finalize_failed(
     err: &SendError,
     policy: &BackoffPolicy,
 ) -> Result<Option<crate::model::JobStatus>, sqlx::Error> {
-    Ok(finalize_failed_inner(pool, job, token, err, policy)
-        .await?
-        .map(|outcome| outcome.status))
+    Ok(
+        finalize_failed_inner(pool, job, token, err, policy, Duration::ZERO)
+            .await?
+            .map(|outcome| outcome.status),
+    )
+}
+
+/// Like [`finalize_failed`], but the retry delay also respects `cooldown`:
+/// `due_at = now() + max(backoff_delay(policy, attempts), cooldown,
+/// min(retry_after, MAX_RETRY_AFTER))`.
+///
+/// Use this for a REAL send attempt that failed while the breaker is (or just became) open:
+/// the attempt is consumed (`attempts` stays incremented), and the job waits out the
+/// cooldown before it can be probed again. Jobs that never reached the provider (breaker
+/// opened while they waited for a send slot) go through [`finalize_deferred`] instead and
+/// keep their refund.
+///
+/// # Retry horizon (SPEC §9 scenario c)
+///
+/// A failed probe pushes its own job's `due_at` out by `max(backoff, cooldown, Retry-After)`,
+/// while [`claim_batch`] always takes the earliest-`due_at` job first, so consecutive probes
+/// round-robin across jobs instead of hammering one row. Probes are spaced at least `cooldown`
+/// apart (one probe per `open_until` window), and every probe consumes one attempt, so a batch
+/// of `N` jobs survives at least `N * max_attempts * cooldown` worst case before the first
+/// death: the SPEC §9c batch (`N = 50`, `max_attempts = 8`, test cooldown `0.3 s`) gives
+/// `50 * 8 * 0.3 = 120 s > 60 s`, and production defaults (`N = 50`, `max_attempts = 8`,
+/// cooldown `5 s`) give `2000 s`. A single job's *expected* horizon with production defaults
+/// (backoff base `1 s`, cap `60 s`: per-attempt uppers `1,2,4,8,16,32,60 s`, mean `upper/2`,
+/// floored by the `5 s` cooldown) is `5+5+5+5+8+16+30 = 74 s > 60 s`. `retry_horizon_stays_above_sixty_seconds`
+/// in `tests/delivery_m4.rs` pins this arithmetic; the sustained-outage test there pins the
+/// other end (a horizon-long outage does reach `dead` with exactly one fallback).
+pub async fn finalize_failed_while_open(
+    pool: &PgPool,
+    job: &DeliveryJob,
+    token: Uuid,
+    err: &SendError,
+    policy: &BackoffPolicy,
+    cooldown: Duration,
+) -> Result<Option<crate::model::JobStatus>, sqlx::Error> {
+    Ok(
+        finalize_failed_inner(pool, job, token, err, policy, cooldown)
+            .await?
+            .map(|outcome| outcome.status),
+    )
 }
 
 /// What `finalize_failed_inner` did to one job.
@@ -247,6 +292,7 @@ async fn finalize_failed_inner(
     token: Uuid,
     err: &SendError,
     policy: &BackoffPolicy,
+    cooldown_floor: Duration,
 ) -> Result<Option<FailedOutcome>, sqlx::Error> {
     let dead = matches!(err, SendError::Permanent(_)) || job.attempts >= job.max_attempts;
     let mut tx = pool.begin().await?;
@@ -268,8 +314,11 @@ async fn finalize_failed_inner(
         // larger, but it is clamped to MAX_RETRY_AFTER (10 minutes): a hostile
         // or broken Retry-After must not park a job for years, whatever any channel
         // produced (the gateway channel clamps its own values as well; this is defence in
-        // depth for every other channel).
+        // depth for every other channel). `cooldown_floor` is the breaker's cooldown, nonzero
+        // only for a real attempt that failed while the breaker is open: the job must wait
+        // out the cooldown as well as its own backoff before it can be probed again.
         let delay = backoff_delay(policy, job.attempts)
+            .max(cooldown_floor)
             .max(err.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
         sqlx::query(
             "UPDATE delivery_jobs \
@@ -308,12 +357,17 @@ async fn finalize_failed_inner(
     }))
 }
 
-/// Put a claimed job back to `pending` WITHOUT consuming its attempt: the channel breaker is
-/// (now) open, so the send must wait out the cooldown instead of counting against
+/// Put a claimed job back to `pending` WITHOUT consuming its attempt: the job never
+/// reached the provider in this attempt (the channel breaker opened while it waited for a
+/// send slot), so the send must wait out the cooldown instead of counting against
 /// `max_attempts` ("deferred jobs don't consume attempts", SPEC §2.3). Sets
 /// `attempts = attempts - 1` (the refund), `due_at = now() + delay`, records the error, clears
 /// the lease; fenced by `token` like the other finalizers. Returns `false` if the lease was
 /// lost.
+///
+/// This is ONLY for sends that never happened. A real send attempt that failed always consumes
+/// its attempt, even when the breaker is or becomes open: those go through
+/// [`finalize_failed_while_open`], never here.
 pub async fn finalize_deferred(
     pool: &PgPool,
     job: &DeliveryJob,
@@ -355,7 +409,8 @@ enum Outcome {
     Sent,
     Cancelled,
     Retried,
-    /// Put back to `pending` with the attempt refunded (channel breaker open).
+    /// Put back to `pending` with the attempt refunded: the job never reached the
+    /// provider (breaker opened while it waited for a send slot).
     Deferred,
     /// Died; the payload is how many fallback jobs were created for it.
     Dead(u64),
@@ -450,21 +505,40 @@ async fn process_job(
                 let open =
                     breaker::record_failure(pool, channel.name(), probe, &cfg.breaker).await?;
                 if open {
-                    // The breaker is open (this failure may have opened it): park the job
-                    // until the cooldown (or a longer Retry-After) ends instead of consuming
-                    // its attempt.
-                    let delay = cfg
-                        .breaker
-                        .cooldown
-                        .max(err.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
-                    if finalize_deferred(pool, &job, token, &err, delay).await? {
-                        info!(job_id = %job.id, alert_id = %job.alert_id, channel = channel.name(),
-                              delay = ?delay, class = err.class().as_str(),
-                              error = err.message(), "delivery deferred: channel breaker open");
-                        Ok(Outcome::Deferred)
-                    } else {
-                        warn!(job_id = %job.id, "lease lost while deferring");
-                        Ok(Outcome::LostLease)
+                    // The breaker is open (this failure may have opened it): this WAS a real
+                    // send attempt, so the attempt is consumed. The job goes back to `pending`
+                    // with `due_at = now() + max(backoff, cooldown, Retry-After clamped)` so it
+                    // respects the cooldown; the backoff growth spreads consecutive probes
+                    // across jobs via the claim's `due_at` ordering. A sustained outage therefore
+                    // exhausts `max_attempts` instead of looping on refunds, and the job reaches
+                    // `dead` (+ one-hop fallback) once the horizon is spent.
+                    match finalize_failed_inner(
+                        pool,
+                        &job,
+                        token,
+                        &err,
+                        &cfg.backoff,
+                        cfg.breaker.cooldown,
+                    )
+                    .await?
+                    {
+                        Some(outcome) if outcome.status == JobStatus::Dead => {
+                            info!(job_id = %job.id, attempts = job.attempts, channel = channel.name(),
+                                  class = err.class().as_str(), error = err.message(),
+                                  fallbacks = outcome.fallbacks,
+                                  "delivery dead during channel breaker open");
+                            Ok(Outcome::Dead(outcome.fallbacks))
+                        }
+                        Some(_) => {
+                            warn!(job_id = %job.id, attempts = job.attempts, channel = channel.name(),
+                                  class = err.class().as_str(), error = err.message(),
+                                  "delivery failed while breaker open, will retry after cooldown");
+                            Ok(Outcome::Retried)
+                        }
+                        None => {
+                            warn!(job_id = %job.id, "lease lost while deferring");
+                            Ok(Outcome::LostLease)
+                        }
                     }
                 } else {
                     finish_failed(pool, &job, token, &err, &cfg.backoff).await
@@ -482,7 +556,7 @@ async fn finish_failed(
     err: &SendError,
     policy: &BackoffPolicy,
 ) -> Result<Outcome, sqlx::Error> {
-    match finalize_failed_inner(pool, job, token, err, policy).await? {
+    match finalize_failed_inner(pool, job, token, err, policy, Duration::ZERO).await? {
         Some(outcome) if outcome.status == JobStatus::Dead => {
             info!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
                   error = err.message(), fallbacks = outcome.fallbacks, "delivery dead");

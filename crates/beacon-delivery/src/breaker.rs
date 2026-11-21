@@ -8,9 +8,11 @@
 //! - after `open_until`: exactly one worker wins the probe: `state='half_open'`, fresh
 //!   `probe_token`, `probe_until = now() + probe_lease` (15 s). It claims ONE job.
 //!   - probe sent OK → `closed`, failures 0, probe fields cleared.
-//!   - probe failed transiently → `open` again with a new `open_until`; the probe job is
-//!     *deferred*: back to `pending`, its attempt refunded (`attempts = attempts - 1`), `due_at =
-//!     open_until` ("deferred jobs don't consume attempts").
+//!   - probe failed transiently → `open` again with a new `open_until`; the probe job is a
+//!     REAL send attempt, so it consumes its attempt and goes back to `pending` with
+//!     `due_at = now() + max(backoff, cooldown, Retry-After clamped)` ("failed real attempts
+//!     consume attempts, even while the breaker is open"; only jobs that never reached the
+//!     provider are deferred with a refund).
 //!   - probe worker crashed: once `probe_until` passes, another worker may take the probe
 //!     (no deadlock in `half_open`).
 //! - Permanent errors (bad address) never count: they say nothing about the provider.
