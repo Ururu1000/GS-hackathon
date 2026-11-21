@@ -192,6 +192,8 @@ export interface RunbookDef {
   url?: string
   text?: string
   steps: RunbookStepDef[]
+  /** Starts at 1; each published change adds one. */
+  revision?: number
 }
 
 export const RUNBOOKS: RunbookDef[] = [
@@ -385,4 +387,24 @@ export function deliveriesFor(a: FeedAlert, plan: DeliveryPlan, people: Map<stri
     const sent = new Date(sendAt).toISOString()
     return { ...base, state: 'sent', attempts: 1 + (h % 4 === 0 ? 1 : 0), last_error: null, sent_at: sent, updated_at: sent }
   })
+}
+
+/**
+ * Runbook changes the mock applies after seeding, so alerts that froze the
+ * earlier revision show a post-incident diff once they are resolved.
+ */
+export function reviseRunbook(book: RunbookDef): RunbookDef | null {
+  if (book.id !== 'settlement-timeout') return null
+  const [check, retry, escalate] = book.steps
+  if (!check || !retry || !escalate) return null
+  return {
+    ...book,
+    revision: (book.revision ?? 1) + 1,
+    steps: [
+      { ...check, text: 'Is the counterparty service healthy? Check its status page as well' },
+      retry,
+      { id: 'notify-desk', kind: 'manual', text: 'Tell the settlements desk in #settlements-ops before escalating' },
+      escalate,
+    ],
+  }
 }

@@ -346,6 +346,11 @@ async fn without_an_actor_every_route_but_replies_is_401(pool: PgPool) {
     }
     let (status, _) = get(&format!("{base}/api/runbooks")).await;
     assert_eq!(status, 401, "GET /api/runbooks needs the session layer too");
+    let (status, _) = get(&format!("{base}/api/runbooks/settlement-timeout")).await;
+    assert_eq!(
+        status, 401,
+        "GET /api/runbooks/{{id}} needs the session layer too"
+    );
 
     // `/api/replies` authenticates by its timestamped signature instead.
     let body = json!({ "from": "+44 7700 900125", "text": "ACK" }).to_string();
@@ -950,6 +955,7 @@ async fn runbooks_lists_the_library(pool: PgPool) {
         json!({
             "items": [{
                 "id": "settlement-timeout",
+                "revision": 7,
                 "title": "Settlement timeout",
                 "format": "yaml",
                 "team": "settlements",
@@ -958,6 +964,45 @@ async fn runbooks_lists_the_library(pool: PgPool) {
         }),
         "{body}"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn runbook_detail_returns_the_current_templates(pool: PgPool) {
+    let mut dir = api_dir();
+    // s2 restarts a service (risk high → approval required even without `approval:`),
+    // s3 is a manual step without an action.
+    dir.runbooks.runbooks[0].steps[1].action = Some("restart_service".into());
+    dir.runbooks.runbooks[0].steps[2].kind = StepKind::Manual;
+    dir.runbooks.runbooks[0].steps[2].action = None;
+    dir.runbooks.runbooks[0].steps[0].text = "Retry {{workflowId}}".into();
+    let mut state = api_state(&pool, None);
+    state.dir = Arc::new(dir);
+    let base = serve_api_as(state, "user:bob").await;
+
+    let (status, body) = get(&format!("{base}/api/runbooks/settlement-timeout")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "id": "settlement-timeout",
+            "revision": 7,
+            "title": "Settlement timeout",
+            "format": "yaml",
+            "team": "settlements",
+            "steps": [
+                {"id": "s1", "kind": "action", "text": "Retry {{workflowId}}",
+                 "action": {"name": "retry_workflow", "label": "Retry workflow"}, "approval": "none"},
+                {"id": "s2", "kind": "action", "text": "Run step s2",
+                 "action": {"name": "restart_service", "label": "Restart service"}, "approval": "required"},
+                {"id": "s3", "kind": "manual", "text": "Run step s3", "action": null, "approval": "none"},
+            ],
+        }),
+        "{body}"
+    );
+
+    let (status, body) = get(&format!("{base}/api/runbooks/no-such-runbook")).await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
 }
 
 // ---------------------------------------------------------------------------------------------

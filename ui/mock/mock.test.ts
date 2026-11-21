@@ -348,6 +348,17 @@ it('starts, lists and ends a demo gateway outage', async () => {
   expect(await request('/api/simulator/outage?channel=sms', 200, 'DELETE')).toEqual({ outages: [] })
 })
 
+it('serves a runbook’s current revision and keeps the alert’s frozen copy', async () => {
+  const detail = await request('/api/runbooks/settlement-timeout')
+  expect(detail).toMatchObject({ id: 'settlement-timeout', revision: 2, team: 'settlements' })
+  expect(detail.steps.map((s: { id: string }) => s.id)).toEqual(['check-counterparty', 'retry', 'notify-desk', 'escalate'])
+  expect(detail.steps.find((s: { id: string }) => s.id === 'escalate')).toMatchObject({ approval: 'required', action: { name: 'escalate', label: 'Escalate' } })
+  expect(detail.steps.find((s: { id: string }) => s.id === 'retry').text).toContain('{{workflowId}}')
+  await request('/api/runbooks/nope', 404)
+  const { items } = await request('/api/runbooks')
+  expect(items.find((r: { id: string }) => r.id === 'settlement-timeout').revision).toBe(2)
+})
+
 it('suggests a mapping for a pasted event without storing it', async () => {
   const before = await request('/api/schemas')
   const event = { alertname: 'DiskFull', level: 'WARN', labels: { service: 'ledger', env: 'prod' }, ts: 1763700000, summary: 'Disk 95% full' }

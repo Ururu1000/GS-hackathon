@@ -6,7 +6,8 @@
 //! | `POST /api/alerts/{id}/steps/{step}/run` `{expected_version?}` | `202 {execution_id}` | `403 forbidden` (actor not on the alert's team); `404 not_found`; `409 approval_required` (+`error.approval_id`); `409 invalid_transition` (alert resolved, step disabled/condition unmet, already queued/running, not an action step, or no one else can approve this step) |
 //! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `403 forbidden` (team); `400 bad_request` (not a manual step); `404` |
 //! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden` (not eligible, or the requester — nobody approves their own request); `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
-//! | `GET /api/runbooks` | `200 {items}` | |
+//! | `GET /api/runbooks` | `200 {items}` (RunbookSummary, with `revision`) | |
+//! | `GET /api/runbooks/{runbookId}` | `200 {id, revision, title, format, team, steps: [{id, kind, text, action: {name, label} \| null, approval}]}` (current library version, step templates unrendered) | `401`; `404 not_found` |
 //! | `GET /api/people/directory` | `200 {items}` of `PersonDirectoryEntry` (`{id, name, teams}`) | `401 unauthorized` |
 //! | `GET /api/people` | `200 {items}` of `PersonView` | `401 unauthorized` |
 //! | `GET /api/teams` | `200 {items}` of `TeamView` | `401 unauthorized` |
@@ -267,6 +268,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/approvals/{id}/approve", post(approve_handler))
         .route("/api/approvals/{id}/reject", post(reject_handler))
         .route("/api/runbooks", get(runbooks_handler))
+        .route("/api/runbooks/{runbook_id}", get(runbook_detail_handler))
         .route("/api/people/directory", get(directory_handler))
         .route("/api/people", get(people_handler))
         .route("/api/teams", get(teams_handler))
@@ -646,6 +648,20 @@ async fn runbooks_handler(
     let _actor = actor.map(|a| a.0).ok_or_else(unauthorized)?;
     let items = crate::runbook::list_items(&state.dir.runbooks);
     Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
+}
+
+/// `GET /api/runbooks/{runbookId}`: the current library version of one runbook with its
+/// step templates ([`crate::runbook::detail_item`]); same access as the list (any
+/// session), `404 not_found` for an unknown id.
+async fn runbook_detail_handler(
+    State(state): State<ApiState>,
+    Path(runbook_id): Path<String>,
+    actor: Option<axum::Extension<Actor>>,
+) -> Result<Response, ApiError> {
+    let _actor = actor.map(|a| a.0).ok_or_else(unauthorized)?;
+    let item = crate::runbook::detail_item(&state.dir.runbooks, &runbook_id)
+        .ok_or_else(|| not_found(format!("unknown runbook {runbook_id:?}")))?;
+    Ok((StatusCode::OK, Json(item)).into_response())
 }
 
 // ---------------------------------------------------------------------------------------------
