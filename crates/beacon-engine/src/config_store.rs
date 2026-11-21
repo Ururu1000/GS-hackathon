@@ -230,16 +230,29 @@ pub async fn update(pool: &PgPool, id: &str, spec: &Value, expected_revision: i6
         return Ok(Err(WriteError::Invalid(vec![Invalid { path: "id".into(), message: format!("must match the URL ({id})") }])));
     }
     let mut tx = pool.begin().await?;
-    lock_rules(&mut tx).await?;
-    let Some(existing) = current(&mut tx, id, true).await?.filter(|e| !e.deleted) else {
+    let res = update_in(&mut tx, id, spec, expected_revision, actor).await?;
+    if res.is_ok() {
+        tx.commit().await?;
+    }
+    Ok(res)
+}
+
+/// Compare-and-set update inside the caller's transaction (already validated
+/// by the caller via [`validate`]), so a rule write can commit atomically with
+/// other state, e.g. a proposal being accepted.
+pub async fn update_in(tx: &mut PgConnection, id: &str, spec: &Value, expected_revision: i64, actor: &str) -> Result<Result<StoredRule, WriteError>> {
+    if let Err(p) = validate(spec) {
+        return Ok(Err(WriteError::Invalid(p)));
+    }
+    lock_rules(&mut *tx).await?;
+    let Some(existing) = current(&mut *tx, id, true).await?.filter(|e| !e.deleted) else {
         return Ok(Err(WriteError::NotFound));
     };
     if existing.revision != expected_revision {
         return Ok(Err(WriteError::Conflict(Some(existing))));
     }
-    write(&mut tx, id, spec, existing.revision + 1, actor).await?;
-    let saved = current(&mut tx, id, false).await?.context("rule just written")?;
-    tx.commit().await?;
+    write(&mut *tx, id, spec, existing.revision + 1, actor).await?;
+    let saved = current(&mut *tx, id, false).await?.context("rule just written")?;
     Ok(Ok(saved))
 }
 

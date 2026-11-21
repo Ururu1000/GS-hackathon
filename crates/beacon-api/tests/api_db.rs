@@ -492,3 +492,42 @@ async fn proposals_lifecycle(pool: PgPool) {
     assert_eq!((s, e["error"]["details"][0]["path"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("kind")));
     assert_eq!(get(&h.app, "/api/proposals?state=nope").await.0, StatusCode::BAD_REQUEST);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn proposal_decisions_are_atomic_and_routes_checked(pool: PgPool) {
+    beacon_engine::config_store::seed_from_yaml(&pool, &root().join("config")).await.unwrap();
+    let h = harness(pool.clone());
+    let (_, r) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+    for round in 0..8 {
+        let rev = r["revision"].as_i64().unwrap() + round;
+        let (_, cur) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+        assert_eq!(cur["revision"].as_i64(), Some(rev));
+        let mut proposed = cur["rule"].clone();
+        proposed["dedup"] = json!({"key": ["raw.payload.tradeId"], "window": format!("{}m", 20 + round)});
+        let (_, p) = send(&h.app, "POST", "/api/proposals", &h.csrf, Some(json!({"rule_id": "rates-rejected-trades", "base_revision": rev, "kind": "noisy", "summary": "s", "proposed_rule": proposed}))).await;
+        let pid = p["id"].as_str().unwrap().to_string();
+        let (acc, rej) = (format!("/api/proposals/{pid}/accept"), format!("/api/proposals/{pid}/reject"));
+        let (a, b) = tokio::join!(send(&h.app, "POST", &acc, &h.csrf, None), send(&h.app, "POST", &rej, &h.csrf, None));
+        let accepted = a.0 == StatusCode::OK;
+        assert_ne!(a.0 == StatusCode::OK, b.0 == StatusCode::OK, "exactly one decision wins");
+        let (_, after) = get(&h.app, "/api/rules/rates-rejected-trades").await;
+        let applied = after["revision"].as_i64() == Some(rev + 1);
+        assert_eq!(applied, accepted, "the rule changes if and only if the proposal was accepted");
+        if !accepted {
+            // Keep revisions moving so the loop's arithmetic holds.
+            send(&h.app, "PUT", "/api/rules/rates-rejected-trades", &h.csrf, Some(json!({"rule": after["rule"], "expected_revision": rev}))).await;
+        }
+    }
+    // Routing checks apply to proposals like to direct edits.
+    let session = Arc::new(Session::demo_with(&root().join("config"), "erin", false).unwrap());
+    let csrf = session.csrf_token.clone();
+    let (updates, _) = broadcast::channel(8);
+    let (_r, ready) = watch::channel(true);
+    let state = ApiState { pool, updates, ready, session, sources: Arc::new(vec![]), streams: Arc::new(tokio::sync::Semaphore::new(8)) };
+    let app = router(state, None);
+    let (_, pr) = get(&app, "/api/rules/pricing-engine-warnings").await;
+    let mut sneaky = pr["rule"].clone();
+    sneaky["route"] = json!([{"to": "team:settlements"}]);
+    let (s, _) = send(&app, "POST", "/api/proposals", &csrf, Some(json!({"rule_id": "pricing-engine-warnings", "base_revision": pr["revision"], "kind": "reroute", "summary": "s", "proposed_rule": sneaky}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "a proposal can't page a team the author can't see");
+}
