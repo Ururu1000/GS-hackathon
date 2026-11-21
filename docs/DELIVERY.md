@@ -78,17 +78,19 @@ cargo run -p beacon -- --migrate \
 
 ## Demos and measured results
 
-Measured on one laptop with `docker compose` and a debug build, except the latency row, which ran on GitHub Actions (release build).
+Rows marked *CI* (and the latency rows) ran on a GitHub Actions `ubuntu-latest` runner (2 vCPU, release build, `.github/workflows/loadtest.yml`). The other rows were measured on one laptop with `docker compose` and a debug build.
 
 | Scenario | Result |
 |---|---|
 | **60 s SMS gateway outage** (SPEC §9 c), `./scripts/demo_sms_outage.sh --events 50 --outage-secs 60` | 50/50 SMS sent, 0 failed, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 2 attempts per job; the last SMS went out **3.8 s** after the gateway came back. Phone calls for the same events were unaffected (all sent within 0.5 s). |
+| *CI, on main* (`b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383)): the same 60 s outage, 50 events | **PASS**: 50/50 SMS sent, 0 dead, 0 fallbacks, 50 distinct gateway receipts, 0 duplicates, at most 3 attempts per job; the last SMS went out **1.7 s** after the gateway came back |
 | Same outage with a single SMS (`--events 1`), the worst case for retries | sent, 0 failed: it used all 8 attempts, and the final-attempt floor kept the last one after the outage (sent 33 s after recovery) |
 | 1,000 emails over 8 workers into Mailpit (`DELIVERY_LOAD_TEST=1 cargo test -p beacon-delivery --test delivery_m0`) | each exactly once; **~47–163 msgs/s**, limited by Mailpit |
 | Escalation (4 s override) | unacked alert: carol (next on call) paged by phone + SMS; acked alert: timer cancelled, nobody else paged |
 | Throttle `{max: 2, per: 1m}`, 5 trades | 2 emails per person, 3 held back, then one digest each: "3 more alert(s) … were held back by throttling" |
 | Settlement-timeout runbook (SPEC M5) | health check ok → `retry_workflow` fails twice → `escalate` unlocks → approval SMS to carol → her `Y <code>` approves → `counterparty-support` (gina) emailed with the runbook steps; full audit timeline; no approval code left at rest |
 | **Ingest → delivery latency** (SPEC §9, M6), `./scripts/demo_latency.sh --events 500 --rate 50` on CI ([run 44867217055](https://github.com/Ururu1000/GS-hackathon/actions/runs/44867217055), commit `9140087`, ubuntu-latest, 2 vCPU, release build) | 500/500 events delivered, 0 missing, 0 dead. Ingest → fake-gateway receipt (sms + phone): **p50 862 ms, p90 1361 ms, p99 1751 ms, max 1970 ms**. Ingest → Mailpit email: **p50 904 ms, p90 1317 ms, p99 1542 ms, max 1578 ms**. Full table below. |
+| *CI, on main* (`b8a4905`, [run 44868458383](https://github.com/Ururu1000/GS-hackathon/actions/runs/44868458383)): the same latency workload again | 500/500 delivered, 0 missing. Gateway: **p50 952 / p90 1225 / p99 1606 / max 1804 ms**. Email: **p50 936 / p90 1204 / p99 1391 / max 1556 ms** |
 
 Run the settlement-timeout flow by hand against the stack above. The mock workflow engine is set to fail with `POST :8070/api/simulator/mock {"target":"workflows","mode":"fail"}` plus the gateway token. Post `samples/events/workflow-failed.json` to `:8090/ingest/webhook`, then run the steps with `POST :8071/api/alerts/<id>/steps/<s1|s2|s3>/run`, and answer the approval SMS through `POST :8070/api/simulator/reply`.
 
