@@ -1070,9 +1070,17 @@ async fn jobs_queued_behind_a_send_slot_do_not_send_once_the_breaker_opens(pool:
     let stats = work_once_bounded(&pool, &bad, &cfg).await;
     assert_eq!(stats.claimed, 3, "{stats:?}");
     assert_eq!(stats.deferred, 3, "{stats:?}");
-    assert_eq!(fake.calls(), 1, "only the send that opened the breaker goes out");
+    assert_eq!(
+        fake.calls(),
+        1,
+        "only the send that opened the breaker goes out"
+    );
     let jobs = job_rows(&pool, alert).await;
-    assert!(jobs.iter().all(|j| j.status == "pending" && j.attempts == 0), "{jobs:?}");
+    assert!(
+        jobs.iter()
+            .all(|j| j.status == "pending" && j.attempts == 0),
+        "{jobs:?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

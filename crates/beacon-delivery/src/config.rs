@@ -777,7 +777,11 @@ mod tests {
         let rules: Vec<serde_json::Value> = load_dir(&root.join("rules")).unwrap();
         assert!(!rules.is_empty(), "no seed rules found");
         for rule in &rules {
-            for entry in rule["route"].as_array().into_iter().flatten() {
+            // A rule without a route list would silently route to nobody: fail loudly.
+            let route = rule["route"]
+                .as_array()
+                .unwrap_or_else(|| panic!("rule {}: route must be a list", rule["id"]));
+            for entry in route {
                 let to = entry["to"].as_str().unwrap();
                 let people = d
                     .expand(to)

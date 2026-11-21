@@ -21,6 +21,11 @@
 //! | `DELIVERY_API_ADDR`  | `127.0.0.1:8071`                          | delivery-api      |
 //! | `DELIVERY_API_URL`   | `http://127.0.0.1:8071` (reply forward)   | gateway           |
 //! | `DELIVERY_API_DEMO_ACTOR` | `user:bob` (dev only)                | delivery-api      |
+//! | `DELIVERY_API_DEMO_HEADER` | `0`; `1` honours `X-Beacon-Demo-Actor` (dev only) | delivery-api |
+//! | `SMTP_TLS`           | `none` \| `starttls` \| `tls`            | delivery          |
+//! | `SMTP_USERNAME` / `SMTP_PASSWORD` | unset                        | delivery          |
+//! | `SMTP_ALLOW_PLAINTEXT` | `0`; `1` allows plaintext to a non-local host | delivery    |
+//! | `GATEWAY_MAX_STREAMS` | `64` concurrent simulator SSE streams    | gateway           |
 //! | `DB_MAX_CONNECTIONS` | sized from the roles (see `pool_size`)    | all               |
 //! | `SHUTDOWN_GRACE_SECS`| `20` (drain time after SIGTERM/SIGINT)    | all               |
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
@@ -371,8 +376,14 @@ async fn main() -> Result<()> {
                     beacon_delivery::api::Actor(env_or("DELIVERY_API_DEMO_ACTOR", "user:bob"));
                 let rx = shutdown_rx.clone();
                 tasks.spawn(async move {
-                    if let Err(e) =
-                        beacon_delivery::api::serve_standalone(state, addr, actor, rx).await
+                    if let Err(e) = beacon_delivery::api::serve_standalone(
+                        state,
+                        addr,
+                        actor,
+                        rx,
+                        env_or("DELIVERY_API_DEMO_HEADER", "0") == "1",
+                    )
+                    .await
                     {
                         tracing::error!(error = %e, "delivery-api stopped");
                     }
@@ -409,10 +420,26 @@ async fn main() -> Result<()> {
                 {
                     let channel: Arc<dyn Channel> = match name {
                         "email" => {
+                            let tls = match env_or("SMTP_TLS", "none").as_str() {
+                                "none" => beacon_delivery::channel::email::SmtpTls::None,
+                                "starttls" => beacon_delivery::channel::email::SmtpTls::StartTls,
+                                "tls" => beacon_delivery::channel::email::SmtpTls::Tls,
+                                other => {
+                                    bail!("SMTP_TLS: unknown value {other:?} (none, starttls, tls)")
+                                }
+                            };
                             let smtp = SmtpConfig {
                                 host: env_or("SMTP_HOST", "localhost"),
                                 port: env_or("SMTP_PORT", "1025").parse().context("SMTP_PORT")?,
                                 from: env_or("MAIL_FROM", "Beacon <beacon@example.test>"),
+                                tls,
+                                username: std::env::var("SMTP_USERNAME")
+                                    .ok()
+                                    .filter(|v| !v.is_empty()),
+                                password: std::env::var("SMTP_PASSWORD")
+                                    .ok()
+                                    .filter(|v| !v.is_empty()),
+                                allow_plaintext: env_or("SMTP_ALLOW_PLAINTEXT", "0") == "1",
                                 ..SmtpConfig::default()
                             };
                             info!(host = %smtp.host, port = smtp.port, "email worker starting");
@@ -458,7 +485,12 @@ async fn main() -> Result<()> {
                         Some(env_or("DELIVERY_API_URL", "http://127.0.0.1:8071")),
                         reply_secret(),
                     )
-                    .with_mocks();
+                    .with_mocks()
+                    .with_max_streams(
+                        env_or("GATEWAY_MAX_STREAMS", "64")
+                            .parse()
+                            .context("GATEWAY_MAX_STREAMS")?,
+                    );
                 let rx = shutdown_rx.clone();
                 tasks.spawn(async move {
                     if let Err(e) = beacon_delivery::gateway::serve(state, addr, rx, |bound| {

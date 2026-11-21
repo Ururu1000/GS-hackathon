@@ -793,9 +793,11 @@ async fn mock_api_modes_calls_and_token(pool: PgPool) {
         start_mock_gateway_token(pool.clone(), Some("mock-token")).await;
     let http = reqwest::Client::new();
 
-    // GET is open and every target defaults to ok with an empty call log.
+    // GET is token-gated like every simulator route; every target defaults to ok with an
+    // empty call log.
     let status: Value = http
         .get(format!("{base_url}/api/simulator/mock"))
+        .bearer_auth("mock-token")
         .send()
         .await
         .expect("GET mock status")
@@ -848,6 +850,7 @@ async fn mock_api_modes_calls_and_token(pool: PgPool) {
     );
     let status: Value = http
         .get(format!("{base_url}/api/simulator/mock"))
+        .bearer_auth("mock-token")
         .send()
         .await
         .expect("GET status")
@@ -904,6 +907,130 @@ async fn mock_api_modes_calls_and_token(pool: PgPool) {
         resp.json::<Value>().await.expect("ticket JSON"),
         json!({"ok": true})
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 9. Audit #11: path segments are validated; outputs lose queries and credentials.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn invalid_path_segments_fail_the_action_without_a_request(pool: PgPool) {
+    let (_state, base_url, _shutdown) = start_mock_gateway(pool.clone()).await;
+    let registry = ActionRegistry::builtin(actions_config(&base_url));
+    let dir = empty_dir();
+    let alert = common::insert_alert(&pool, "open", "segment validation").await;
+
+    // `..`, `.`, empty, and anything with `/` or `\` can never become part of the mock path.
+    for (step, action, params) in [
+        ("s1", "retry_workflow", json!({"workflowId": ".."})),
+        ("s2", "retry_workflow", json!({"workflowId": "a/b"})),
+        ("s3", "restart_service", json!({"service": "a\\b"})),
+        ("s4", "restart_service", json!({"service": "."})),
+        ("s5", "restart_service", json!({"service": ""})),
+    ] {
+        let id = queue_exec(&pool, alert, step, action, params)
+            .await
+            .expect("queue");
+        run(&pool, &dir, &registry).await;
+        let (state, output, _) = exec_state(&pool, id).await;
+        assert_eq!(state, "failed", "{step}");
+        assert_eq!(
+            output.as_deref(),
+            Some("invalid path segment"),
+            "{step}: {output:?}"
+        );
+    }
+
+    // Nothing ever reached the gateway's mock targets.
+    let status: Value = reqwest::Client::new()
+        .get(format!("{base_url}/api/simulator/mock"))
+        .bearer_auth("mock-token")
+        .send()
+        .await
+        .expect("mock status")
+        .json()
+        .await
+        .expect("status JSON");
+    assert_eq!(status["calls"], json!([]), "{status}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn outputs_strip_url_queries_and_credentials(pool: PgPool) {
+    // A target that echoes credentials back in its error body.
+    let leak = axum::Router::new().route(
+        "/leak/x",
+        axum::routing::get(|| async {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Authorization: Bearer hunter2 and token=hunter2 in the body",
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind leak server");
+    let leak_base = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        axum::serve(listener, leak).await.expect("leak server");
+    });
+
+    let (_state, base_url, _shutdown) = start_mock_gateway(pool.clone()).await;
+    let cfg = ActionsConfig {
+        gateway_url: base_url.clone(),
+        http_targets: HashMap::from([
+            (
+                "counterparty-service".to_string(),
+                format!("{base_url}/mock/health/counterparty-service"),
+            ),
+            ("leaky".to_string(), format!("{leak_base}/leak")),
+        ]),
+        timeout: Duration::from_secs(5),
+    };
+    let registry = ActionRegistry::builtin(cfg);
+    let dir = empty_dir();
+    let alert = common::insert_alert(&pool, "open", "redaction test").await;
+
+    // 1. The stored output drops the request URL's query string (the request keeps it).
+    let id = queue_exec(
+        &pool,
+        alert,
+        "s1",
+        "http_get",
+        json!({"url": "http://counterparty-service/health?token=hunter2&verbose=1"}),
+    )
+    .await
+    .expect("queue");
+    run(&pool, &dir, &registry).await;
+    let (state, output, _) = exec_state(&pool, id).await;
+    assert_eq!(state, "ok", "{output:?}");
+    let output = output.unwrap();
+    assert!(!output.contains('?'), "the query survived: {output:?}");
+    assert!(!output.contains("hunter2"), "{output:?}");
+
+    // 2. Credential-shaped snippets (bearer/basic headers, token= values) never reach the
+    //    stored output or the audit trail either.
+    let id = queue_exec(
+        &pool,
+        alert,
+        "s2",
+        "http_get",
+        json!({"url": "http://leaky/x?sig=hunter2"}),
+    )
+    .await
+    .expect("queue");
+    run(&pool, &dir, &registry).await;
+    let (state, output, _) = exec_state(&pool, id).await;
+    assert_eq!(state, "failed", "{output:?}");
+    let output = output.unwrap();
+    assert!(
+        !output.contains("hunter2"),
+        "the credential survived: {output:?}"
+    );
+    assert!(output.contains("[REDACTED]"), "{output:?}");
+    assert!(!output.contains('?'), "{output:?}");
+    for message in audit_messages(&pool, alert, "step_run").await {
+        assert!(!message.contains("hunter2"), "the audit leaked: {message}");
+    }
 }
 
 async fn set_mock_mode_authed(http: &reqwest::Client, base_url: &str, target: &str, mode: &str) {

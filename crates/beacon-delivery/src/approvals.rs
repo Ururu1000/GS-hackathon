@@ -5,8 +5,11 @@
 //!   (`approval: required`, or the action's risk is `high`). Inside the caller's tx: if a pending
 //!   request exists for (alert, step), return it (no new SMS); else insert one with frozen
 //!   action + params, `eligible` = the alert team's lead + the current on-call person of every
-//!   schedule that team defines (`user:<id>`, deduplicated; the requester may approve only if
-//!   eligible), `expires_at = now() + 15 min`, a random 4-digit code (`0000`–`9999`) stored only
+//!   schedule that team defines (`user:<id>`, deduplicated) **minus the requester** — nobody may
+//!   decide their own request (audit #11 self-approval), so the requester is never prompted and
+//!   never eligible; if that leaves nobody at all, `request` fails with
+//!   `RequestError::NoEligibleApprover`. `expires_at = now() + 15 min`, a random 4-digit code
+//!   (`0000`–`9999`) stored only
 //!   as `sms_code_hash = hex(sha256(id || ":" || code))`. The draw is collision-safe: inside the
 //!   same tx, take `pg_advisory_xact_lock(hashtext('approval-code:' || person))` per eligible
 //!   person (persons sorted, so concurrent requests lock in one order and cannot deadlock),
@@ -26,12 +29,16 @@
 //!   so a prompt for someone this notification already paged on sms (the demo's on-call bob)
 //!   simply reuses the alert's current `notify_seq` — the step column keeps it a second job
 //!   next to the original page (step 0), and a later real renotify is never swallowed.
-//! - **Decide** (`decide`): ONE tx: `SELECT ... FOR UPDATE`; not found → `NotFound`; actor not in
-//!   `eligible` → `Forbidden`; state not `pending` → `AlreadyDecided(state)`; `expires_at <=
-//!   now()` → set `expired`, `Expired`; alert not `open` (resolved) → `InvalidTransition`.
+//! - **Decide** (`decide`): ONE tx: `SELECT ... FOR UPDATE`; not found → `NotFound`; the actor
+//!   is the requester → `Forbidden("the requester cannot approve their own request")` (audit
+//!   #11: even when a foreign row lists the requester as eligible, they may not decide it);
+//!   actor not in `eligible` → `Forbidden`; state not `pending` → `AlreadyDecided(state)`;
+//!   `expires_at <= now()` → set `expired`, `Expired`; alert not `open` (resolved) →
+//!   `InvalidTransition`.
 //!   Approve: `state='approved'`, `decided_*`, queue the execution (`actions::queue` with
 //!   `approval_id`), store `execution_id`, audit, `AlertOps::touch`. Reject: `state='rejected'`,
-//!   audit, touch.
+//!   audit, touch. Whichever way an approval leaves `pending` here (approved, rejected or
+//!   expired), the same tx scrubs its plaintext code at rest (below).
 //! - **SMS reply** (`handle_reply`): `from` (E.164, compare digits only) → the person in the
 //!   Directory with that phone; unknown → `Unknown`. Text, trimmed, case-insensitive:
 //!   `Y <code>` | `YES <code>` | `APPROVE <code>` → approve; `N <code>` | `NO <code>` |
@@ -44,8 +51,24 @@
 //!   the request in the UI; on no match increment
 //!   `sms_attempts` of those pending approvals and expire any that reach 5 (`TooManyAttempts`).
 //!   A repeated reply for an already-decided approval returns `AlreadyDecided` (idempotent, no
-//!   side effects); so does a code that matches an approval that is no longer pending
-//!   (approved/rejected/expired).
+//!   side effects); so does a code that matches an approval that is no longer actionable
+//!   (approved/rejected/expired, or pending past its expiry). Only pending approvals that have
+//!   not expired are candidates for a code (audit #11: an expired approval sharing the code must
+//!   not make the reply ambiguous); the candidate scan is bounded (`LIMIT 200`) and locks rows in
+//!   a fixed order (`ORDER BY id FOR UPDATE`) so concurrent replies cannot deadlock, and hashes
+//!   are compared in constant time.
+//!
+//! **Codes never survive at rest after the decision (audit #11).** The plaintext code exists in
+//! exactly two places outside the `approvals` row's hash: the prompt jobs'
+//! `delivery_jobs.route_info.approval.code` (the SMS must carry it) and the gateway's
+//! `gateway_receipts.text`/`approval_challenge` once the provider accepted the prompt. The
+//! moment an approval stops being `pending` — approved or rejected in `decide_in_tx`, expired
+//! on a decide, expired by the 5-wrong-attempt rule, or swept by [`expire_stale`] — the same
+//! transaction runs [`scrub_code`]: the prompt jobs' `route_info` drops `approval.code`
+//! (`route_info #- '{approval,code}'`, `updated_at = now()`) and the matching `gateway_receipts`
+//! rows lose `approval_challenge` and have every 4-digit run in `text` masked to `****`. A
+//! prompt job still pending at that point simply renders as a plain alert SMS
+//! (`channel::gateway_client` treats a codeless approval object as a non-prompt).
 
 use chrono::{DateTime, Utc};
 use rand::Rng;
@@ -93,8 +116,9 @@ pub enum DecideOutcome {
 pub enum DecideError {
     #[error("approval not found")]
     NotFound,
-    #[error("not eligible to decide this approval")]
-    Forbidden,
+    /// Why the actor may not decide: not eligible, or the requester (self-approval, audit #11).
+    #[error("{0}")]
+    Forbidden(String),
     #[error("approval already {0}")]
     AlreadyDecided(String),
     #[error("approval expired")]
@@ -105,13 +129,16 @@ pub enum DecideError {
     Db(String),
 }
 
-/// `request` fails when the database does, or when no free code is left: with 10,000 codes,
+/// `request` fails when the database does, when no free code is left: with 10,000 codes,
 /// 50 redraws without a hit mean ~9,990 live codes already share an eligible person with
-/// this request.
+/// this request — or when the requester is the only person who could decide (audit #11:
+/// nobody may approve their own request).
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
     #[error("no free approval code after 50 tries")]
     NoFreeCode,
+    #[error("no one else can approve this step")]
+    NoEligibleApprover,
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -121,7 +148,8 @@ pub enum RequestError {
 /// run exactly the same checks and writes inside one transaction.
 enum Decided {
     NotFound,
-    Forbidden,
+    /// Why the actor may not decide (not eligible / the requester).
+    Forbidden(String),
     /// The request was already approved/rejected; carries that state.
     NotPending(String),
     /// `state = 'expired'` was written in the tx: commit it.
@@ -130,9 +158,10 @@ enum Decided {
     Applied(DecideOutcome),
 }
 
-/// `user:<id>` of everyone who may decide this approval: the alert team's lead plus the
-/// current on-call person of every schedule that team defines, deduplicated, lead first and
-/// schedules in id order so the array is stable.
+/// `user:<id>` of everyone who may decide an approval of `team_id`: the alert team's lead plus
+/// the current on-call person of every schedule that team defines, deduplicated, lead first and
+/// schedules in id order so the array is stable. The requester is removed by `request` (audit
+/// #11: they may never decide their own request).
 fn eligible_ids(dir: &Directory, team_id: &str) -> Vec<String> {
     fn push_unique(out: &mut Vec<String>, id: &str) {
         let entry = format!("user:{id}");
@@ -166,6 +195,74 @@ fn generate_code() -> String {
 /// `hex(sha256("<approval id>:<code>"))` — the only form of the code the database ever sees.
 fn code_hash(id: Uuid, code: &str) -> String {
     hex::encode(Sha256::digest(format!("{id}:{code}").as_bytes()))
+}
+
+/// Constant-time byte equality for comparing code hashes (audit #11): the accumulate-then-
+/// compare loop takes the same path for every input, so a mismatch never reveals how many
+/// bytes matched. Both sides are fixed-length hex digests, so the length check is not a
+/// useful signal.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+/// Scrub one approval's plaintext code from everywhere it lives at rest (audit #11), inside
+/// the caller's transaction: the prompt jobs' `route_info` loses `approval.code` (the rest of
+/// the approval object stays, so receipts can still be matched later), and the gateway
+/// receipts of those jobs lose `approval_challenge` and have every 4-digit run in `text`
+/// masked to `****` (the rendered prompt names the code twice, `Y <code>`/`N <code>`). Called
+/// whenever an approval leaves `pending`: `decide_in_tx` (approved/rejected/expired), the
+/// 5-wrong-attempt expiry in `code_decision`, and `expire_stale`.
+async fn scrub_code(
+    tx: &mut Transaction<'_, Postgres>,
+    approval_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let id = approval_id.to_string();
+    // The prompt jobs of THIS approval; #- deletes only the code key.
+    sqlx::query(
+        "UPDATE delivery_jobs \
+         SET route_info = route_info #- '{approval,code}', updated_at = now() \
+         WHERE route_info->>'target' = 'approval' \
+           AND route_info->'approval'->>'id' = $1",
+    )
+    .bind(&id)
+    .execute(&mut **tx)
+    .await?;
+    // The receipts the gateway wrote for exactly those jobs (it keys them by job id).
+    sqlx::query(
+        "UPDATE gateway_receipts r \
+         SET approval_challenge = NULL, \
+             text = regexp_replace(text, '\\d{4}', '****', 'g') \
+         WHERE r.job_id IN (SELECT id FROM delivery_jobs \
+                            WHERE route_info->>'target' = 'approval' \
+                              AND route_info->'approval'->>'id' = $1)",
+    )
+    .bind(&id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Expire every pending approval past `expires_at` and scrub its code at rest, in one tx
+/// (audit #11). Returns how many approvals expired. The actions worker calls this once per
+/// loop iteration — a single indexed UPDATE, cheap when there is nothing to do — so a request
+/// nobody decided never leaves its code in `delivery_jobs`/`gateway_receipts` forever.
+pub async fn expire_stale(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let expired: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE approvals SET state = 'expired', updated_at = now() \
+         WHERE state = 'pending' AND expires_at <= now() \
+         RETURNING id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for id in &expired {
+        scrub_code(&mut tx, *id).await?;
+    }
+    tx.commit().await?;
+    Ok(expired.len() as u64)
 }
 
 /// How many times `request` redraws before giving up on a code that no live approval of the
@@ -216,6 +313,16 @@ pub async fn request(
     };
 
     let eligible = eligible_ids(dir, &team);
+    // Self-approval is impossible (audit #11): the requester is never eligible for their own
+    // request and never gets a prompt SMS for it. If that leaves nobody who may decide, the
+    // step cannot be run at all.
+    let eligible: Vec<String> = eligible
+        .into_iter()
+        .filter(|who| who != requested_by)
+        .collect();
+    if eligible.is_empty() {
+        return Err(RequestError::NoEligibleApprover);
+    }
     let id = Uuid::new_v4();
 
     // One live code per eligible person: the transaction-scoped advisory lock per person
@@ -262,7 +369,8 @@ pub async fn request(
     .execute(&mut **tx)
     .await?;
 
-    // The SMS prompt: one sms job per eligible person with a phone. The code travels in the
+    // The SMS prompt: one sms job per eligible person with a phone (the requester is not in
+    // `eligible`, so they are never prompted for their own request). The code travels in the
     // job (the SMS must carry it); the table keeps only its hash.
     for who in &eligible {
         let Some(person_id) = who.strip_prefix("user:") else {
@@ -334,6 +442,7 @@ struct ApprovalRow {
     params: Value,
     eligible: Vec<String>,
     state: String,
+    requested_by: String,
     expires_at: DateTime<Utc>,
 }
 
@@ -350,7 +459,7 @@ async fn decide_in_tx(
     note: Option<&str>,
 ) -> Result<Decided, sqlx::Error> {
     let row = sqlx::query_as::<_, ApprovalRow>(
-        "SELECT alert_id, step_id, action, params, eligible, state, expires_at \
+        "SELECT alert_id, step_id, action, params, eligible, state, requested_by, expires_at \
          FROM approvals WHERE id = $1 FOR UPDATE",
     )
     .bind(approval_id)
@@ -363,23 +472,35 @@ async fn decide_in_tx(
         params,
         eligible,
         state,
+        requested_by,
         expires_at,
     }) = row
     else {
         return Ok(Decided::NotFound);
     };
+    // Self-approval is impossible, whatever the row says (audit #11): the requester may never
+    // decide their own request.
+    if actor == requested_by {
+        return Ok(Decided::Forbidden(
+            "the requester cannot approve their own request".into(),
+        ));
+    }
     if !eligible.iter().any(|e| e == actor) {
-        return Ok(Decided::Forbidden);
+        return Ok(Decided::Forbidden(
+            "not eligible to decide this approval".into(),
+        ));
     }
     if state != "pending" {
         return Ok(Decided::NotPending(state));
     }
     if expires_at <= Utc::now() {
-        // The request lapsed without a decision; free the (alert, step) slot for a new one.
+        // The request lapsed without a decision; free the (alert, step) slot for a new one and
+        // scrub the code at rest in the same tx.
         sqlx::query("UPDATE approvals SET state = 'expired', updated_at = now() WHERE id = $1")
             .bind(approval_id)
             .execute(&mut **tx)
             .await?;
+        scrub_code(tx, approval_id).await?;
         return Ok(Decided::Expired);
     }
     // Revalidate the alert before claiming the execution (SPEC §6.3). Resolved alerts are
@@ -439,6 +560,9 @@ async fn decide_in_tx(
     .bind(execution_id)
     .execute(&mut **tx)
     .await?;
+    // The approval has left `pending`: the plaintext code stops existing at rest in the same
+    // tx (audit #11).
+    scrub_code(tx, approval_id).await?;
     audit::record(
         tx,
         actor,
@@ -483,9 +607,9 @@ pub async fn decide(
             let _ = tx.rollback().await;
             Err(DecideError::NotFound)
         }
-        Ok(Decided::Forbidden) => {
+        Ok(Decided::Forbidden(message)) => {
             let _ = tx.rollback().await;
-            Err(DecideError::Forbidden)
+            Err(DecideError::Forbidden(message))
         }
         Ok(Decided::NotPending(state)) => {
             let _ = tx.rollback().await;
@@ -594,6 +718,11 @@ fn person_by_phone<'a>(dir: &'a Directory, from: &str) -> Option<&'a crate::conf
 
 /// Decide one approval from an SMS code reply: the same tx as the UI decide, with the
 /// attempt accounting of the module doc around it.
+///
+/// Audit #11 hardening: only pending approvals that have NOT expired are candidates (an
+/// expired one sharing the code must not make the reply ambiguous), the scan is bounded
+/// (`LIMIT 200`), rows lock in a fixed order (`ORDER BY id FOR UPDATE`, so concurrent replies
+/// cannot deadlock) and the hash comparison is constant time.
 async fn code_decision(
     pool: &PgPool,
     alert_ops: &dyn AlertOps,
@@ -602,11 +731,12 @@ async fn code_decision(
     code: &str,
 ) -> Result<ReplyOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // Lock every pending approval this person may decide; the reply decides exactly one —
-    // or, when the code matches several of them, none (`Ambiguous`).
+    // Lock every pending, unexpired approval this person may decide, in id order; the reply
+    // decides exactly one — or, when the code matches several of them, none (`Ambiguous`).
     let pendings: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, sms_code_hash FROM approvals \
-         WHERE state = 'pending' AND $1 = ANY(eligible) FOR UPDATE",
+         WHERE state = 'pending' AND expires_at > now() AND $1 = ANY(eligible) \
+         ORDER BY id LIMIT 200 FOR UPDATE",
     )
     .bind(actor)
     .fetch_all(&mut *tx)
@@ -615,7 +745,7 @@ async fn code_decision(
     // The pending approvals this code unlocks for the sender.
     let matching: Vec<Uuid> = pendings
         .iter()
-        .filter(|(id, hash)| code_hash(*id, code) == *hash)
+        .filter(|(id, hash)| ct_eq(code_hash(*id, code).as_bytes(), hash.as_bytes()))
         .map(|(id, _)| *id)
         .collect();
 
@@ -657,7 +787,7 @@ async fn code_decision(
                 Ok(ReplyOutcome::Unknown(m))
             }
             // Unreachable: the row was selected as this person's pending approval.
-            Ok(Decided::NotFound | Decided::Forbidden) => {
+            Ok(Decided::NotFound | Decided::Forbidden(_)) => {
                 let _ = tx.rollback().await;
                 Ok(ReplyOutcome::WrongCode)
             }
@@ -668,25 +798,27 @@ async fn code_decision(
         };
     }
 
-    // No pending match: a code belonging to an already-decided (or expired) approval is
-    // idempotently "already decided", not an attempt.
+    // No pending match: a code belonging to an already-decided approval, or to one still
+    // `pending` past its expiry, is idempotently "already decided" (nothing actionable is left
+    // to decide, and no attempt burns for it).
     let decided: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, sms_code_hash FROM approvals \
-         WHERE state <> 'pending' AND $1 = ANY(eligible)",
+         WHERE (state <> 'pending' OR expires_at <= now()) AND $1 = ANY(eligible)",
     )
     .bind(actor)
     .fetch_all(&mut *tx)
     .await?;
     if decided
         .iter()
-        .any(|(id, hash)| code_hash(*id, code) == *hash)
+        .any(|(id, hash)| ct_eq(code_hash(*id, code).as_bytes(), hash.as_bytes()))
     {
         let _ = tx.rollback().await;
         return Ok(ReplyOutcome::AlreadyDecided);
     }
 
     // A wrong code burns one SMS attempt on every pending approval of this person; the one
-    // that reaches [`MAX_SMS_ATTEMPTS`] expires (and frees its (alert, step) slot).
+    // that reaches [`MAX_SMS_ATTEMPTS`] expires (frees its (alert, step) slot) and has its
+    // code scrubbed at rest in the same tx (audit #11).
     if pendings.is_empty() {
         let _ = tx.rollback().await;
         return Ok(ReplyOutcome::WrongCode);
@@ -707,6 +839,9 @@ async fn code_decision(
     .bind(MAX_SMS_ATTEMPTS)
     .fetch_all(&mut *tx)
     .await?;
+    for id in &expired {
+        scrub_code(&mut tx, *id).await?;
+    }
     tx.commit().await?;
     if expired.is_empty() {
         Ok(ReplyOutcome::WrongCode)

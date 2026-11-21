@@ -17,6 +17,9 @@
 //! Hardening (delivery review):
 //! - redirects are disabled on the reqwest client (see above);
 //! - error bodies are read with a bounded loop (at most 4 KiB) instead of buffered whole;
+//! - success (200) bodies are read with a bounded loop too (at most 64 KiB) before JSON
+//!   parsing; an oversize success body is `SendError::Ambiguous` (the provider may have
+//!   accepted it, and buffering it whole would let a hostile provider eat memory);
 //! - `Retry-After` is clamped to [`MAX_RETRY_AFTER`] so no provider answer can park a job
 //!   for years;
 //! - [`GatewayClientConfig::token`] makes the channel send `Authorization: Bearer <token>`
@@ -229,6 +232,10 @@ fn classify_reqwest_error(e: &reqwest::Error) -> SendError {
 /// not be buffered whole, and must not delay the worker's retry decision. Reading used to be
 /// `resp.text().await`, which reads to EOF.
 const ERROR_BODY_MAX_BYTES: usize = 4096;
+/// Cap on success-body bytes read before JSON parsing: a huge 200 body must not be buffered
+/// whole either. An oversize success body maps to [`SendError::Ambiguous`]: the provider
+/// answered 200, so it may have accepted the message.
+const SUCCESS_BODY_MAX_BYTES: usize = 64 * 1024;
 /// Error snippets in `SendError` messages are kept short for logs and the job row.
 const SNIPPET_MAX_CHARS: usize = 300;
 
@@ -280,6 +287,29 @@ fn parse_retry_after(value: &str) -> Option<u64> {
             .unwrap_or(u64::MAX);
     }
     Some(secs.min(MAX_RETRY_AFTER.as_secs()))
+}
+
+/// Read at most [`SUCCESS_BODY_MAX_BYTES`] of a 200 body, then stop. Returns the bytes and
+/// whether the body is longer than the cap: an oversize body is dropped with the response
+/// (nothing past the cap is ever buffered or waited for).
+async fn read_success_body(resp: &mut reqwest::Response) -> (Vec<u8>, bool) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut oversize = false;
+    while buf.len() <= SUCCESS_BODY_MAX_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > SUCCESS_BODY_MAX_BYTES {
+                    oversize = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            // End of body or transport error: keep whatever was read so far (a short or
+            // broken body fails JSON parsing below, exactly as before).
+            Ok(None) | Err(_) => break,
+        }
+    }
+    (buf, oversize)
 }
 
 /// Read at most [`ERROR_BODY_MAX_BYTES`] of an error body, then stop: the body is only used
@@ -397,9 +427,15 @@ impl Channel for GatewayChannel {
             };
             let status = resp.status().as_u16();
             if status == 200 {
-                let provider: ProviderResponse = resp
-                    .json()
-                    .await
+                let (body, oversize) = read_success_body(&mut resp).await;
+                if oversize {
+                    return Err(SendError::Ambiguous(format!(
+                        "gateway returned an oversize success body (> {} bytes); \
+                         it may have accepted the message",
+                        SUCCESS_BODY_MAX_BYTES
+                    )));
+                }
+                let provider: ProviderResponse = serde_json::from_slice(&body)
                     .map_err(|e| SendError::Transient(format!("invalid provider response: {e}")))?;
                 return Ok(Receipt {
                     provider_message_id: provider.receipt_id.to_string(),
@@ -594,7 +630,10 @@ mod tests {
         // `subject` is the channel's out-of-band carriage for the provider challenge.
         assert_eq!(msg.subject, "Y 4821");
         assert!(msg.body.chars().count() <= SMS_MAX_CHARS);
-        assert!(!msg.body.contains("#/alerts/"), "prompt replaces the link text");
+        assert!(
+            !msg.body.contains("#/alerts/"),
+            "prompt replaces the link text"
+        );
 
         // A long title is truncated first (with `…`), never the instruction.
         let alert = AlertView {

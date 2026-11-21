@@ -3,17 +3,24 @@
 //!
 //! | Route | Success | Errors |
 //! |---|---|---|
-//! | `POST /api/alerts/{id}/steps/{step}/run` `{expected_version?}` | `202 {execution_id}` | `404 not_found`; `409 approval_required` (+`error.approval_id`); `409 invalid_transition` (alert resolved, step disabled/condition unmet, already queued/running, not an action step) |
-//! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `400 bad_request` (not a manual step); `404` |
-//! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden`; `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
+//! | `POST /api/alerts/{id}/steps/{step}/run` `{expected_version?}` | `202 {execution_id}` | `403 forbidden` (actor not on the alert's team); `404 not_found`; `409 approval_required` (+`error.approval_id`); `409 invalid_transition` (alert resolved, step disabled/condition unmet, already queued/running, not an action step, or no one else can approve this step) |
+//! | `POST /api/alerts/{id}/steps/{step}/check` `{done = true}` | `200 {}` | `403 forbidden` (team); `400 bad_request` (not a manual step); `404` |
+//! | `POST /api/approvals/{id}/{approve\|reject}` `{note?}` (note <= 2000) | `200 {execution_id?}` | `403 forbidden` (not eligible, or the requester — nobody approves their own request); `404`; `409 invalid_transition` (already decided / expired / alert resolved) |
 //! | `GET /api/runbooks` | `200 {items}` | |
-//! | `POST /api/replies` `{from, text}` (fake-gateway callback, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`), `already_decided`, `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (bad/missing signature) |
+//! | `POST /api/replies` `{from, text}` (fake-gateway callback: `X-Beacon-Timestamp: <unix seconds>` within ±300 s of now, `X-Beacon-Signature: hex(hmac_sha256(reply_secret, "<timestamp>." + raw_body))`) | `200 {outcome}`: `approved`/`rejected` (+`approval_id`; approved also `execution_id`), `acked` (+`alert_id`), `already_decided`, `wrong_code`, `too_many_attempts`, `ambiguous` (+`message`: the code matches more than one pending approval — decide in the UI), `unknown` (+`message`) | `401 unauthorized` (missing/old/future timestamp, bad/missing signature) |
 //!
 //! Auth: beacon-api's session/CSRF middleware inserts `Extension(Actor("user:<id>"))` before
 //! these handlers; without it every route except `/api/replies` returns `401 unauthorized`.
-//! `/api/replies` is authenticated by its signature instead (the caller is the gateway).
-//! Errors are `{error: {code, message, approval_id?}}`; 500s are `internal` with details only in
-//! logs. Every mutation writes `audit_log` and bumps the alert version (`AlertOps::touch`).
+//! `/api/replies` is authenticated by its timestamped signature instead (the caller is the
+//! gateway; a replay inside the 300 s window is harmless because decisions are idempotent).
+//! `run` and `check` additionally require the actor to be on the alert's team — a member, the
+//! lead, or anyone in one of the team's on-call rotations (Directory) — else `403 forbidden`
+//! (audit #11; `GET /api/runbooks` stays open to any authenticated user).
+//! POST bodies must be `application/json` (`415 unsupported_media_type` otherwise; an empty
+//! body is accepted wherever the contract allows one) — a cross-site `<form>` can never post
+//! one. Errors are `{error: {code, message, approval_id?}}`; 500s are `internal` with details
+//! only in logs. Every mutation writes `audit_log` and bumps the alert version
+//! (`AlertOps::touch`).
 //!
 //! `{expected_version?}` on the run route is accepted (shape-checked: an integer or null) but
 //! not enforced — the route table above lists no version-conflict error for it.
@@ -35,7 +42,9 @@ use uuid::Uuid;
 
 use crate::actions::{self, ActionRegistry};
 use crate::alert_ops::AlertOps;
-use crate::approvals::{self, DecideError, DecideOutcome, Decision, ReplyOutcome, Via};
+use crate::approvals::{
+    self, DecideError, DecideOutcome, Decision, ReplyOutcome, RequestError, Via,
+};
 use crate::audit;
 use crate::config::Directory;
 use crate::runbook::{RenderedStep, StepKind};
@@ -105,6 +114,10 @@ fn unauthorized() -> ApiError {
     )
 }
 
+fn forbidden(message: impl Into<String>) -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, "forbidden", message)
+}
+
 fn not_found(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", message)
 }
@@ -115,6 +128,55 @@ fn bad_request(message: impl Into<String>) -> ApiError {
 
 fn invalid_transition(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::CONFLICT, "invalid_transition", message)
+}
+
+/// `415 unsupported_media_type`: POST bodies must be `application/json`.
+fn unsupported_media_type() -> ApiError {
+    ApiError::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_media_type",
+        "Content-Type must be application/json",
+    )
+}
+
+/// Audit #11 (CSRF): a POST body that is not empty and not `application/json` (media type
+/// only — parameters like `charset` are ignored) is rejected before it is parsed, so a
+/// cross-site `<form>` (which can at best send `text/plain` or form encodings) can never
+/// reach a handler. Empty bodies stay allowed wherever the contract allows them.
+fn require_json_body(headers: &axum::http::HeaderMap, body: &[u8]) -> Result<(), ApiError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if media_type == "application/json" {
+        Ok(())
+    } else {
+        Err(unsupported_media_type())
+    }
+}
+
+/// Audit #11 (team authorization): the actor may run or check an alert's steps only when
+/// they are on the alert's team — a member, the lead, or anyone in one of the team's on-call
+/// rotations. A team missing from the Directory authorizes nobody.
+fn on_team(dir: &Directory, team_id: &str, actor: &str) -> bool {
+    let Some(person) = actor.strip_prefix("user:") else {
+        return false;
+    };
+    let Some(team) = dir.teams.get(team_id) else {
+        return false;
+    };
+    team.members.iter().any(|m| m == person)
+        || team.lead.as_deref() == Some(person)
+        || team.oncall.values().flatten().any(|p| p == person)
 }
 
 /// `{..}` from a possibly-empty JSON body; empty is `{}` (both run body forms are optional),
@@ -155,19 +217,20 @@ pub fn router(state: ApiState) -> Router {
 /// The run/check handlers' frozen step, loaded once per request.
 ///
 /// Load the alert row, the frozen runbook and the named step. 404s for an unknown alert id,
-/// an alert without a runbook and an unknown step id, in that order. Returns the alert status
-/// and the step.
+/// an alert without a runbook and an unknown step id, in that order. Returns the alert
+/// status, the alert's team (for the authorization check) and the step.
 async fn load_step(
     state: &ApiState,
     alert_id: Uuid,
     step_id: &str,
-) -> Result<(String, RenderedStep), ApiError> {
-    let status: Option<(String,)> = sqlx::query_as("SELECT status FROM alerts WHERE id = $1")
-        .bind(alert_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    let Some((status,)) = status else {
+) -> Result<(String, String, RenderedStep), ApiError> {
+    let status: Option<(String, String)> =
+        sqlx::query_as("SELECT status, team FROM alerts WHERE id = $1")
+            .bind(alert_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let Some((status, team)) = status else {
         return Err(not_found(format!("unknown alert {alert_id}")));
     };
 
@@ -185,7 +248,7 @@ async fn load_step(
     let Some(step) = steps.into_iter().find(|s| s.id == step_id) else {
         return Err(not_found(format!("unknown runbook step {step_id:?}")));
     };
-    Ok((status, step))
+    Ok((status, team, step))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -195,12 +258,14 @@ async fn load_step(
 async fn run_step_handler(
     State(state): State<ApiState>,
     Path((alert_raw, step_raw)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     actor: Option<axum::Extension<Actor>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let Some(axum::Extension(Actor(actor))) = actor else {
         return Err(unauthorized());
     };
+    require_json_body(&headers, &body)?;
     let alert_id = parse_id(&alert_raw)?;
 
     // The body is optional; `expected_version` is shape-checked but not enforced (module doc).
@@ -211,7 +276,14 @@ async fn run_step_handler(
         return Err(bad_request("expected_version must be an integer"));
     }
 
-    let (status, step) = load_step(&state, alert_id, &step_raw).await?;
+    let (status, team, step) = load_step(&state, alert_id, &step_raw).await?;
+
+    // Audit #11: only the alert's own team may touch its steps.
+    if !on_team(&state.dir, &team, &actor) {
+        return Err(forbidden(
+            "only a member, the lead or an on-call of the alert's team may run its steps",
+        ));
+    }
 
     // Manual (and check-only) steps are never run.
     if step.kind == StepKind::Manual || step.action.is_none() {
@@ -259,7 +331,14 @@ async fn run_step_handler(
             &actor,
         )
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(|e| match e {
+            // Audit #11: the requester is the only one who could decide (never themselves) —
+            // the step cannot be run at all.
+            RequestError::NoEligibleApprover => {
+                invalid_transition("no one else can approve this step")
+            }
+            RequestError::NoFreeCode | RequestError::Db(_) => ApiError::internal(e),
+        })?;
         state
             .alert_ops
             .touch(&mut tx, alert_id)
@@ -311,12 +390,14 @@ async fn run_step_handler(
 async fn check_step_handler(
     State(state): State<ApiState>,
     Path((alert_raw, step_raw)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     actor: Option<axum::Extension<Actor>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let Some(axum::Extension(Actor(actor))) = actor else {
         return Err(unauthorized());
     };
+    require_json_body(&headers, &body)?;
     let alert_id = parse_id(&alert_raw)?;
 
     let body = parse_body(&body)?;
@@ -326,7 +407,15 @@ async fn check_step_handler(
         Some(_) => return Err(bad_request("done must be a boolean")),
     };
 
-    let (_, step) = load_step(&state, alert_id, &step_raw).await?;
+    let (_, team, step) = load_step(&state, alert_id, &step_raw).await?;
+
+    // Audit #11: only the alert's own team may touch its steps.
+    if !on_team(&state.dir, &team, &actor) {
+        return Err(forbidden(
+            "only a member, the lead or an on-call of the alert's team may check its steps",
+        ));
+    }
+
     if step.kind != StepKind::Manual {
         return Err(bad_request(format!(
             "step {step_raw:?} is not a manual step"
@@ -386,18 +475,22 @@ async fn check_step_handler(
 async fn approve_handler(
     state: State<ApiState>,
     Path(id_raw): Path<String>,
+    headers: axum::http::HeaderMap,
     actor: Option<axum::Extension<Actor>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    require_json_body(&headers, &body)?;
     decide_http(state, id_raw, actor, body, Decision::Approve).await
 }
 
 async fn reject_handler(
     state: State<ApiState>,
     Path(id_raw): Path<String>,
+    headers: axum::http::HeaderMap,
     actor: Option<axum::Extension<Actor>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    require_json_body(&headers, &body)?;
     decide_http(state, id_raw, actor, body, Decision::Reject).await
 }
 
@@ -456,7 +549,9 @@ async fn decide_http(
 /// Map a [`DecideError`] to the route table's error responses.
 fn decide_error(e: DecideError) -> ApiError {
     match e {
-        DecideError::Forbidden => ApiError::new(StatusCode::FORBIDDEN, "forbidden", e.to_string()),
+        DecideError::Forbidden(_) => {
+            ApiError::new(StatusCode::FORBIDDEN, "forbidden", e.to_string())
+        }
         DecideError::NotFound => not_found(e.to_string()),
         DecideError::AlreadyDecided(_)
         | DecideError::Expired
@@ -482,6 +577,10 @@ async fn runbooks_handler(
 // POST /api/replies (the fake gateway's authenticated callback)
 // ---------------------------------------------------------------------------------------------
 
+/// The signed reply window: `|now - X-Beacon-Timestamp|` may not exceed this (unix seconds).
+/// A replay inside the window is harmless — decisions are idempotent (`AlreadyDecided`).
+const REPLY_MAX_SKEW_SECS: i64 = 300;
+
 #[derive(Debug, Deserialize)]
 struct ReplyBody {
     from: String,
@@ -493,7 +592,9 @@ async fn replies_handler(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    // The signature authenticates the caller (the gateway), not a session: no Actor here.
+    // A cross-site form can never satisfy this (audit #11), and the signature below
+    // authenticates the caller (the gateway), not a session: no Actor here.
+    require_json_body(&headers, &body)?;
     let Some(secret) = state.reply_secret.as_deref() else {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -501,6 +602,35 @@ async fn replies_handler(
             "no reply secret configured; SMS replies are rejected",
         ));
     };
+
+    // Replay protection (audit #11): the signature covers the timestamp as well, and the
+    // timestamp must be current. A captured reply cannot be replayed later than the window,
+    // and inside the window a replay decides nothing (idempotency).
+    let Some(ts_raw) = headers
+        .get("x-beacon-timestamp")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing X-Beacon-Timestamp",
+        ));
+    };
+    let ts: i64 = ts_raw.trim().parse().map_err(|_| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "X-Beacon-Timestamp must be unix seconds",
+        )
+    })?;
+    if (chrono::Utc::now().timestamp() - ts).abs() > REPLY_MAX_SKEW_SECS {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "X-Beacon-Timestamp is outside the allowed window",
+        ));
+    }
+
     let Some(signature) = headers
         .get("x-beacon-signature")
         .and_then(|v| v.to_str().ok())
@@ -518,10 +648,12 @@ async fn replies_handler(
             "X-Beacon-Signature is not valid hex",
         )
     })?;
-    // HMAC verification is constant-time (`verify_slice`); the raw body bytes are exactly
-    // what was signed.
+    // HMAC verification is constant-time (`verify_slice`); the message is exactly
+    // "<timestamp>." + the raw body bytes the gateway signed.
     let mut mac = Hmac::<Sha256>::new_from_slice(secret)
         .map_err(|e| ApiError::internal(format!("hmac init: {e}")))?;
+    mac.update(ts_raw.as_bytes());
+    mac.update(b".");
     mac.update(&body);
     if mac.verify_slice(&signature).is_err() {
         return Err(ApiError::new(
@@ -614,18 +746,37 @@ pub async fn timeline_entries(
 // ---------------------------------------------------------------------------------------------
 
 /// Standalone dev server for the `delivery-api` role until beacon-api mounts `router`. Dev/demo
-/// only: binds `addr` (the binary defaults to 127.0.0.1), logs a warning, and injects the
-/// `Actor` from the request header `X-Beacon-Demo-Actor: user:<id>` (must name a person in the
-/// Directory, else 401), falling back to `demo_actor`.
+/// only: binds `addr` — which MUST be loopback; anything else is refused with an io error
+/// before any socket is opened (audit #11) — logs a warning, and injects the `Actor` for every
+/// request. `allow_demo_header` (an `ApiState`-independent flag the binary wires, e.g. from an
+/// env var) gates whether the request header `X-Beacon-Demo-Actor: user:<id>` may pick the
+/// acting person (it must name a person in the Directory, else 401): when `false` the header is
+/// ignored outright and every request acts as `demo_actor`.
 pub async fn serve_standalone(
     state: ApiState,
     addr: std::net::SocketAddr,
     demo_actor: Actor,
     shutdown: crate::Shutdown,
+    allow_demo_header: bool,
 ) -> std::io::Result<()> {
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "delivery-api standalone mode is dev/demo only and refuses to bind \
+                 non-loopback {addr}"
+            ),
+        ));
+    }
     tracing::warn!(
-        "delivery-api standalone mode is DEV/DEMO ONLY: the X-Beacon-Demo-Actor header can \
-         act as ANY person in the Directory. Do not expose this port beyond localhost."
+        allow_demo_header,
+        "delivery-api standalone mode is DEV/DEMO ONLY: {} Do not expose this port beyond \
+         localhost.",
+        if allow_demo_header {
+            "the X-Beacon-Demo-Actor header can act as ANY person in the Directory."
+        } else {
+            "the X-Beacon-Demo-Actor header is disabled; every request acts as the demo actor."
+        }
     );
     let dir = state.dir.clone();
     let fallback = demo_actor.0.clone();
@@ -635,22 +786,22 @@ pub async fn serve_standalone(
             let dir = dir.clone();
             let fallback = fallback.clone();
             async move {
-                // `X-Beacon-Demo-Actor: user:<id>` names the acting person; unknown names are
-                // rejected instead of silently falling back.
-                let header = req
-                    .headers()
-                    .get("x-beacon-demo-actor")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                let actor = match header {
-                    None => fallback,
-                    Some(raw) => {
-                        let id = raw.strip_prefix("user:").unwrap_or(&raw);
-                        match dir.people.contains_key(id) {
-                            true => format!("user:{id}"),
-                            false => return unauthorized().into_response(),
+                // `X-Beacon-Demo-Actor: user:<id>` names the acting person — but only when the
+                // server was started with the header allowed. Unknown names are rejected
+                // instead of silently falling back.
+                let actor = match (allow_demo_header, req.headers().get("x-beacon-demo-actor")) {
+                    // Header disabled (or absent): every request acts as the demo actor.
+                    (false, _) | (true, None) => fallback,
+                    (true, Some(raw)) => match raw.to_str() {
+                        Err(_) => return unauthorized().into_response(),
+                        Ok(raw) => {
+                            let id = raw.strip_prefix("user:").unwrap_or(raw);
+                            match dir.people.contains_key(id) {
+                                true => format!("user:{id}"),
+                                false => return unauthorized().into_response(),
+                            }
                         }
-                    }
+                    },
                 };
                 let mut req = req;
                 req.extensions_mut().insert(Actor(actor));

@@ -12,7 +12,7 @@ rust-version = "1.89"
 # Versions per docs/SPEC.md §3.
 tokio = { version = "1.54", features = ["full"] }
 sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "migrate", "json", "uuid", "chrono", "macros"] }
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "pool", "hostname"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "pool", "hostname", "tokio1-rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

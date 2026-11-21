@@ -200,9 +200,11 @@ async fn serve_api_as(state: ApiState, actor: &str) -> String {
 
 /// The delivery-api standalone server on a random port, plus its shutdown sender. It binds
 /// its own listener, so the port is picked by bind-drop-rebind (races are retried).
+/// `allow_demo_header` is forwarded to `api::serve_standalone`.
 async fn serve_standalone(
     state: ApiState,
     demo_actor: &str,
+    allow_demo_header: bool,
 ) -> (
     String,
     tokio::sync::watch::Sender<bool>,
@@ -219,7 +221,7 @@ async fn serve_standalone(
         let st = state.clone();
         let demo_actor = Actor(demo_actor.to_string());
         let handle = tokio::spawn(async move {
-            let _ = api::serve_standalone(st, addr, demo_actor, rx).await;
+            let _ = api::serve_standalone(st, addr, demo_actor, rx, allow_demo_header).await;
         });
         if wait_listening(port).await {
             return (format!("http://127.0.0.1:{port}"), tx, handle);
@@ -289,6 +291,28 @@ fn hmac_signature(secret: &[u8], body: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+/// The gateway's reply headers (shared contract): `X-Beacon-Timestamp: <unix seconds>` and
+/// `X-Beacon-Signature: hex(hmac_sha256(secret, "<timestamp>." + raw_body))`.
+fn signed_reply(secret: &[u8], ts: i64, body: &str) -> Vec<(&'static str, String)> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac key");
+    mac.update(format!("{ts}.").as_bytes());
+    mac.update(body.as_bytes());
+    vec![
+        ("x-beacon-timestamp", ts.to_string()),
+        (
+            "x-beacon-signature",
+            hex::encode(mac.finalize().into_bytes()),
+        ),
+    ]
+}
+
 fn error_code(body: &Value) -> &str {
     body["error"]["code"].as_str().unwrap_or("<missing code>")
 }
@@ -323,15 +347,10 @@ async fn without_an_actor_every_route_but_replies_is_401(pool: PgPool) {
     let (status, _) = get(&format!("{base}/api/runbooks")).await;
     assert_eq!(status, 401, "GET /api/runbooks needs the session layer too");
 
-    // `/api/replies` authenticates by signature instead.
+    // `/api/replies` authenticates by its timestamped signature instead.
     let body = json!({ "from": "+44 7700 900125", "text": "ACK" }).to_string();
-    let sig = hmac_signature(b"secret", &body);
-    let (status, outcome) = post_raw(
-        &format!("{base}/api/replies"),
-        body,
-        &[("x-beacon-signature", sig)],
-    )
-    .await;
+    let headers = signed_reply(b"secret", now_ts(), &body);
+    let (status, outcome) = post_raw(&format!("{base}/api/replies"), body, &headers).await;
     assert_eq!(status, 200, "{outcome}");
     assert_eq!(outcome["outcome"], json!("unknown"), "{outcome}");
 }
@@ -721,7 +740,7 @@ async fn check_marks_and_clears_manual_steps(pool: PgPool) {
 // POST /api/approvals/{id}/{approve|reject}
 // ---------------------------------------------------------------------------------------------
 
-/// An approval to decide, created through the API's own run route.
+/// An approval to decide, created through the API's own run route mounted as `base`.
 async fn approval_via_run(base: &str, pool: &PgPool) -> (Uuid, Uuid) {
     let alert =
         insert_alert_with_runbook(pool, "open", &[action_step("s3", "required", None)]).await;
@@ -742,11 +761,12 @@ async fn approval_via_run(base: &str, pool: &PgPool) -> (Uuid, Uuid) {
 async fn approvals_decide_endpoints_cover_the_whole_error_table(pool: PgPool) {
     let state = api_state(&pool, None);
     let base = serve_api_as(state.clone(), "user:carol").await;
-    // A second api mounted as frank (a plain member, never eligible).
+    // The run route mounted as frank: approvals he requests stay decidable by carol — the
+    // requester can never decide their own request (audit #11).
     let as_frank = serve_api_as(state, "user:frank").await;
 
     // Approve: 200 {execution_id}, the execution queued with the approval linked.
-    let (alert, approval) = approval_via_run(&base, &pool).await;
+    let (alert, approval) = approval_via_run(&as_frank, &pool).await;
     let url = format!("{base}/api/approvals/{approval}/approve");
     let (status, body) = post(&url, &json!({ "note": "runbook says go" })).await;
     assert_eq!(status, 200, "{body}");
@@ -782,7 +802,7 @@ async fn approvals_decide_endpoints_cover_the_whole_error_table(pool: PgPool) {
     );
 
     // Reject on a fresh approval: 200 {}.
-    let (_, approval) = approval_via_run(&base, &pool).await;
+    let (_, approval) = approval_via_run(&as_frank, &pool).await;
     let (status, body) = post(
         &format!("{base}/api/approvals/{approval}/reject"),
         &json!({}),
@@ -799,7 +819,8 @@ async fn approvals_decide_endpoints_cover_the_whole_error_table(pool: PgPool) {
     assert_eq!(state_str, "rejected");
     assert_eq!(execution_id, None);
 
-    // Not eligible: 403.
+    // Not eligible: 403. (The approval is carol's own request, so frank — a plain member —
+    // is simply not in the eligible set.)
     let (_, approval) = approval_via_run(&base, &pool).await;
     let (status, body) = post(
         &format!("{as_frank}/api/approvals/{approval}/approve"),
@@ -808,6 +829,13 @@ async fn approvals_decide_endpoints_cover_the_whole_error_table(pool: PgPool) {
     .await;
     assert_eq!(status, 403, "{body}");
     assert_eq!(error_code(&body), "forbidden", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not eligible"),
+        "{body}"
+    );
 
     // Unknown approval: 404; malformed uuid: 404.
     let (status, body) = post(
@@ -821,7 +849,7 @@ async fn approvals_decide_endpoints_cover_the_whole_error_table(pool: PgPool) {
     assert_eq!(status, 404);
 
     // Expired: 409 invalid_transition, state 'expired'.
-    let (_, approval) = approval_via_run(&base, &pool).await;
+    let (_, approval) = approval_via_run(&as_frank, &pool).await;
     sqlx::query("UPDATE approvals SET expires_at = now() - interval '1 second' WHERE id = $1")
         .bind(approval)
         .execute(&pool)
@@ -843,7 +871,7 @@ async fn approvals_decide_endpoints_cover_the_whole_error_table(pool: PgPool) {
     );
 
     // Note over 2000 chars: 400.
-    let (_, approval) = approval_via_run(&base, &pool).await;
+    let (_, approval) = approval_via_run(&as_frank, &pool).await;
     let (status, body) = post(
         &format!("{base}/api/approvals/{approval}/approve"),
         &json!({ "note": "x".repeat(2001) }),
@@ -885,37 +913,73 @@ async fn runbooks_lists_the_library(pool: PgPool) {
 // ---------------------------------------------------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn replies_reject_everything_but_a_valid_signature(pool: PgPool) {
+async fn replies_reject_everything_but_a_valid_current_signature(pool: PgPool) {
     let secret = b"reply-secret".to_vec();
     let state = api_state(&pool, Some(secret.clone()));
     let base = serve_api_as(state, "user:bob").await;
     let url = format!("{base}/api/replies");
     let payload = json!({ "from": "+44 7700 900125", "text": "ACK" }).to_string();
-    let sig = hmac_signature(&secret, &payload);
+    let good = signed_reply(&secret, now_ts(), &payload);
 
-    // Missing / invalid-hex / wrong signature: 401 unauthorized.
+    // Missing both headers: 401 unauthorized.
     let (status, res) = post_raw(&url, payload.clone(), &[]).await;
     assert_eq!(status, 401, "{res}");
     assert_eq!(error_code(&res), "unauthorized", "{res}");
+    // Invalid-hex signature: 401.
     let (status, _) = post_raw(
         &url,
         payload.clone(),
-        &[("x-beacon-signature", "zz-not-hex".into())],
+        &[
+            ("x-beacon-timestamp", now_ts().to_string()),
+            ("x-beacon-signature", "zz-not-hex".into()),
+        ],
     )
     .await;
     assert_eq!(status, 401);
+    // A current timestamp but a body-only signature (the old, unsigned-timestamp scheme):
+    // still 401 — the signature must cover the timestamp too.
     let (status, _) = post_raw(
         &url,
         payload.clone(),
-        &[("x-beacon-signature", hmac_signature(b"other", &payload))],
+        &[
+            ("x-beacon-timestamp", now_ts().to_string()),
+            ("x-beacon-signature", hmac_signature(&secret, &payload)),
+        ],
     )
     .await;
     assert_eq!(status, 401);
-    // A signature over different bytes does not verify either.
+    // A signature with the wrong secret: 401.
     let (status, _) = post_raw(
         &url,
         payload.clone(),
-        &[("x-beacon-signature", hmac_signature(&secret, "other bytes"))],
+        &signed_reply(b"other", now_ts(), &payload),
+    )
+    .await;
+    assert_eq!(status, 401);
+    // A signature over different bytes: 401.
+    let (status, _) = post_raw(
+        &url,
+        payload.clone(),
+        &signed_reply(&secret, now_ts(), "other bytes"),
+    )
+    .await;
+    assert_eq!(status, 401);
+    // A signature without its timestamp header: 401.
+    let (status, _) = post_raw(
+        &url,
+        payload.clone(),
+        &[("x-beacon-signature", hmac_signature(&secret, &payload))],
+    )
+    .await;
+    assert_eq!(status, 401);
+    // A non-numeric timestamp: 401.
+    let (status, _) = post_raw(
+        &url,
+        payload.clone(),
+        &signed_reply(&secret, now_ts(), &payload)
+            .into_iter()
+            .map(|(k, _)| (k, "not-a-number".to_string()))
+            .collect::<Vec<_>>(),
     )
     .await;
     assert_eq!(status, 401);
@@ -926,19 +990,27 @@ async fn replies_reject_everything_but_a_valid_signature(pool: PgPool) {
     let (status, _) = post_raw(
         &format!("{bare}/api/replies"),
         payload.clone(),
-        &[("x-beacon-signature", sig.clone())],
+        &signed_reply(&secret, now_ts(), &payload),
     )
     .await;
     assert_eq!(status, 401);
 
-    // Good signature: the reply is handled (an unknown number is a 200 outcome).
-    let (status, res) = post_raw(&url, payload, &[("x-beacon-signature", sig)]).await;
+    // Good, current signature: the reply is handled (an unknown number is a 200 outcome).
+    let (status, res) = post_raw(&url, payload.clone(), &good).await;
     assert_eq!(status, 200, "{res}");
     assert_eq!(res["outcome"], json!("unknown"), "{res}");
+    // A signature from within the window (200 s old) is still fine.
+    let (status, res) = post_raw(
+        &url,
+        payload.clone(),
+        &signed_reply(&secret, now_ts() - 200, &payload),
+    )
+    .await;
+    assert_eq!(status, 200, "{res}");
     // Malformed or shape-invalid bodies are 400s (the signature was fine).
     let bad = json!({ "from": "+44 7700 900125" }).to_string();
-    let bad_sig = hmac_signature(&secret, &bad);
-    let (status, _) = post_raw(&url, bad, &[("x-beacon-signature", bad_sig)]).await;
+    let bad_headers = signed_reply(&secret, now_ts(), &bad);
+    let (status, _) = post_raw(&url, bad, &bad_headers).await;
     assert_eq!(status, 400, "missing text field");
 }
 
@@ -980,13 +1052,8 @@ async fn replies_answer_an_ambiguous_code_with_decide_in_the_ui(pool: PgPool) {
 
     // The reply is a 200 that decides nothing and points at the UI.
     let payload = json!({ "from": "+44 7700 900125", "text": format!("Y {code}") }).to_string();
-    let sig = hmac_signature(&secret, &payload);
-    let (status, body) = post_raw(
-        &format!("{base}/api/replies"),
-        payload,
-        &[("x-beacon-signature", sig)],
-    )
-    .await;
+    let headers = signed_reply(&secret, now_ts(), &payload);
+    let (status, body) = post_raw(&format!("{base}/api/replies"), payload, &headers).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["outcome"], json!("ambiguous"), "{body}");
     assert_eq!(body["message"], json!("decide in the UI"), "{body}");
@@ -1012,7 +1079,7 @@ async fn replies_answer_an_ambiguous_code_with_decide_in_the_ui(pool: PgPool) {
 async fn the_simulator_reply_forwarding_flow_approves_end_to_end(pool: PgPool) {
     let secret = b"shared-secret".to_vec();
     let state = api_state(&pool, Some(secret.clone()));
-    let (api_base, shutdown, task) = serve_standalone(state, "user:bob").await;
+    let (api_base, shutdown, task) = serve_standalone(state, "user:bob", true).await;
 
     // The fake phone gateway: simulator routes only, forwarding replies to the api.
     let gw = GatewayState::new(pool.clone())

@@ -11,6 +11,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::breaker::{self, Gate};
+use crate::channel::email::mask_emails_in_text;
 use crate::channel::gateway_client::MAX_RETRY_AFTER;
 use crate::channel::{AlertView, Channel, Receipt, SendError};
 use crate::model::{AlertStatus, DeliveryJob, JobStatus};
@@ -515,9 +516,11 @@ async fn process_job(
                         .cooldown
                         .max(err.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
                     if finalize_deferred(pool, &job, token, &err, delay).await? {
+                        // Privacy: the error string may embed the destination address, so it
+                        // is scrubbed before logging (see `mask_emails_in_text`).
                         info!(job_id = %job.id, alert_id = %job.alert_id, channel = channel.name(),
                               delay = ?delay, class = err.class().as_str(),
-                              error = err.message(), "delivery deferred: channel breaker open");
+                              error = %mask_emails_in_text(err.message()), "delivery deferred: channel breaker open");
                         Ok(Outcome::Deferred)
                     } else {
                         warn!(job_id = %job.id, "lease lost while deferring");
@@ -541,13 +544,15 @@ async fn finish_failed(
 ) -> Result<Outcome, sqlx::Error> {
     match finalize_failed_inner(pool, job, token, err, policy).await? {
         Some(outcome) if outcome.status == JobStatus::Dead => {
+            // Privacy: scrubbed like the deferred log above; `delivery_jobs.last_error`
+            // itself still stores the full message for operators.
             info!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
-                  error = err.message(), fallbacks = outcome.fallbacks, "delivery dead");
+                  error = %mask_emails_in_text(err.message()), fallbacks = outcome.fallbacks, "delivery dead");
             Ok(Outcome::Dead(outcome.fallbacks))
         }
         Some(_) => {
             warn!(job_id = %job.id, attempts = job.attempts, class = err.class().as_str(),
-                  error = err.message(), "delivery failed, will retry");
+                  error = %mask_emails_in_text(err.message()), "delivery failed, will retry");
             Ok(Outcome::Retried)
         }
         None => {

@@ -8,6 +8,13 @@
 //! calls `AlertOps::touch` so the UI refetches; a successful step with `resolves: true`
 //! resolves the alert (`AlertOps::transition(Resolve{reason: "runbook step <id>"})`).
 //!
+//! Audit #11 hardening: URL path segments built from parameters are validated
+//! (`encode_segment` rejects empty, `.`, `..` and anything containing `/` or `\` — the action
+//! fails with "invalid path segment") and percent-encoded; outputs are redacted
+//! (`redact_output`) before truncation, so URL query strings and bearer/basic credentials
+//! (`Authorization:`/`token=`) never reach `action_executions.output` or the audit trail. The
+//! loop also sweeps stale approvals (`approvals::expire_stale`) once per iteration.
+//!
 //! **Built-in actions** (all safe: targets are the gateway's mock endpoints or config aliases):
 //! - `http_get` (risk low): `{url}` must start with one of the `config/actions/targets.yaml`
 //!   aliases' base URLs (alias map `{name: base_url}`; a runbook's `http://counterparty-service/
@@ -371,6 +378,90 @@ fn truncate_output(s: &str) -> String {
     }
 }
 
+/// True at the end of a URL token (whitespace or a common closing punctuation byte).
+fn is_url_end(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b')' | b']' | b'>' | b'"' | b'\'' | b',')
+}
+
+/// Redact one output before it is stored or audited (audit #11): URL tokens lose everything
+/// from their `?` (query strings may carry tokens — the request itself keeps them, only the
+/// recorded output drops them), and credentials never survive — `Authorization: <creds>`
+/// (bearer/basic headers echoed by a target) and `token=<value>` (query- or form-style
+/// credentials, including `access_token=` etc.) become `[REDACTED]`. The scan is
+/// case-insensitive and leaves everything else byte for byte.
+fn redact_output(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let lower: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let mut out = String::with_capacity(text.len());
+    let push = |out: &mut String, range: std::ops::Range<usize>| {
+        out.push_str(&String::from_utf8_lossy(&bytes[range]));
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &lower[i..];
+        // `http(s)://…?query` -> `http(s)://…`.
+        if rest.starts_with(b"http://") || rest.starts_with(b"https://") {
+            let mut end = i;
+            while end < bytes.len() && !is_url_end(bytes[end]) {
+                end += 1;
+            }
+            let cut = bytes[i..end]
+                .iter()
+                .position(|&b| b == b'?')
+                .map(|q| i + q)
+                .unwrap_or(end);
+            push(&mut out, i..cut);
+            i = end;
+            continue;
+        }
+        // `Authorization: Bearer xyz` -> `Authorization: [REDACTED]` (to the line's end).
+        if rest.starts_with(b"authorization") {
+            let word_end = i + "authorization".len();
+            let mut j = word_end;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b':' {
+                let mut k = j + 1;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() && bytes[k] != b'\n' {
+                    k += 1;
+                }
+                let line_end = bytes[k..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|p| k + p)
+                    .unwrap_or(bytes.len());
+                out.push_str("Authorization: [REDACTED]");
+                i = line_end;
+                continue;
+            }
+            // Not the header form: keep the word as-is.
+            push(&mut out, i..word_end);
+            i = word_end;
+            continue;
+        }
+        // `token=<value>` -> `token=[REDACTED]` (value ends at whitespace or `&`).
+        if rest.starts_with(b"token") && bytes.get(i + 5) == Some(&b'=') {
+            let mut j = i + "token=".len();
+            while j < bytes.len() && !bytes[j].is_ascii_whitespace() && bytes[j] != b'&' {
+                j += 1;
+            }
+            out.push_str("token=[REDACTED]");
+            i = j;
+            continue;
+        }
+        // No marker here: copy one full character (markers are ASCII, so `i` always sits on
+        // a char boundary).
+        let mut len = 1usize;
+        while i + len < bytes.len() && !text.is_char_boundary(i + len) {
+            len += 1;
+        }
+        push(&mut out, i..i + len);
+        i += len;
+    }
+    out
+}
+
 /// One claimed execution: everything `run_once` needs to run it and finalize it.
 #[derive(Debug, sqlx::FromRow)]
 struct ClaimedExecution {
@@ -480,7 +571,8 @@ pub async fn run_once(
             None => Outcome::Failed(format!("unknown action {}", c.action)),
         };
         let state = outcome.state();
-        let output = truncate_output(outcome.output());
+        // Redact first, truncate after (audit #11): no query strings, no credentials.
+        let output = truncate_output(&redact_output(outcome.output()));
         let mut ftx = pool.begin().await?;
         let res = sqlx::query(
             "UPDATE action_executions SET state = $2, finished_at = now(), output = $3, \
@@ -571,6 +663,11 @@ pub async fn run_actions(
     let mut shutdown = shutdown;
     info!(worker_id = %cfg.worker_id, "actions worker started");
     while !*shutdown.borrow() {
+        // Audit #11: sweep pending approvals past their expiry (and scrub their codes at
+        // rest) once per iteration — one cheap indexed UPDATE when there is nothing to do.
+        if let Err(err) = crate::approvals::expire_stale(&pool).await {
+            error!(error = %err, "stale approval expiry failed");
+        }
         let wait = match run_once(&pool, &dir, &registry, alert_ops.as_ref(), &cfg).await {
             Ok(stats) => {
                 if stats.claimed > 0 || stats.uncertain > 0 {
@@ -634,8 +731,14 @@ fn snippet(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Percent-encode one URL path segment (everything outside `unreserved`).
-fn encode_segment(s: &str) -> String {
+/// Percent-encode one URL path segment (everything outside `unreserved`). Audit #11: the
+/// segment must not be empty, `.`, `..`, or contain `/` or `\` — those could escape the mock
+/// path the caller builds around it (`..` climbs, `/` and `\` split) — and the action fails
+/// with "invalid path segment"; everything else is percent-encoded.
+fn encode_segment(s: &str) -> Result<String, String> {
+    if s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') {
+        return Err("invalid path segment".to_string());
+    }
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -644,7 +747,7 @@ fn encode_segment(s: &str) -> String {
             out.push_str(&format!("%{b:02X}"));
         }
     }
-    out
+    Ok(out)
 }
 
 /// One mock-target call: 2xx is `Ok`, anything else `Failed`; a client-side timeout is
@@ -778,11 +881,14 @@ impl Action for RetryWorkflow {
                 Some(id) => id,
                 None => return Outcome::Failed("missing param: workflowId".to_string()),
             };
-            let url = format!(
-                "{}/mock/workflows/{}/retry",
-                self.gateway_url.trim_end_matches('/'),
-                encode_segment(id)
-            );
+            let url = match encode_segment(id) {
+                Ok(segment) => format!(
+                    "{}/mock/workflows/{}/retry",
+                    self.gateway_url.trim_end_matches('/'),
+                    segment
+                ),
+                Err(e) => return Outcome::Failed(e),
+            };
             match send_post(&self.client, &url, json!({"workflowId": id})).await {
                 Ok((status, _)) if (200..300).contains(&status) => {
                     Outcome::Ok(format!("workflow {id} retried (HTTP {status})"))
@@ -824,11 +930,14 @@ impl Action for RestartService {
                 Some(s) => s,
                 None => return Outcome::Failed("missing param: service".to_string()),
             };
-            let url = format!(
-                "{}/mock/services/{}/restart",
-                self.gateway_url.trim_end_matches('/'),
-                encode_segment(name)
-            );
+            let url = match encode_segment(name) {
+                Ok(segment) => format!(
+                    "{}/mock/services/{}/restart",
+                    self.gateway_url.trim_end_matches('/'),
+                    segment
+                ),
+                Err(e) => return Outcome::Failed(e),
+            };
             match send_post(&self.client, &url, json!({"service": name})).await {
                 Ok((status, _)) if (200..300).contains(&status) => {
                     Outcome::Ok(format!("service {name} restarted (HTTP {status})"))
@@ -1242,5 +1351,80 @@ mod tests {
         // Char boundary, not byte boundary.
         let wide = "€".repeat(500);
         assert_eq!(truncate_output(&wide).chars().count(), OUTPUT_MAX_CHARS);
+    }
+
+    #[test]
+    fn encode_segment_rejects_traversal_and_encodes_the_rest() {
+        for bad in ["", ".", "..", "a/b", "/x", "x/", "a\\b", "a\\"] {
+            assert_eq!(
+                encode_segment(bad).unwrap_err(),
+                "invalid path segment",
+                "{bad:?}"
+            );
+        }
+        // Unreserved characters stay; everything else percent-encodes.
+        assert_eq!(encode_segment("WF-1").unwrap(), "WF-1");
+        assert_eq!(encode_segment("a.b~c_d-e").unwrap(), "a.b~c_d-e");
+        assert_eq!(encode_segment("a b").unwrap(), "a%20b");
+        assert_eq!(encode_segment("%41").unwrap(), "%2541");
+        // `..` only as the WHOLE segment is traversal; embedded dots are ordinary bytes.
+        assert_eq!(encode_segment("v1..beta").unwrap(), "v1..beta");
+    }
+
+    #[test]
+    fn redact_output_strips_queries_and_credentials() {
+        // URL query strings never survive (the request keeps them; the output does not).
+        assert_eq!(
+            redact_output("GET http://h/x/y?token=hunter2 -> HTTP 200 (5 bytes)"),
+            "GET http://h/x/y -> HTTP 200 (5 bytes)"
+        );
+        assert_eq!(
+            redact_output("error sending request for url (http://h/x?sig=1)"),
+            "error sending request for url (http://h/x)"
+        );
+        assert_eq!(
+            redact_output("plain text, no markers"),
+            "plain text, no markers"
+        );
+        // Bearer/basic credentials redact to the end of the line, whatever the case.
+        assert_eq!(
+            redact_output("x Authorization: Bearer hunter2 tail"),
+            "x Authorization: [REDACTED]"
+        );
+        assert_eq!(
+            redact_output("authorization: Basic aGk=\nnext line"),
+            "Authorization: [REDACTED]\nnext line"
+        );
+        // `token=` values redact up to the next `&` or whitespace; prefixes like
+        // `access_token=` ride along.
+        assert_eq!(
+            redact_output("a=1&token=supersecret&b=2"),
+            "a=1&token=[REDACTED]&b=2"
+        );
+        assert_eq!(
+            redact_output("access_token=hunter2 ok"),
+            "access_token=[REDACTED] ok"
+        );
+        // Non-ASCII passes through untouched.
+        assert_eq!(
+            redact_output("…⟨wf-9⟩ em dashes stay"),
+            "…⟨wf-9⟩ em dashes stay"
+        );
+        // The word without the header form stays.
+        assert_eq!(
+            redact_output("the Authorization header was missing"),
+            "the Authorization header was missing"
+        );
+    }
+
+    #[test]
+    fn redact_output_leaves_nothing_of_the_secrets() {
+        let redacted = redact_output(
+            "GET https://gw/mock?token=hunter2&x=1 failed: HTTP 500: \
+             Authorization: Bearer hunter2\nretry hint: token=hunter2 here",
+        );
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        assert!(!redacted.contains('?'), "{redacted}");
+        assert_eq!(redacted.matches("[REDACTED]").count(), 2, "{redacted}");
     }
 }

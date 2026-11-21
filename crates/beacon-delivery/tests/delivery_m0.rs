@@ -838,8 +838,16 @@ async fn concurrent_workers_send_each_job_exactly_once_fake(pool: PgPool) {
     assert_eq!(fake.calls() as i64, LOAD_JOBS);
 }
 
+/// Load test: 1,000 real emails through Mailpit. Opt-in (`DELIVERY_LOAD_TEST=1`): it floods
+/// Mailpit and makes the single-send email tests running next to it time out, and it needs
+/// Mailpit's message cap above 1,000 (`MP_MAX_MESSAGES`). The fake-channel version below always
+/// runs and proves the exactly-once property.
 #[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_workers_deliver_1000_emails_to_mailpit(pool: PgPool) {
+    if std::env::var("DELIVERY_LOAD_TEST").as_deref() != Ok("1") {
+        eprintln!("skipped: set DELIVERY_LOAD_TEST=1 to run the 1,000-email Mailpit load test");
+        return;
+    }
     let pool = big_pool(&pool, 20).await;
     let tag = unique_tag();
     let alert = insert_many_jobs(&pool, &alert_title(&tag), LOAD_JOBS).await;

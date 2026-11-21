@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use beacon_delivery::RouterConfig;
 use beacon_delivery::alert_ops::SqlAlertOps;
 use beacon_delivery::approvals::{
-    self, DecideError, DecideOutcome, Decision, MAX_SMS_ATTEMPTS, ReplyOutcome, Via,
+    self, DecideError, DecideOutcome, Decision, MAX_SMS_ATTEMPTS, ReplyOutcome, RequestError, Via,
 };
 use beacon_delivery::audit;
 use beacon_delivery::config::{Contact, Directory, Person, Team};
@@ -68,17 +68,22 @@ fn approvals_dir() -> Directory {
 }
 
 async fn insert_alert(pool: &PgPool, status: &str) -> Uuid {
+    insert_alert_on_team(pool, status, "settlements").await
+}
+
+async fn insert_alert_on_team(pool: &PgPool, status: &str, team: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO alerts (id, rule_id, rule_revision, rule_name, team, fingerprint, \
                              dedup_window_ms, status, severity, color, title, body, \
                              first_seen, last_seen, source, schema, notify_seq) \
          VALUES ($1, 'settlements-workflow-failed', 1, 'Settlement workflow failed', \
-                 'settlements', $2, 600000, $3, 'critical', 'red', \
+                 $2, $3, 600000, $4, 'critical', 'red', \
                  'Settlement workflow wf-9 failed', '', now(), now(), 'test', \
                  'workflow.failed.v1', 1)",
     )
     .bind(id)
+    .bind(team)
     .bind(format!("fp-{id}"))
     .bind(status)
     .execute(pool)
@@ -179,6 +184,74 @@ async fn audit_messages(pool: &PgPool, alert: Uuid) -> Vec<(String, String, Stri
 fn wrong_code(code: &str) -> String {
     let n: u32 = code.parse().expect("4-digit code");
     format!("{:04}", (n + 1) % 10_000)
+}
+
+/// Plant the gateway receipt for one prompt job, as the gateway writes it when the provider
+/// accepts the prompt (the rendered SMS text names the code twice, plus the challenge).
+async fn plant_receipt(pool: &PgPool, job: &DeliveryJob, code: &str) {
+    sqlx::query(
+        "INSERT INTO gateway_receipts \
+            (job_id, alert_id, channel, recipient, to_address, text, approval_challenge) \
+         VALUES ($1, $2, 'sms', $3, $4, $5, $6)",
+    )
+    .bind(job.id)
+    .bind(job.alert_id)
+    .bind(format!("user:{}", job.recipient_id))
+    .bind(&job.address)
+    .bind(format!(
+        "Approve escalate for the alert? Reply \"Y {code}\" to approve, \"N {code}\" to reject."
+    ))
+    .bind(format!("Y {code}"))
+    .execute(pool)
+    .await
+    .expect("plant gateway receipt");
+}
+
+/// The receipts of an alert's prompt jobs: `(approval_challenge, text)`, oldest first.
+async fn receipt_rows(pool: &PgPool, alert: Uuid) -> Vec<(Option<String>, String)> {
+    sqlx::query_as(
+        "SELECT r.approval_challenge, r.text FROM gateway_receipts r \
+         JOIN delivery_jobs j ON j.id = r.job_id \
+         WHERE j.alert_id = $1 AND j.route_info->>'target' = 'approval' \
+         ORDER BY r.id",
+    )
+    .bind(alert)
+    .fetch_all(pool)
+    .await
+    .expect("receipt rows")
+}
+
+/// True when `s` contains any run of 4 or more ASCII digits (the scrub masks every 4-digit
+/// run, so a scrubbed text has none).
+fn has_digit_run(s: &str) -> bool {
+    s.as_bytes()
+        .windows(4)
+        .any(|w| w.iter().all(|b| b.is_ascii_digit()))
+}
+
+/// Assert the code is gone at rest for every prompt job of `alert` (audit #11): the jobs'
+/// `route_info` lost `approval.code` but kept the rest of the approval object, and the
+/// receipts lost their challenge and every 4-digit run in `text`.
+async fn assert_scrubbed(pool: &PgPool, alert: Uuid, approval: Uuid, prompts: usize) {
+    let jobs = prompt_jobs(pool, alert).await;
+    assert_eq!(jobs.len(), prompts, "{jobs:?}");
+    for job in &jobs {
+        assert!(
+            job.route_info["approval"].get("code").is_none(),
+            "{} still carries the code: {:?}",
+            job.recipient_id,
+            job.route_info
+        );
+        assert_eq!(job.route_info["approval"]["id"], json!(approval));
+        assert_eq!(job.route_info["approval"]["step_id"], json!("s3"));
+    }
+    let receipts = receipt_rows(pool, alert).await;
+    assert_eq!(receipts.len(), prompts, "{receipts:?}");
+    for (challenge, text) in &receipts {
+        assert_eq!(challenge.as_deref(), None, "{text:?}");
+        assert!(text.contains("****"), "the code was not masked: {text:?}");
+        assert!(!has_digit_run(text), "a digit run survived: {text:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -520,7 +593,10 @@ async fn decide_by_someone_not_eligible_is_forbidden(pool: PgPool) {
     )
     .await
     .expect_err("frank may not decide");
-    assert_eq!(err, DecideError::Forbidden);
+    assert!(
+        matches!(err, DecideError::Forbidden(ref m) if m.contains("not eligible")),
+        "{err:?}"
+    );
     // A complete outsider neither.
     let err = approvals::decide(
         &pool,
@@ -533,7 +609,10 @@ async fn decide_by_someone_not_eligible_is_forbidden(pool: PgPool) {
     )
     .await
     .expect_err("ghost may not decide");
-    assert_eq!(err, DecideError::Forbidden);
+    assert!(
+        matches!(err, DecideError::Forbidden(ref m) if m.contains("not eligible")),
+        "{err:?}"
+    );
     assert_eq!(approval_row(&pool, id).await.state, "pending");
     let executions: i64 =
         sqlx::query_scalar("SELECT count(*) FROM action_executions WHERE alert_id = $1")
@@ -1137,4 +1216,271 @@ async fn two_approvals_on_one_alert_both_prompt_the_same_people(pool: PgPool) {
         .map(|j| j.route_info["approval"]["id"].clone())
         .collect();
     assert_eq!(ids.len(), 2, "both approvals prompted: {ids:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Self-approval (audit #11): the requester never decides, is never eligible, is never prompted.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_requester_is_never_eligible_and_never_prompted(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+
+    // carol — the lead, and she has a phone — requests the approval herself.
+    let mut tx = pool.begin().await.expect("tx");
+    let id = approvals::request(
+        &mut tx,
+        &dir,
+        alert,
+        "s3",
+        "escalate",
+        &json!({ "team": "counterparty-support" }),
+        "user:carol",
+    )
+    .await
+    .expect("request");
+    tx.commit().await.expect("commit");
+
+    // Eligible is lead + on-call MINUS the requester.
+    let row = approval_row(&pool, id).await;
+    assert_eq!(
+        row.eligible,
+        vec!["user:erin", "user:bob"],
+        "{:?}",
+        row.eligible
+    );
+
+    // carol has a phone but is never prompted for her own request: only bob is (erin has none).
+    let jobs = prompt_jobs(&pool, alert).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].recipient_id, "bob");
+
+    // And even a hand-planted eligible entry cannot let the requester decide: the decide
+    // state machine refuses them before eligibility is even consulted.
+    let planted = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO approvals \
+            (id, alert_id, step_id, action, params, eligible, state, requested_by, \
+             expires_at, sms_code_hash) \
+         VALUES ($1, $2, 's9', 'escalate', '{}', ARRAY['user:carol'], 'pending', 'user:carol', \
+                 now() + interval '15 minutes', $3)",
+    )
+    .bind(planted)
+    .bind(alert)
+    .bind(expected_hash(planted, "4821"))
+    .execute(&pool)
+    .await
+    .expect("plant self-eligible approval");
+    let err = approvals::decide(
+        &pool,
+        &SqlAlertOps,
+        planted,
+        "user:carol",
+        Decision::Approve,
+        Via::Ui,
+        None,
+    )
+    .await
+    .expect_err("self-approval");
+    assert!(
+        matches!(
+            err,
+            DecideError::Forbidden(ref m) if m == "the requester cannot approve their own request"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(approval_row(&pool, planted).await.state, "pending");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sole_approver_request_fails_with_no_eligible_approver(pool: PgPool) {
+    // A team whose only decider is its lead: when the lead requests, nobody is left.
+    let dir = Directory::from_parts(
+        vec![person(
+            "solo",
+            Some("solo@example.test"),
+            Some("+44 7700 900999"),
+        )],
+        vec![Team {
+            id: "solo-team".into(),
+            members: vec!["solo".into()],
+            lead: Some("solo".into()),
+            oncall: HashMap::new(),
+            default_channels: None,
+        }],
+    )
+    .expect("directory builds");
+    let alert = insert_alert_on_team(&pool, "open", "solo-team").await;
+
+    let mut tx = pool.begin().await.expect("tx");
+    let err = approvals::request(
+        &mut tx,
+        &dir,
+        alert,
+        "s3",
+        "escalate",
+        &json!({ "team": "counterparty-support" }),
+        "user:solo",
+    )
+    .await
+    .expect_err("nobody else can decide");
+    assert!(matches!(err, RequestError::NoEligibleApprover), "{err:?}");
+    tx.rollback().await.expect("rollback");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM approvals WHERE alert_id = $1")
+        .bind(alert)
+        .fetch_one(&pool)
+        .await
+        .expect("count approvals");
+    assert_eq!(rows, 0, "no approvals row was written");
+    assert_eq!(
+        prompt_jobs(&pool, alert).await.len(),
+        0,
+        "no prompt was sent"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scrubbing the code at rest (audit #11): the code leaves the DB with the decision.
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn approving_scrubs_the_code_from_jobs_and_receipts(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+    let id = request_approval(&pool, &dir, alert, "s3").await;
+    for job in prompt_jobs(&pool, alert).await {
+        let code = job.route_info["approval"]["code"].as_str().expect("code");
+        plant_receipt(&pool, &job, code).await;
+    }
+
+    approvals::decide(
+        &pool,
+        &SqlAlertOps,
+        id,
+        "user:carol",
+        Decision::Approve,
+        Via::Ui,
+        None,
+    )
+    .await
+    .expect("approve");
+
+    assert_scrubbed(&pool, alert, id, 2).await;
+    assert_eq!(approval_row(&pool, id).await.state, "approved");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn rejecting_scrubs_the_code_from_jobs_and_receipts(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+    let id = request_approval(&pool, &dir, alert, "s3").await;
+    for job in prompt_jobs(&pool, alert).await {
+        let code = job.route_info["approval"]["code"].as_str().expect("code");
+        plant_receipt(&pool, &job, code).await;
+    }
+
+    approvals::decide(
+        &pool,
+        &SqlAlertOps,
+        id,
+        "user:bob",
+        Decision::Reject,
+        Via::Sms,
+        None,
+    )
+    .await
+    .expect("reject");
+
+    assert_scrubbed(&pool, alert, id, 2).await;
+    assert_eq!(approval_row(&pool, id).await.state, "rejected");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_fifth_wrong_attempt_expires_and_scrubs_the_code(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+    let id = request_approval(&pool, &dir, alert, "s3").await;
+    let code = prompt_code(&pool, alert, "carol").await;
+    for job in prompt_jobs(&pool, alert).await {
+        let code = job.route_info["approval"]["code"].as_str().expect("code");
+        plant_receipt(&pool, &job, code).await;
+    }
+    let wrong = wrong_code(&code);
+
+    for _ in 1..MAX_SMS_ATTEMPTS {
+        let outcome = approvals::handle_reply(
+            &pool,
+            &dir,
+            &SqlAlertOps,
+            "+44 7700 900125",
+            &format!("Y {wrong}"),
+        )
+        .await
+        .expect("wrong reply");
+        assert_eq!(outcome, ReplyOutcome::WrongCode);
+    }
+    // The first four wrong replies scrub nothing; the fifth expires and scrubs.
+    assert!(
+        prompt_jobs(&pool, alert).await[0].route_info["approval"]
+            .get("code")
+            .is_some(),
+        "the code lives while the approval is pending"
+    );
+    let outcome = approvals::handle_reply(
+        &pool,
+        &dir,
+        &SqlAlertOps,
+        "+44 7700 900125",
+        &format!("Y {wrong}"),
+    )
+    .await
+    .expect("fifth wrong reply");
+    assert_eq!(outcome, ReplyOutcome::TooManyAttempts);
+
+    assert_scrubbed(&pool, alert, id, 2).await;
+    assert_eq!(approval_row(&pool, id).await.state, "expired");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn expire_stale_expires_and_scrubs_only_lapsed_approvals(pool: PgPool) {
+    let dir = approvals_dir();
+    let alert = insert_alert(&pool, "open").await;
+    let id = request_approval(&pool, &dir, alert, "s3").await;
+    for job in prompt_jobs(&pool, alert).await {
+        let code = job.route_info["approval"]["code"].as_str().expect("code");
+        plant_receipt(&pool, &job, code).await;
+    }
+    // A second, live approval on another alert: the sweeper must not touch it.
+    let other_alert = insert_alert(&pool, "open").await;
+    let fresh = request_approval(&pool, &dir, other_alert, "s5").await;
+
+    sqlx::query("UPDATE approvals SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("backdate expiry");
+
+    let expired = approvals::expire_stale(&pool).await.expect("expire_stale");
+    assert_eq!(expired, 1);
+
+    assert_eq!(approval_row(&pool, id).await.state, "expired");
+    assert_scrubbed(&pool, alert, id, 2).await;
+    // The live one is untouched: still pending, code still in its prompt jobs.
+    let fresh_row = approval_row(&pool, fresh).await;
+    assert_eq!(fresh_row.state, "pending");
+    let fresh_jobs = prompt_jobs(&pool, other_alert).await;
+    assert_eq!(fresh_jobs.len(), 2);
+    assert!(
+        fresh_jobs
+            .iter()
+            .all(|j| j.route_info["approval"].get("code").is_some()),
+        "{fresh_jobs:?}"
+    );
+
+    // Nothing left to sweep.
+    assert_eq!(
+        approvals::expire_stale(&pool).await.expect("second sweep"),
+        0
+    );
 }

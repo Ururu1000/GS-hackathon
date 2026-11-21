@@ -687,14 +687,23 @@ async fn gateway_with_token_requires_bearer_auth_on_control_routes(pool: PgPool)
         .expect("outage POST with token");
     assert_eq!(resp.status().as_u16(), 200);
 
-    // GET outage is open and shows the outage started above.
-    let outages: Value = http
+    // GET outage needs the token too now (audit #11): without it 401, with it 200.
+    let resp = http
         .get(format!("{base_url}/api/simulator/outage"))
         .send()
         .await
-        .expect("GET outage")
+        .expect("GET outage without token");
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], Value::String("unauthorized".into()));
+    let outages: Value = http
+        .get(format!("{base_url}/api/simulator/outage"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("GET outage with token")
         .error_for_status()
-        .expect("GET outage must stay open")
+        .expect("GET outage with token must stay open")
         .json()
         .await
         .expect("outages JSON");
@@ -709,6 +718,7 @@ async fn gateway_with_token_requires_bearer_auth_on_control_routes(pool: PgPool)
     assert_eq!(resp.status().as_u16(), 401);
     let outages: Value = http
         .get(format!("{base_url}/api/simulator/outage"))
+        .bearer_auth(TOKEN)
         .send()
         .await
         .expect("GET outage")
@@ -727,6 +737,7 @@ async fn gateway_with_token_requires_bearer_auth_on_control_routes(pool: PgPool)
     assert_eq!(resp.status().as_u16(), 200);
     let outages: Value = http
         .get(format!("{base_url}/api/simulator/outage"))
+        .bearer_auth(TOKEN)
         .send()
         .await
         .expect("GET outage")
@@ -735,19 +746,40 @@ async fn gateway_with_token_requires_bearer_auth_on_control_routes(pool: PgPool)
         .expect("outages JSON");
     assert_eq!(outages["outages"].as_array().unwrap().len(), 0);
 
-    // The other read endpoints stay open too.
-    let resp = http
-        .get(format!("{base_url}/api/simulator/messages"))
-        .send()
-        .await
-        .expect("GET messages");
-    assert_eq!(resp.status().as_u16(), 200);
+    // The other read endpoints need the token too: 401 without, 200 with.
+    for path in ["/api/simulator/messages", "/api/simulator/mock"] {
+        let resp = http
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .expect("GET read without token");
+        let (status, body) = error_body(resp).await;
+        assert_eq!(status, 401, "{path}: {body}");
+        assert_eq!(body["error"]["code"], Value::String("unauthorized".into()));
+        let resp = http
+            .get(format!("{base_url}{path}"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .expect("GET read with token");
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+    }
     let resp = http
         .get(format!("{base_url}/api/simulator/stream"))
         .header("Accept", "text/event-stream")
         .send()
         .await
-        .expect("GET stream");
+        .expect("GET stream without token");
+    let (status, body) = error_body(resp).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], Value::String("unauthorized".into()));
+    let resp = http
+        .get(format!("{base_url}/api/simulator/stream"))
+        .bearer_auth(TOKEN)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("GET stream with token");
     assert_eq!(resp.status().as_u16(), 200);
 }
 
@@ -1152,7 +1184,11 @@ async fn open_simulator_stream_does_not_block_shutdown(pool: PgPool) {
         .send()
         .await
         .expect("GET stream");
-    stream.chunk().await.expect("snapshot chunk").expect("snapshot");
+    stream
+        .chunk()
+        .await
+        .expect("snapshot chunk")
+        .expect("snapshot");
 
     shutdown_tx.send(true).expect("signal shutdown");
     tokio::time::timeout(Duration::from_secs(5), server)
