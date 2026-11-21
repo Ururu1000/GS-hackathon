@@ -14,6 +14,7 @@ import type {
   RuleSpec,
   RuleTestRequest,
   RuleTestResult,
+  RunbookDetail,
   RunbookSummary,
   Session,
   TeamView,
@@ -180,6 +181,8 @@ export const deleteRule = (id: string, expectedRevision: number) =>
 export const testRule = (body: RuleTestRequest, signal?: AbortSignal) =>
   post<RuleTestResult>('/api/rules/test', body, signal)
 export const listRunbooks = () => request<{ items: RunbookSummary[] }>('/api/runbooks').then((r) => r.items)
+export const getRunbook = (id: string, signal?: AbortSignal) =>
+  request<RunbookDetail>(`/api/runbooks/${encodeURIComponent(id)}`, { signal })
 export const recentEvents = (limit = 20, team?: string | null) => {
   const qs = new URLSearchParams({ limit: String(limit) })
   if (team) qs.set('team', team)

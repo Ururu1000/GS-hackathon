@@ -7,6 +7,7 @@ import { CheckIcon, CloseIcon, CopyIcon } from '../lib/icons'
 import { maskAddress } from '../lib/redact'
 import { actorName, colorToken, CountBadge, resolvedReasonText, resolvedText, SeverityBadge, STATUS_LABEL } from './badges'
 import { LIVE_STATES, Runbook } from './Runbook'
+import { RunbookChanges } from './RunbookChanges'
 
 interface Props {
   /** Live projection from the feed store (count/status update in place). */
@@ -137,6 +138,8 @@ export function AlertDetail({ alert: a, snapshotAt, now, pending, onAct, onClose
       {detail?.occurrences && <OccurrenceChart series={detail.occurrences} />}
 
       {detail?.runbook && <Runbook runbook={detail.runbook} alert={a} now={now} onChanged={reload} onToast={onToast} />}
+
+      {detail?.runbook && a.status === 'resolved' && <RunbookChanges runbook={detail.runbook} />}
 
       <section className="section">
         {error && <div className="placeholder error">Couldn’t load this part. It will retry automatically.</div>}

@@ -334,3 +334,14 @@ it('applies detector precedence before resolving matching detectors with the sam
   expect(await request('/api/rules/test', 200, 'POST', { rule: RULES[0], event, source: 'http:alertmanager' }))
     .toMatchObject({ schema: 'prometheus.alert', fields: { stage: 'firing' } })
 })
+
+it('serves a runbook’s current revision and keeps the alert’s frozen copy', async () => {
+  const detail = await request('/api/runbooks/settlement-timeout')
+  expect(detail).toMatchObject({ id: 'settlement-timeout', revision: 2, team: 'settlements' })
+  expect(detail.steps.map((s: { id: string }) => s.id)).toEqual(['check-counterparty', 'retry', 'notify-desk', 'escalate'])
+  expect(detail.steps.find((s: { id: string }) => s.id === 'escalate')).toMatchObject({ approval: 'required', action: { name: 'escalate', label: 'Escalate' } })
+  expect(detail.steps.find((s: { id: string }) => s.id === 'retry').text).toContain('{{workflowId}}')
+  await request('/api/runbooks/nope', 404)
+  const { items } = await request('/api/runbooks')
+  expect(items.find((r: { id: string }) => r.id === 'settlement-timeout').revision).toBe(2)
+})

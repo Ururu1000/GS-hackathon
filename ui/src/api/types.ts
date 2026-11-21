@@ -433,10 +433,31 @@ export interface RecentEvent extends EventSample {
 
 export interface RunbookSummary {
   id: string
+  /** Current published revision (older backends omit it). */
+  revision?: number
   title: string
   format: RunbookFormat | (string & {})
   team: string | null
   steps: number
+}
+
+/** One step of a runbook's current revision, as templates (not rendered for an alert). */
+export interface RunbookDetailStep {
+  id: string
+  kind: RunbookStep['kind']
+  text: string
+  action: { name: string; label: string } | null
+  approval: 'none' | 'required'
+}
+
+/** `GET /api/runbooks/{id}`: the current revision, for post-incident diffs. */
+export interface RunbookDetail {
+  id: string
+  revision: number
+  title: string
+  format: RunbookFormat | (string & {})
+  team: string | null
+  steps: RunbookDetailStep[]
 }
 
 // ---- People, teams, preferences (spec §4.4) ------------------------------
