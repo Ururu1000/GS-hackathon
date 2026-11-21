@@ -32,7 +32,7 @@ docker compose ps -a              # beacon healthy, demo-seed exited 0
 1. **New schema at runtime.** Post any JSON to `:8090/ingest/demo`, with the JSON content type:
    `curl -H 'content-type: application/json' --data @event.json http://localhost:8090/ingest/demo`
    The Sources tab shows its shape; write a rule in the Rules tab, dry-run it in the test panel, save. The next event raises an alert, with no restart.
-2. **Runbook + approval.** Open the settlement-workflow alert, run the steps, and ask for approval on *escalate*. The Phone simulator tab gets the approval SMS; reply `Y <code>`. To make the retry step fail so escalate unlocks:
+2. **Runbook + approval.** Open the settlement-workflow alert, run the steps, and ask for approval on *escalate*. The Phone simulator tab gets the approval SMS; reply `Y <code>`. Or open the approval email in Mailpit (:8025) and follow its signed link: the page shows the request, and *Approve* decides it (opening the link alone changes nothing). To make the retry step fail so escalate unlocks:
    `docker compose exec beacon curl -s -X POST -H 'Authorization: Bearer beacon-demo-gateway-token' -H 'content-type: application/json' -d '{"target":"workflows","mode":"fail"}' http://127.0.0.1:8070/api/simulator/mock`
 3. **Channel outage.** In the Phone simulator tab, open **Gateway outage**, pick SMS and 60 s, and press *Take SMS down for 60 s*. Then trigger alerts. The SMS are held, the breaker opens, and every SMS arrives after recovery (at-least-once delivery; in our 60 s outage runs, 0 lost and 0 duplicates against the gateway's receipts). *End SMS outage now* stops it early.
 4. **Preferences.** Change a person's channels in Preferences; the next notification follows them.
@@ -40,6 +40,19 @@ docker compose ps -a              # beacon healthy, demo-seed exited 0
 Stop with `docker compose down` (`-v` also deletes the data).
 
 The demo session is a fixed admin user (`BEACON_DEMO_USER`, default `anna`). There is no real login, so every port binds to localhost only.
+
+## What is mocked
+
+Real: Kafka (Redpanda), Postgres, the HTTP/webhook, Kafka, file-tail and poll sources, SMTP delivery, and every Beacon service. Simulated, because they are external systems:
+
+| What | Mock | Swapping in the real thing |
+|---|---|---|
+| Email provider | [Mailpit](http://localhost:8025) catches every message over plain SMTP | Config only: `SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS`, `SMTP_USERNAME`/`SMTP_PASSWORD` |
+| SMS and phone provider | The `gateway` role: a fake provider with the Phone simulator tab, receipts, outage switch and signed replies | One adapter behind the `Channel` trait; retries, breaker and fallback stay shared ([docs/PROVIDERS.md](docs/PROVIDERS.md)) |
+| Runbook action targets | The gateway's `/mock/*` endpoints: health checks, workflow retry, service restart, tickets (`POST /api/simulator/mock` makes them fail) | Point the action at a real URL (`config/actions/targets.yaml` aliases) |
+| Login | One fixed demo session (`BEACON_DEMO_USER`, default `anna`, an admin), so every port binds to localhost | An auth layer in front of `beacon-api`; handlers already take the `Actor` from the session |
+| LLM schema suggestions | Off by default; `BEACON_LLM=mock` is a labelled heuristic | `BEACON_LLM=claude` with `ANTHROPIC_API_KEY` |
+| On-call rotations and working hours | Read from `config/people` and `config/teams` (editable at runtime) | No calendar or paging-service integration |
 
 ## UI
 
@@ -181,7 +194,7 @@ One binary, `beacon`, runs any mix of roles (`--role ingest,matcher,...`); the c
 - **Webhook ingest:** `POST /ingest/*` must be `Content-Type: application/json`, so a page the user visits can't post events across sites. Set `INGEST_TOKEN` to require `Authorization: Bearer <token>`. Without it the ingest logs a warning when it listens beyond loopback.
 - **Redaction:** secret-looking fields are redacted before they reach alerts, samples or notifications. Delivery addresses and provider errors are masked in alert detail.
 - **Logs:** no message text, SMS codes or approval challenges. Phone numbers are masked.
-- **Approvals:** codes are stored hashed, single-use, expire after 15 min, and allow 5 attempts. Nobody approves their own request.
+- **Approvals:** codes are stored hashed, single-use, expire after 15 min, and allow 5 attempts. Nobody approves their own request. The approval email carries a link signed with `REPLY_SECRET` (HMAC over the approval, the approver and the expiry) instead of the code. Opening it only shows a confirm page, because mail scanners prefetch links. The *Approve*/*Reject* POST then goes through the same checks as the SMS reply, and a forged link burns no attempts.
 - **SMS replies:** they reach the API signed with `REPLY_SECRET` (HMAC with a timestamp). `GATEWAY_TOKEN` stays on the server, and the API adds it to the UI's simulator calls.
 - **Demo caveat:** the device simulator is a fake phone for the demo. Any session can read the SMS it holds, approval codes included, and reply as any number. A real SMS provider replaces it.
 - **Limits:** bodies, rule sizes, regexes, templates, SSE streams and pending proposals are all capped, and every request is validated.
