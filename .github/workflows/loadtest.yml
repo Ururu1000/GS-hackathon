@@ -115,8 +115,12 @@ jobs:
         run: |
           # One-shot service: start it after beacon is healthy (not under --wait, it exits by design).
           docker compose up -d --no-build demo-seed
-          code=$(docker compose wait demo-seed)
+          # `docker wait` also handles a container that already exited (the seed takes seconds).
+          cid=$(docker compose ps -aq demo-seed)
+          test -n "$cid"
+          code=$(docker wait "$cid")
           docker compose logs demo-seed
+          echo "demo-seed exit code: $code"
           test "$code" = 0
       - name: Smoke test through the UI origin (:8080)
         run: |
