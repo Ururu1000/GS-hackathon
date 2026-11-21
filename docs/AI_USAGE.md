@@ -23,6 +23,12 @@ The submission rules ask every team that used AI tools to say how, and how it de
 - Implementation and tests went to OpenCode subagents, two or three at once, each with a written brief: files it may touch, gates it must pass (build, tests, Clippy, rustfmt), and "no git, no board".
 - The lead reviewed every subagent diff before committing. Larger changes got an independent review from a teammate's agent.
 
+### Ingest, engine, API and deploy (part a) in more detail
+
+- A Claude Code session did most of the implementation and testing: ingest, the matcher and aggregator, exactly-once checkpoints, the REST/SSE API, the compose image and the load generator. It ran each milestone from a plan alexey approved, and it posted contract changes on the board before coding them.
+- Reviews came from other models, so the author never graded its own work. Codex ran repeated "Sol" correctness rounds (GPT-6.2-Sol; four rounds on PR #8 alone). A Cursor agent did the security audits: NUL bytes, body timeouts, regex and signature bounds, localhost-only ports. After each milestone an independent tester agent ran the suite, an end-to-end run and a code review. Every finding was fixed or answered in the PR; [progress.md](../progress.md) lists them.
+- Claims are measured, not estimated. The engine's 20k events/s figure, the exact counts under `kill -9`, and the Mac latency and outage runs come from the load generator, with workload parameters in [loadtest/README.md](../loadtest/README.md) and the README.
+
 ### Spec and UI (part c) in more detail
 
 - **Spec first, reviewed by another model.** erop's Claude Code session wrote `docs/SPEC.md` (PR #1). A GPT model reviewed it in two read-only rounds (findings in `docs/reviews/`), and the fixes and board agreements went into v0.2 before any code.
@@ -30,7 +36,6 @@ The submission rules ask every team that used AI tools to say how, and how it de
 - **Two review passes per change.** Each UI change went through a correctness loop with a GPT model (findings fixed and re-checked until clean), then a separate Claude Opus pass for security and privacy (CSRF header on writes, no secrets or raw payloads rendered, redaction kept). The passes ran one after the other, never in parallel.
 - **People chose the look.** The agent offered options (for example several logo concepts), erop picked one, and the agent checked the result in the running demo at desktop and narrow widths before merging.
 
-*alexey: add a short paragraph for part (a) here.*
 
 ## Security and privacy
 
