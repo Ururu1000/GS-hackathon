@@ -80,7 +80,17 @@ struct Args {
     out: String,
 }
 
-/// Generate one event; `matching` false produces a near-miss that no rule matches.
+/// `topic:partition:offset` from a Kafka source's event id
+/// (`<source id>:<topic>:<partition>:<offset>`; source ids may contain `:`,
+/// topic names can't).
+fn kafka_locator(event_id: &str) -> Option<&str> {
+    let mut idx = event_id.len();
+    for _ in 0..3 {
+        idx = event_id[..idx].rfind(':')?;
+    }
+    Some(&event_id[idx + 1..])
+}
+
 fn event_types(spec: &str) -> Result<Vec<usize>> {
     if spec == "all" {
         return Ok(vec![0, 1, 2, 3]);
@@ -96,6 +106,7 @@ fn event_types(spec: &str) -> Result<Vec<usize>> {
         .collect()
 }
 
+/// Generate one event; `matching` false produces a near-miss that no rule matches.
 fn make_event(rng: &mut impl Rng, run: &str, keys: u64, matching: bool, types: &[usize]) -> Value {
     // Keys are namespaced per run so alerts from earlier runs are never reused.
     let k = format!("{run}-{:06}", rng.random_range(0..keys));
@@ -190,18 +201,22 @@ async fn main() -> Result<()> {
                 let now = Instant::now();
                 updates_seen.fetch_add(1, Ordering::Relaxed);
                 // Only alerts carrying an event from this run are sampled, so
-                // unrelated traffic on the shared feed is ignored.
-                // Over Kafka the source assigns event ids, so only first-alert
-                // latency (server clock) is measured, for this run's alerts.
-                if via_kafka {
-                    if !a.title.contains(run_tag.as_str()) {
-                        continue;
+                // unrelated traffic on the shared feed is ignored. Over Kafka the
+                // source names events by topic:partition:offset, which the
+                // producer learns from the broker ack.
+                let t0 = a.last_event_id.as_deref().and_then(|eid| {
+                    let key = if via_kafka { kafka_locator(eid)? } else { eid };
+                    sent_at.lock().unwrap().get(key).copied()
+                });
+                match t0 {
+                    Some(t0) => {
+                        let us = now.duration_since(t0).as_micros() as u64;
+                        let _ = latency.lock().unwrap().record(us.max(1));
                     }
-                } else {
-                    let Some(eid) = a.last_event_id.as_deref() else { continue };
-                    let Some(t0) = sent_at.lock().unwrap().get(eid).copied() else { continue };
-                    let us = now.duration_since(t0).as_micros() as u64;
-                    let _ = latency.lock().unwrap().record(us.max(1));
+                    // An alert can beat its own ack back to us; it still counts
+                    // as this run's for first-alert latency (keys carry the run id).
+                    None if via_kafka && a.title.contains(run_tag.as_str()) => {}
+                    None => continue,
                 }
                 if alerts_seen.lock().unwrap().insert(a.id) {
                     // Opening latency on the server clock: ingest receipt (first_seen)
@@ -268,10 +283,12 @@ async fn main() -> Result<()> {
         let intended = start + period.mul_f64(b as f64);
         tokio::time::sleep_until(intended.into()).await;
         let mut matching_in_batch = 0u64;
+        let mut matching_flags = Vec::with_capacity(args.batch);
         let events: Vec<Value> = (0..args.batch)
             .map(|_| {
                 let matching = rng.random_bool(args.match_ratio.clamp(0.0, 1.0));
                 matching_in_batch += matching as u64;
+                matching_flags.push(matching);
                 make_event(&mut rng, &run_id, args.distinct_keys, matching, &types)
             })
             .collect();
@@ -282,7 +299,7 @@ async fn main() -> Result<()> {
             late.fetch_add(events.len() as u64, Ordering::Relaxed);
             continue;
         };
-        {
+        if !via_kafka {
             let mut map = sent_at.lock().unwrap();
             for i in 0..events.len() {
                 map.insert(format!("http:lg:{key}-{i}"), intended);
@@ -291,20 +308,32 @@ async fn main() -> Result<()> {
         let (client, url, counters) = (client.clone(), args.url.clone(), counters.clone());
         let n = events.len() as u64;
         if let (true, Some(producer)) = (via_kafka, producer.clone()) {
-            let topic = args.topic.clone();
+            let (topic, sent_at) = (args.topic.clone(), sent_at.clone());
             handles.push(tokio::spawn(async move {
                 let _permit = permit;
                 counters.sent.fetch_add(n, Ordering::Relaxed);
-                let payloads: Vec<Vec<u8>> = events.iter().map(|e| serde_json::to_vec(e).unwrap()).collect();
-                let sends = payloads.iter().map(|p| {
-                    producer.send(rdkafka::producer::FutureRecord::<str, [u8]>::to(&topic).payload(p), Duration::from_secs(10))
+                // Each record is acked on its own, so each is counted on its own:
+                // a partly failed batch still has its accepted events processed.
+                let sends = events.iter().zip(matching_flags).map(|(e, matching)| {
+                    let (producer, topic, sent_at) = (&producer, &topic, &sent_at);
+                    async move {
+                        let payload = serde_json::to_vec(e).expect("generated events serialize");
+                        let record = rdkafka::producer::FutureRecord::<str, [u8]>::to(topic).payload(&payload);
+                        let delivery = producer.send(record, Duration::from_secs(10)).await.ok()?;
+                        sent_at.lock().unwrap().insert(format!("{topic}:{}:{}", delivery.partition, delivery.offset), intended);
+                        Some(matching)
+                    }
                 });
-                let results = futures::future::join_all(sends).await;
-                if results.iter().all(Result::is_ok) {
-                    counters.matching_accepted.fetch_add(matching_in_batch, Ordering::Relaxed);
-                    counters.accepted.fetch_add(n, Ordering::Relaxed);
-                } else {
-                    counters.failed.fetch_add(n, Ordering::Relaxed);
+                for result in futures::future::join_all(sends).await {
+                    match result {
+                        Some(matching) => {
+                            counters.accepted.fetch_add(1, Ordering::Relaxed);
+                            counters.matching_accepted.fetch_add(matching as u64, Ordering::Relaxed);
+                        }
+                        None => {
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }));
             continue;
@@ -429,12 +458,18 @@ impl Report {
         let mut s = String::new();
         s.push_str(&format!("# Load test `{}` ({})\n\n", a.scenario, self.run_id));
         s.push_str("## Workload\n\n| Parameter | Value |\n|---|---|\n");
-        s.push_str(&format!("| Target rate | {} events/s |\n| Duration | {} s |\n| Events per request | {} |\n", a.rate, a.duration, a.batch));
-        s.push_str(&format!("| Distinct keys per event type | {} |\n| Match ratio | {} |\n| Max concurrent requests | {} |\n", a.distinct_keys, a.match_ratio, a.concurrency));
-        s.push_str(&format!("| Host | {host} |\n| Ingest URL | {} |\n\n", a.url));
+        let transport = if a.via == "kafka" {
+            format!("Kafka topic `{}` on {}, read by a Kafka source", a.topic, a.kafka)
+        } else {
+            format!("HTTP `POST {}/ingest/lg/batch`", a.url)
+        };
+        s.push_str(&format!("| Transport | {transport} |\n| Event types | {} |\n", a.event_types));
+        s.push_str(&format!("| Target rate | {} events/s |\n| Duration | {} s |\n| Events per batch | {} |\n", a.rate, a.duration, a.batch));
+        s.push_str(&format!("| Distinct keys per event type | {} |\n| Match ratio | {} |\n| Max concurrent batches | {} |\n", a.distinct_keys, a.match_ratio, a.concurrency));
+        s.push_str(&format!("| Host | {host} |\n\n"));
         s.push_str("## Throughput\n\n| Metric | Value |\n|---|---|\n");
         s.push_str(&format!(
-            "| Sent | {} |\n| Accepted (202) | {} |\n| Matching events accepted (expected sum of alert counts) | {} |\n| Rejected (429) | {} |\n| Failed | {} |\n| Accepted rate | {:.0} events/s |\n| Shed by client (over concurrency budget) | {} events |\n| Alert updates observed | {} |\n| Distinct alerts observed | {} |\n| Drain after send stopped | {:.1} s |\n\n",
+            "| Sent | {} |\n| Accepted (HTTP 202 or broker ack) | {} |\n| Matching events accepted (expected sum of alert counts) | {} |\n| Rejected (429) | {} |\n| Failed | {} |\n| Accepted rate | {:.0} events/s |\n| Shed by client (over concurrency budget) | {} events |\n| Alert updates observed | {} |\n| Distinct alerts observed | {} |\n| Drain after send stopped | {:.1} s |\n\n",
             self.sent,
             self.accepted,
             self.matching_accepted,
@@ -451,6 +486,21 @@ impl Report {
         s.push_str(&row("Any update (count bump or new alert)", &self.latency));
         s.push_str(&row("First alert: ingest receipt → first update (server clock)", &self.first_alert));
         s.push_str("\nSamples are the events whose id is the alert's `last_event_id` when an update is published; duplicates folded into the same batch are not individually timed.\n");
+        if a.via == "kafka" {
+            s.push_str("Over Kafka, \"any update\" includes the time the event waited in the source topic; \"first alert\" starts when the Kafka source read it.\n");
+        }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kafka_locator;
+
+    #[test]
+    fn kafka_locator_keeps_topic_partition_offset() {
+        assert_eq!(kafka_locator("kafka:workflows:workflow-events:3:42"), Some("workflow-events:3:42"));
+        assert_eq!(kafka_locator("src:t:0:1"), Some("t:0:1"));
+        assert_eq!(kafka_locator("http:lg:abc"), None);
     }
 }

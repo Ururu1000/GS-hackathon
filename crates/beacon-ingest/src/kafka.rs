@@ -53,7 +53,18 @@ pub fn producer(bootstrap: &str) -> Result<FutureProducer> {
 /// A consumer that only commits offsets we explicitly store after processing
 /// (at-least-once; M1 replaces this with fenced checkpoints for the aggregator).
 pub fn consumer(bootstrap: &str, group: &str, topics: &[&str], from_beginning: bool) -> Result<StreamConsumer> {
-    let consumer: StreamConsumer = base_config(bootstrap)
+    let consumer: StreamConsumer = consumer_config(bootstrap, group, from_beginning)
+        .create()
+        .context("creating Kafka consumer")?;
+    rdkafka::consumer::Consumer::subscribe(&consumer, topics).context("subscribing")?;
+    Ok(consumer)
+}
+
+/// The settings behind [`consumer`], for callers that add their own (e.g. a
+/// Kafka source's TLS/SASL settings) before creating it.
+pub fn consumer_config(bootstrap: &str, group: &str, from_beginning: bool) -> ClientConfig {
+    let mut c = base_config(bootstrap);
+    c
         .set("group.id", group)
         .set("enable.auto.commit", "true")
         .set("auto.commit.interval.ms", "500")
@@ -65,11 +76,8 @@ pub fn consumer(bootstrap: &str, group: &str, topics: &[&str], from_beginning: b
         // Detect a crashed member in seconds, not the 45 s default, so its
         // partitions move to a live replica quickly.
         .set("session.timeout.ms", "10000")
-        .set("heartbeat.interval.ms", "1000")
-        .create()
-        .context("creating Kafka consumer")?;
-    rdkafka::consumer::Consumer::subscribe(&consumer, topics).context("subscribing")?;
-    Ok(consumer)
+        .set("heartbeat.interval.ms", "1000");
+    c
 }
 
 /// Create topics with `partitions` if they don't exist (idempotent).
