@@ -34,6 +34,9 @@
 //! | `MATCHER_WORKERS`    | `8` (consumers in the matcher group)      | matcher           |
 //! | `AGGREGATOR_WORKERS` | `2` (consumers in the aggregator group)   | aggregator        |
 //! | `RELAY_WORKERS`      | `1`                                       | relay             |
+//! | `SUGGEST_INTERVAL_SECS` | `300`; `0` = no auto-suggested proposals | aggregator        |
+//! | `SUGGEST_MIN_ALERTS` | `20` (noisy: alerts in the lookback)      | aggregator        |
+//! | `SUGGEST_LOOKBACK_HOURS` | `168` (7 days)                        | aggregator        |
 //! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
 //! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
 //! | `BEACON_UI_DIR`      | `ui/dist` if it exists (static UI)        | api               |
@@ -350,6 +353,32 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Aggregator => {
+                // Auto-suggested proposals (M7): every SUGGEST_INTERVAL_SECS; 0 turns it off.
+                let interval: u64 = env_or("SUGGEST_INTERVAL_SECS", "300")
+                    .parse()
+                    .context("SUGGEST_INTERVAL_SECS")?;
+                if interval > 0 {
+                    let d = beacon_engine::suggest::SuggestConfig::default();
+                    let cfg = beacon_engine::suggest::SuggestConfig {
+                        interval: std::time::Duration::from_secs(interval),
+                        lookback: std::time::Duration::from_secs(
+                            env_or("SUGGEST_LOOKBACK_HOURS", "168")
+                                .parse::<u64>()
+                                .context("SUGGEST_LOOKBACK_HOURS")?
+                                .max(1)
+                                * 3600,
+                        ),
+                        min_alerts: env_or("SUGGEST_MIN_ALERTS", "20")
+                            .parse::<i64>()
+                            .context("SUGGEST_MIN_ALERTS")?
+                            .max(1),
+                        ..d
+                    };
+                    let (pool, rx) = (pool.clone(), shutdown_rx.clone());
+                    tasks.spawn(supervise("suggester", rx.clone(), move || {
+                        beacon_engine::suggest::run_suggester(pool.clone(), cfg.clone(), rx.clone())
+                    }));
+                }
                 tasks.spawn({
                     let (pool, rx) = (pool.clone(), shutdown_rx.clone());
                     async move {
