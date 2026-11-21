@@ -1,0 +1,8 @@
+target/
+**/node_modules/
+ui/dist/
+.git/
+.agentbridge.json
+loadtest/results/
+*.log
+.DS_Store

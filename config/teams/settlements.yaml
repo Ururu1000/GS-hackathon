@@ -2,4 +2,4 @@ team: settlements
 members: [bob, carol]
 lead: carol
 oncall:                       # first entry is on call (M0)
-  settlements: [bob, carol]
+  settlements-primary: [bob, carol]

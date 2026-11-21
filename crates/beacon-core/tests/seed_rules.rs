@@ -36,7 +36,7 @@ fn settlements_workflow_failure() {
     assert_eq!(m.body, "TIMEOUT: Counterparty service did not respond in 5000 ms");
     assert_eq!(m.color, "red");
     assert_eq!(m.severity, "critical");
-    assert_eq!(m.route[0].to, "oncall:settlements");
+    assert_eq!(m.route[0].to, "oncall:settlements-primary");
     assert_eq!(m.fields[0].label, "Step");
 }
 
@@ -76,6 +76,16 @@ fn anna_fires_and_recovers_on_same_fingerprint() {
     assert_eq!(fire[0].kind, MatchKind::Fire);
     assert_eq!(fire[0].route[0].to, "user:anna");
     assert_eq!(fire[0].title, "HighErrorRate on payments-api (eu-west)");
+    assert_eq!(fire[0].context.service.as_deref(), Some("payments-api"));
+    assert_eq!(fire[0].context.event_type.as_deref(), Some("HighErrorRate"));
+    assert_eq!(fire[0].context.schema.as_deref(), Some("prometheus.alert"));
+    // Rules with a runbook pin the opening event for templates.
+    let ev = fire[0].event.as_ref().expect("anna's rule has a runbook");
+    assert_eq!(ev.raw["labels"]["region"], json!("eu-west"));
+    assert_eq!(ev.fields["service"], json!("payments-api"));
+    // Rules without one don't carry it (pricing has no runbook).
+    let (_, p) = run(&cfg, "http:logs", sample("pricing-log-warn.json"));
+    assert!(p[0].event.is_none());
 
     let (_, rec) = run(&cfg, "http:alertmanager", sample("high-error-rate-resolved.json"));
     assert_eq!(rec.len(), 1, "{rec:?}");
@@ -100,6 +110,22 @@ fn pricing_warn_and_above_by_instrument() {
     other["instrument"] = json!("GBPUSD");
     let (_, m2) = run(&cfg, "http:logs", other);
     assert_ne!(m2[0].fingerprint, m[0].fingerprint, "one alert per instrument");
+
+    // Grouping: same instrument in the same UTC 5-minute bucket = same digest;
+    // the next bucket starts a new one. The card shows the window.
+    use chrono::TimeZone;
+    let at = |min: u32, sec: u32| {
+        let mut e = Event::new(format!("p{min}{sec}"), "http:logs".into(), sample("pricing-log-warn.json"));
+        e.ingested_at = chrono::Utc.with_ymd_and_hms(2026, 11, 21, 9, min, sec).unwrap();
+        cfg.process(e).1.remove(0)
+    };
+    let (a, b, c) = (at(15, 1), at(19, 59), at(20, 0));
+    assert_eq!(a.fingerprint, b.fingerprint);
+    assert_ne!(b.fingerprint, c.fingerprint);
+    assert_eq!(a.dedup_window_ms, 300_000);
+    let w = a.fields.iter().find(|f| f.label == "Window").expect("window field");
+    assert_eq!(w.value, json!("09:15–09:20 UTC"));
+    assert_eq!(a.quiet_for_ms, Some(600_000));
 }
 
 #[test]

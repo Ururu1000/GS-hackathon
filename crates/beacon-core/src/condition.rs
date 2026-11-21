@@ -20,6 +20,8 @@ use crate::path::{Path, PathError, Root};
 /// Upper bound on tree size, so a pasted rule can't blow up evaluation.
 pub const MAX_NODES: usize = 256;
 pub const MAX_REGEX_LEN: usize = 1024;
+/// Upper bound on `in` / `not_in` lists.
+pub const MAX_LIST: usize = 256;
 /// Bound compiled NFA/DFA size so short regexes like `(a{50}){50}` cannot blow up memory.
 const MAX_REGEX_SIZE_BYTES: usize = 256 * 1024;
 
@@ -181,6 +183,75 @@ impl Condition {
     }
 }
 
+/// One node of the rule test panel: `node` is the child-index path from the
+/// root (`""` = root, `"1.0"` = first child of the second child; a `not`
+/// wraps its child at index 0). After an `all`/`any` is decided, the remaining
+/// siblings and their subtrees are `skipped`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TestNode {
+    pub node: String,
+    pub result: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<Value>,
+}
+
+impl Condition {
+    pub fn test_nodes(&self, event: &Event) -> Vec<TestNode> {
+        let mut out = Vec::new();
+        self.test_into(event, String::new(), false, &mut out);
+        out
+    }
+
+    fn test_into(&self, event: &Event, path: String, skip: bool, out: &mut Vec<TestNode>) -> bool {
+        let child = |i: usize| if path.is_empty() { i.to_string() } else { format!("{path}.{i}") };
+        let idx = out.len();
+        out.push(TestNode { node: path.clone(), result: "skipped", actual: None });
+        if skip {
+            match self {
+                Condition::All(cs) | Condition::Any(cs) => {
+                    for (i, c) in cs.iter().enumerate() {
+                        c.test_into(event, child(i), true, out);
+                    }
+                }
+                Condition::Not(c) => {
+                    c.test_into(event, child(0), true, out);
+                }
+                Condition::Leaf(_) => {}
+            }
+            return false;
+        }
+        let result = match self {
+            Condition::All(cs) => {
+                let mut decided = false;
+                for (i, c) in cs.iter().enumerate() {
+                    let r = c.test_into(event, child(i), decided, out);
+                    if !decided && !r {
+                        decided = true;
+                    }
+                }
+                !decided
+            }
+            Condition::Any(cs) => {
+                let mut decided = false;
+                for (i, c) in cs.iter().enumerate() {
+                    let r = c.test_into(event, child(i), decided, out);
+                    if !decided && r {
+                        decided = true;
+                    }
+                }
+                decided
+            }
+            Condition::Not(c) => !c.test_into(event, child(0), false, out),
+            Condition::Leaf(leaf) => {
+                out[idx].actual = leaf.path.resolve(event).map(|v| crate::matcher::bounded_to(v.into_owned(), 1024));
+                leaf.eval(event)
+            }
+        };
+        out[idx].result = if result { "match" } else { "no_match" };
+        result
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeResult {
     pub depth: usize,
@@ -236,6 +307,9 @@ fn compile(
             match op {
                 Op::In | Op::NotIn if !value.is_array() => {
                     return Err(ConditionError::NeedsList { op: *op, path: p });
+                }
+                Op::In | Op::NotIn if value.as_array().is_some_and(|a| a.len() > MAX_LIST) => {
+                    return Err(ConditionError::TooLarge);
                 }
                 Op::StartsWith if !value.is_string() => {
                     return Err(ConditionError::NeedsString { op: *op, path: p });
@@ -450,6 +524,24 @@ all:
         assert!(bad("{ path: raw.x, op: in, value: 3 }"));
         assert!(bad("{ path: nope.x, op: exists }"));
         assert!(bad("all: []"));
+    }
+
+    #[test]
+    fn test_nodes_paths_and_skips() {
+        let c = cond("all: [ { path: raw.payload.notional, op: lt, value: 5 }, { any: [ { path: raw.payload.desk, op: eq, value: rates }, { path: raw.x, op: exists } ] }, { not: { path: raw.y, op: exists } } ]");
+        let r = c.test_nodes(&trade());
+        let got: Vec<(&str, &str)> = r.iter().map(|n| (n.node.as_str(), n.result)).collect();
+        assert_eq!(
+            got,
+            vec![("", "no_match"), ("0", "no_match"), ("1", "skipped"), ("1.0", "skipped"), ("1.1", "skipped"), ("2", "skipped"), ("2.0", "skipped")]
+        );
+        assert_eq!(r[1].actual, Some(json!(25000000)));
+        let c = cond("any: [ { path: raw.payload.desk, op: eq, value: rates }, { path: raw.x, op: exists } ]");
+        let got: Vec<&str> = c.test_nodes(&trade()).iter().map(|n| n.result).collect();
+        assert_eq!(got, vec!["match", "match", "skipped"]);
+        let c = cond("not: { path: raw.payload.desk, op: eq, value: fx }");
+        let got: Vec<(String, &str)> = c.test_nodes(&trade()).into_iter().map(|n| (n.node, n.result)).collect();
+        assert_eq!(got, vec![("".into(), "match"), ("0".into(), "no_match")]);
     }
 
     #[test]

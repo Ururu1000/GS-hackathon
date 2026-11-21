@@ -72,6 +72,8 @@ pub struct AlertState {
     pub resolved_by: Option<String>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub resolved_reason: Option<String>,
+    pub quiet_for_ms: Option<i64>,
+    pub group_key: Option<String>,
     #[serde(skip)]
     pub is_new: bool,
     #[serde(skip)]
@@ -96,13 +98,16 @@ pub struct Plan {
     pub folded: usize,
     /// Fires older than a recovery already seen for their incident key.
     pub suppressed: usize,
-    /// Latest recovery time per (rule_id, fingerprint), to upsert.
-    pub recoveries: Vec<(String, String, DateTime<Utc>)>,
+    /// Latest recovery time per (rule_id, team, fingerprint), to upsert.
+    pub recoveries: Vec<(String, String, String, DateTime<Utc>)>,
+    /// Grouped-rule recoveries: resolve every open digest of (rule_id, team,
+    /// group_key) that started at or before the time, in Postgres.
+    pub group_resolves: Vec<(String, String, String, DateTime<Utc>)>,
 }
 
-/// Latest recovery seen per (rule_id, fingerprint). Fire and recovery events
+/// Latest recovery seen per (rule_id, team, fingerprint). Fire and recovery events
 /// have different event ids, so they can reach the aggregator out of order.
-pub type Recoveries = HashMap<(String, String), DateTime<Utc>>;
+pub type Recoveries = HashMap<(String, String, String), DateTime<Utc>>;
 
 fn rank(s: &str) -> u8 {
     Severity::normalize(s).map(Severity::rank).unwrap_or(0)
@@ -113,11 +118,11 @@ fn rank(s: &str) -> u8 {
 /// alert ids.
 pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Recoveries, now: DateTime<Utc>) -> Plan {
     let mut states: Vec<AlertState> = existing;
-    // (rule_id, fingerprint) → index of the active alert, if any.
-    let mut active: HashMap<(String, String), usize> = states
+    // (rule_id, team, fingerprint) → index of the active alert, if any.
+    let mut active: HashMap<(String, String, String), usize> = states
         .iter()
         .enumerate()
-        .map(|(i, s)| ((s.rule_id.clone(), s.fingerprint.clone()), i))
+        .map(|(i, s)| ((s.rule_id.clone(), s.team.clone(), s.fingerprint.clone()), i))
         .collect();
     let mut notifies: Vec<(usize, NotifyReason, i32, &MatchRecord)> = Vec::new();
     let mut plan = Plan::default();
@@ -130,7 +135,7 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
     ordered.sort_by_key(|m| m.ingested_at);
 
     for m in ordered {
-        let key = (m.rule_id.clone(), m.fingerprint.clone());
+        let key = (m.rule_id.clone(), m.team.clone(), m.fingerprint.clone());
         let current = active.get(&key).copied();
         match m.kind {
             MatchKind::Fire if recovered.get(&key).is_some_and(|&at| m.ingested_at <= at) => {
@@ -169,14 +174,37 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
                     notifies.push((i, NotifyReason::New, 1, m));
                 }
             }
+            MatchKind::Recover if m.group_key.is_some() => {
+                let gk = m.group_key.clone().unwrap();
+                // Digests of this tuple inside the batch (new or loaded).
+                for s in states.iter_mut() {
+                    if s.rule_id == m.rule_id
+                        && s.team == m.team
+                        && s.group_key.as_deref() == Some(gk.as_str())
+                        && s.status != "resolved"
+                        && s.first_seen <= m.ingested_at
+                    {
+                        s.status = "resolved".into();
+                        s.resolved_at = Some(m.ingested_at);
+                        s.resolved_by = Some("system".into());
+                        s.resolved_reason = Some("recovered".into());
+                        s.dedup_active = false;
+                        s.status_changed = true;
+                        s.touched = true;
+                    }
+                }
+                active.retain(|k, i| !(k.0 == m.rule_id && states[*i].team == m.team && states[*i].group_key.as_deref() == Some(gk.as_str()) && states[*i].status == "resolved"));
+                // Older digests not loaded in this batch are resolved in SQL.
+                plan.group_resolves.push((m.rule_id.clone(), m.team.clone(), gk, m.ingested_at));
+            }
             MatchKind::Recover => {
                 let latest = recovered.entry(key.clone()).or_insert(m.ingested_at);
                 if m.ingested_at > *latest {
                     *latest = m.ingested_at;
                 }
                 recovered_dirty.insert(key.clone());
-                // A recovery older than the whole incident belongs to an earlier one.
-                let Some(i) = current.filter(|&i| m.ingested_at >= states[i].first_seen) else {
+                // A recovery older than the whole incident (or for another team) does not touch it.
+                let Some(i) = current.filter(|&i| states[i].team == m.team && m.ingested_at >= states[i].first_seen) else {
                     continue;
                 };
                 // A recovery that trails a later fire (applied in an earlier
@@ -232,6 +260,8 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
             reason,
             route: m.route.clone(),
             created_at: now,
+            context: m.context.clone(),
+            event: if reason == NotifyReason::New { m.event.clone() } else { None },
         };
         plan.outbox.push(OutboxRow {
             kind: outbox_kind::NOTIFY,
@@ -241,7 +271,7 @@ pub fn plan(batch: &[MatchRecord], existing: Vec<AlertState>, mut recovered: Rec
     }
     for key in recovered_dirty {
         let at = recovered[&key];
-        plan.recoveries.push((key.0, key.1, at));
+        plan.recoveries.push((key.0, key.1, key.2, at));
     }
     for s in states.into_iter().filter(|s| s.touched) {
         plan.outbox.push(OutboxRow {
@@ -314,26 +344,36 @@ fn new_alert(m: &MatchRecord, generation: i32) -> AlertState {
         resolved_by: None,
         resolved_at: None,
         resolved_reason: None,
+        quiet_for_ms: m.quiet_for_ms.map(|q| q as i64),
+        group_key: m.group_key.clone(),
         is_new: true,
         touched: true,
         status_changed: false,
     }
 }
 
-/// Load the active alerts for the batch's fingerprints, locking them.
-async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> Result<Vec<AlertState>> {
-    let (rules, fps): (Vec<String>, Vec<String>) = keys.iter().cloned().unzip();
+/// Load the active alerts for the batch's (rule_id, team, fingerprint) keys, locking them.
+async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String, String)]) -> Result<Vec<AlertState>> {
+    let mut rules = Vec::with_capacity(keys.len());
+    let mut teams = Vec::with_capacity(keys.len());
+    let mut fps = Vec::with_capacity(keys.len());
+    for (r, t, f) in keys {
+        rules.push(r.clone());
+        teams.push(t.clone());
+        fps.push(f.clone());
+    }
     let rows = sqlx::query(
         "SELECT id, rule_id, rule_revision, rule_name, team, fingerprint, generation, dedup_active,
                 dedup_window_ms, status, severity, color, title, body, fields, count, first_seen,
                 last_seen, version, status_version, notify_seq, source, schema, last_event_id,
-                resolved_by, resolved_at, resolved_reason
+                resolved_by, resolved_at, resolved_reason, quiet_for_ms, group_key
          FROM alerts
-         WHERE (rule_id, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+         WHERE (rule_id, team, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))
            AND dedup_active AND status IN ('open', 'acked')
          FOR UPDATE",
     )
     .bind(&rules)
+    .bind(&teams)
     .bind(&fps)
     .fetch_all(&mut *tx)
     .await
@@ -368,6 +408,8 @@ async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> 
                 resolved_by: r.try_get("resolved_by")?,
                 resolved_at: r.try_get("resolved_at")?,
                 resolved_reason: r.try_get("resolved_reason")?,
+                quiet_for_ms: r.try_get("quiet_for_ms")?,
+                group_key: r.try_get("group_key")?,
                 is_new: false,
                 touched: false,
                 status_changed: false,
@@ -376,19 +418,32 @@ async fn load_active(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> 
         .collect()
 }
 
-async fn load_recoveries(tx: &mut sqlx::PgConnection, keys: &[(String, String)]) -> Result<Recoveries> {
-    let (rules, fps): (Vec<String>, Vec<String>) = keys.iter().cloned().unzip();
+async fn load_recoveries(tx: &mut sqlx::PgConnection, keys: &[(String, String, String)]) -> Result<Recoveries> {
+    let mut rules = Vec::with_capacity(keys.len());
+    let mut teams = Vec::with_capacity(keys.len());
+    let mut fps = Vec::with_capacity(keys.len());
+    for (r, t, f) in keys {
+        rules.push(r.clone());
+        teams.push(t.clone());
+        fps.push(f.clone());
+    }
     let rows = sqlx::query(
-        "SELECT rule_id, fingerprint, recovered_at FROM recoveries
-         WHERE (rule_id, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[]))",
+        "SELECT rule_id, team, fingerprint, recovered_at FROM recoveries
+         WHERE (rule_id, team, fingerprint) IN (SELECT * FROM unnest($1::text[], $2::text[], $3::text[]))",
     )
     .bind(&rules)
+    .bind(&teams)
     .bind(&fps)
     .fetch_all(&mut *tx)
     .await
     .context("loading recoveries")?;
     rows.into_iter()
-        .map(|r| Ok(((r.try_get("rule_id")?, r.try_get("fingerprint")?), r.try_get("recovered_at")?)))
+        .map(|r| {
+            Ok((
+                (r.try_get("rule_id")?, r.try_get("team")?, r.try_get("fingerprint")?),
+                r.try_get("recovered_at")?,
+            ))
+        })
         .collect()
 }
 
@@ -434,11 +489,101 @@ fn sanitized_json<T: Serialize>(value: &T) -> Result<Value> {
 
 /// Apply one batch in a single transaction. Returns the plan that was written.
 pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
-    // Lookup by (rule_id, fingerprint) so the partial unique index is used.
-    let mut keys: Vec<(String, String)> = batch.iter().map(|m| (m.rule_id.clone(), m.fingerprint.clone())).collect();
+    match apply_batch_fenced(pool, batch, &[]).await? {
+        Ok(plan) => Ok(plan),
+        Err(Fenced) => unreachable!("no fences given"),
+    }
+}
+
+/// The partition checkpoint advanced together with a batch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fence {
+    pub partition: i32,
+    pub epoch: i64,
+    /// First offset not yet applied once this batch commits.
+    pub next_offset: i64,
+}
+
+/// Another owner claimed one of the batch's partitions; nothing was written.
+#[derive(Debug, PartialEq)]
+pub struct Fenced;
+
+pub const CHECKPOINT_PIPELINE: &str = "aggregator";
+
+/// Take ownership of a partition: bump its epoch and return (epoch, next_offset).
+/// `next_offset` is -1 when nothing has been applied yet.
+pub async fn claim_partition(pool: &PgPool, partition: i32) -> Result<(i64, i64)> {
+    let row = sqlx::query(
+        "INSERT INTO checkpoints (pipeline, topic, partition, epoch, next_offset) VALUES ($1, $2, $3, 1, -1)
+         ON CONFLICT (pipeline, topic, partition) DO UPDATE SET epoch = checkpoints.epoch + 1, updated_at = now()
+         RETURNING epoch, next_offset",
+    )
+    .bind(CHECKPOINT_PIPELINE)
+    .bind(ALERTS_MATCHES)
+    .bind(partition)
+    .fetch_one(pool)
+    .await?;
+    Ok((row.try_get("epoch")?, row.try_get("next_offset")?))
+}
+
+/// Apply one batch and advance its partition checkpoints in the same
+/// transaction. If any checkpoint's epoch moved (a newer owner), nothing is
+/// written and `Fenced` is returned.
+pub async fn apply_batch_fenced(pool: &PgPool, batch: &[MatchRecord], fences: &[Fence]) -> Result<Result<Plan, Fenced>> {
+    // Lookup by (rule_id, team, fingerprint) so the partial unique index is used.
+    let mut keys: Vec<(String, String, String)> = batch
+        .iter()
+        .map(|m| (m.rule_id.clone(), m.team.clone(), m.fingerprint.clone()))
+        .collect();
     keys.sort();
     keys.dedup();
     let mut tx = pool.begin().await?;
+    if !fences.is_empty() {
+        let parts: Vec<i32> = fences.iter().map(|f| f.partition).collect();
+        let epochs: Vec<i64> = fences.iter().map(|f| f.epoch).collect();
+        let nexts: Vec<i64> = fences.iter().map(|f| f.next_offset).collect();
+        let advanced = sqlx::query(
+            "UPDATE checkpoints c SET next_offset = f.next, updated_at = now()
+             FROM unnest($3::int[], $4::bigint[], $5::bigint[]) AS f(part, epoch, next)
+             WHERE c.pipeline = $1 AND c.topic = $2 AND c.partition = f.part AND c.epoch = f.epoch
+               AND c.next_offset < f.next",
+        )
+        .bind(CHECKPOINT_PIPELINE)
+        .bind(ALERTS_MATCHES)
+        .bind(&parts)
+        .bind(&epochs)
+        .bind(&nexts)
+        .execute(&mut *tx)
+        .await
+        .context("advancing checkpoints")?
+        .rows_affected();
+        if advanced != fences.len() as u64 {
+            tx.rollback().await?;
+            // Either a newer owner took a partition, or this exact batch was
+            // already committed and only the acknowledgement was lost (the
+            // retry after an ambiguous commit). Only the latter is fine.
+            let rows = sqlx::query(
+                "SELECT partition, epoch, next_offset FROM checkpoints
+                 WHERE pipeline = $1 AND topic = $2 AND partition = ANY($3)",
+            )
+            .bind(CHECKPOINT_PIPELINE)
+            .bind(ALERTS_MATCHES)
+            .bind(&parts)
+            .fetch_all(pool)
+            .await?;
+            let already = fences.iter().all(|f| {
+                rows.iter().any(|r| {
+                    r.get::<i32, _>("partition") == f.partition
+                        && r.get::<i64, _>("epoch") == f.epoch
+                        && r.get::<i64, _>("next_offset") >= f.next_offset
+                })
+            });
+            if already {
+                return Ok(Ok(Plan::default()));
+            }
+            return Ok(Err(Fenced));
+        }
+    }
     let existing = load_active(&mut tx, &keys).await?;
     let recovered = load_recoveries(&mut tx, &keys).await?;
     let plan = plan(batch, existing, recovered, Utc::now());
@@ -463,11 +608,11 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
             "INSERT INTO alerts (id, rule_id, rule_revision, rule_name, team, fingerprint, generation,
                 dedup_active, dedup_window_ms, status, severity, color, title, body, fields, count,
                 first_seen, last_seen, version, status_version, notify_seq, source, schema,
-                last_event_id, resolved_by, resolved_at, resolved_reason)
+                last_event_id, resolved_by, resolved_at, resolved_reason, quiet_for_ms, group_key)
              SELECT id, rule_id, rule_revision, rule_name, team, fingerprint, generation,
                 dedup_active, dedup_window_ms, status, severity, color, title, body, fields, count,
                 first_seen, last_seen, version, status_version, notify_seq, source, schema,
-                last_event_id, resolved_by, resolved_at, resolved_reason
+                last_event_id, resolved_by, resolved_at, resolved_reason, quiet_for_ms, group_key
              FROM jsonb_populate_recordset(NULL::alerts, $1)",
         )
         .bind(sanitized_json(&plan.inserts)?)
@@ -475,17 +620,48 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
         .await
         .context("inserting alerts")?;
     }
+    for (rule_id, team, gk, at) in &plan.group_resolves {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE alerts SET status = 'resolved', resolved_reason = 'recovered', resolved_by = 'system',
+                    resolved_at = $4, dedup_active = false, version = version + 1, status_version = version + 1
+             WHERE rule_id = $1 AND team = $2 AND group_key = $3 AND status IN ('open', 'acked') AND first_seen <= $4
+             RETURNING id",
+        )
+        .bind(rule_id)
+        .bind(team)
+        .bind(gk)
+        .bind(at)
+        .fetch_all(&mut *tx)
+        .await
+        .context("resolving grouped digests")?;
+        if !ids.is_empty() {
+            sqlx::query("INSERT INTO outbox (kind, alert_id) SELECT $1, unnest($2::uuid[])")
+                .bind(outbox_kind::ALERT_UPDATE)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("SELECT pg_notify($1, '')").bind(OUTBOX_CHANNEL).execute(&mut *tx).await?;
+        }
+    }
     if !plan.recoveries.is_empty() {
-        let (rules, rest): (Vec<String>, Vec<(String, DateTime<Utc>)>) =
-            plan.recoveries.iter().map(|(r, f, at)| (r.clone(), (f.clone(), *at))).unzip();
-        let (fps, ats): (Vec<String>, Vec<DateTime<Utc>>) = rest.into_iter().unzip();
+        let mut rules = Vec::with_capacity(plan.recoveries.len());
+        let mut teams = Vec::with_capacity(plan.recoveries.len());
+        let mut fps = Vec::with_capacity(plan.recoveries.len());
+        let mut ats = Vec::with_capacity(plan.recoveries.len());
+        for (r, t, f, at) in &plan.recoveries {
+            rules.push(r.clone());
+            teams.push(t.clone());
+            fps.push(f.clone());
+            ats.push(*at);
+        }
         sqlx::query(
-            "INSERT INTO recoveries (rule_id, fingerprint, recovered_at)
-             SELECT * FROM unnest($1::text[], $2::text[], $3::timestamptz[])
-             ON CONFLICT (rule_id, fingerprint)
+            "INSERT INTO recoveries (rule_id, team, fingerprint, recovered_at)
+             SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::timestamptz[])
+             ON CONFLICT (rule_id, team, fingerprint)
              DO UPDATE SET recovered_at = GREATEST(recoveries.recovered_at, EXCLUDED.recovered_at)",
         )
         .bind(&rules)
+        .bind(&teams)
         .bind(&fps)
         .bind(&ats)
         .execute(&mut *tx)
@@ -514,13 +690,75 @@ pub async fn apply_batch(pool: &PgPool, batch: &[MatchRecord]) -> Result<Plan> {
             .await?;
     }
     tx.commit().await?;
-    Ok(plan)
+    Ok(Ok(plan))
+}
+
+/// Resolve open/acked alerts whose `quiet_for` elapsed since `last_seen`
+/// (`resolved_reason = 'quiet_for'`). Any number of sweepers can run: rows
+/// are claimed with SKIP LOCKED, and Postgres re-checks `last_seen` after
+/// waiting on a row the aggregator is updating, so a fresh match wins.
+pub async fn sweep_quiet(pool: &PgPool) -> Result<usize> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE alerts SET status = 'resolved', resolved_reason = 'quiet_for', resolved_by = 'system',
+                resolved_at = now(), dedup_active = false,
+                version = version + 1, status_version = version + 1
+         WHERE id IN (
+             SELECT id FROM alerts
+             WHERE quiet_for_ms IS NOT NULL AND status IN ('open', 'acked')
+               AND last_seen < now() - quiet_for_ms * interval '1 millisecond'
+             ORDER BY last_seen LIMIT 500
+             FOR UPDATE SKIP LOCKED)
+           AND last_seen < now() - quiet_for_ms * interval '1 millisecond'
+         RETURNING id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if !ids.is_empty() {
+        sqlx::query("INSERT INTO outbox (kind, alert_id) SELECT $1, unnest($2::uuid[])")
+            .bind(outbox_kind::ALERT_UPDATE)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_notify($1, '')").bind(OUTBOX_CHANNEL).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(ids.len())
+}
+
+pub async fn run_quiet_sweeper(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    info!("quiet-timer sweeper started");
+    loop {
+        match sweep_quiet(&pool).await {
+            Ok(n) if n > 0 => info!(resolved = n, "resolved quiet alerts"),
+            Ok(_) => {}
+            Err(e) => warn!(error = format!("{e:#}"), "quiet sweep failed"),
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+    }
+}
+
+/// Only partitions that move forward get a fence. A partition whose messages
+/// were all below its checkpoint (replay) has nothing to advance; fencing it
+/// would make the "advance only forward" check fail for the whole batch and
+/// crash-loop the aggregator.
+pub fn active_fences(fences: HashMap<i32, Fence>, owned: &HashMap<i32, (i64, i64)>) -> Vec<Fence> {
+    fences
+        .into_values()
+        .filter(|f| owned.get(&f.partition).is_some_and(|o| f.next_offset > o.1))
+        .collect()
 }
 
 pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let consumer = kafka::consumer(&bootstrap, GROUP, &[ALERTS_MATCHES], true)?;
     let linger = linger();
     info!(linger_ms = linger.as_millis() as u64, "aggregator started");
+    // partition -> (epoch, next_offset) for partitions this consumer claimed.
+    let mut owned: HashMap<i32, (i64, i64)> = HashMap::new();
+    let (mut skipped, mut last_skip_log) = (0u64, std::time::Instant::now());
     loop {
         // Block for the first message, then linger briefly to build a batch.
         let first = tokio::select! {
@@ -547,18 +785,36 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                 Err(_) => break,
             }
         }
+        // Fencing: claim each partition the first time we see it, and skip
+        // messages below its checkpoint (already applied before a crash or
+        // rebalance). Kafka offsets are only a resume hint.
+        let mut fences: HashMap<i32, Fence> = HashMap::new();
         let mut batch = Vec::with_capacity(msgs.len());
         for m in &msgs {
+            let p = m.partition();
+            if let std::collections::hash_map::Entry::Vacant(slot) = owned.entry(p) {
+                let claim = claim_partition(&pool, p).await?;
+                info!(partition = p, epoch = claim.0, next_offset = claim.1, "claimed partition");
+                slot.insert(claim);
+            }
+            let (epoch, next) = owned[&p];
+            let f = fences.entry(p).or_insert(Fence { partition: p, epoch, next_offset: next });
+            f.next_offset = f.next_offset.max(m.offset() + 1);
+            if m.offset() < next {
+                skipped += 1;
+                continue;
+            }
             match m.payload().map(serde_json::from_slice::<MatchRecord>) {
                 Some(Ok(rec)) => batch.push(rec),
-                Some(Err(e)) => error!(partition = m.partition(), offset = m.offset(), error = %e, "undecodable match; skipped"),
+                Some(Err(e)) => error!(partition = p, offset = m.offset(), error = %e, "undecodable match; skipped"),
                 None => {}
             }
         }
+        let fences = active_fences(fences, &owned);
         let mut backoff = Duration::from_millis(50);
         loop {
-            match apply_batch(&pool, &batch).await {
-                Ok(plan) => {
+            match apply_batch_fenced(&pool, &batch, &fences).await {
+                Ok(Ok(plan)) => {
                     tracing::debug!(
                         matches = batch.len(),
                         inserts = plan.inserts.len(),
@@ -566,6 +822,11 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                         "batch applied"
                     );
                     break;
+                }
+                Ok(Err(Fenced)) => {
+                    // A newer owner took a partition. Restart from committed
+                    // offsets and re-claim; the checkpoint skips what's applied.
+                    anyhow::bail!("fenced by a newer owner of one of the partitions; restarting");
                 }
                 Err(e) => {
                     error!(error = format!("{e:#}"), "applying batch failed; retrying");
@@ -576,6 +837,16 @@ pub async fn run_aggregator(bootstrap: String, pool: PgPool, mut shutdown: watch
                     }
                 }
             }
+        }
+        for f in &fences {
+            if let Some(o) = owned.get_mut(&f.partition) {
+                o.1 = o.1.max(f.next_offset);
+            }
+        }
+        if skipped > 0 && last_skip_log.elapsed() > Duration::from_secs(5) {
+            info!(skipped, "skipped already-applied matches after replay");
+            skipped = 0;
+            last_skip_log = std::time::Instant::now();
         }
         for m in &msgs {
             if let Err(e) = consumer.store_offset_from_message(m) {
@@ -619,6 +890,10 @@ mod tests {
             schema: "s".into(),
             ingested_at: t(at),
             diagnostics: vec![],
+            context: Default::default(),
+            event: None,
+            quiet_for_ms: None,
+            group_key: None,
         }
     }
 
@@ -730,9 +1005,9 @@ mod tests {
         // The recovery (t=10) reaches the aggregator before the fire it ends (t=5).
         let p = plan(&[m("r", "fp", 10, MatchKind::Recover, "error")], vec![], Recoveries::new(), t(10));
         assert!(p.inserts.is_empty() && p.outbox.is_empty());
-        assert_eq!(p.recoveries, vec![("r".to_string(), "fp".to_string(), t(10))]);
+        assert_eq!(p.recoveries, vec![("r".to_string(), "t".to_string(), "fp".to_string(), t(10))]);
 
-        let recovered: Recoveries = [(("r".to_string(), "fp".to_string()), t(10))].into();
+        let recovered: Recoveries = [(("r".to_string(), "t".to_string(), "fp".to_string()), t(10))].into();
         let p = plan(&[fire("late", "fp", 5)], vec![], recovered.clone(), t(11));
         assert!(p.inserts.is_empty(), "an incident that already recovered is not reopened");
         assert_eq!(p.suppressed, 1);
@@ -781,6 +1056,32 @@ mod tests {
         ex.touched = false;
         let p = plan(&[m("r", "fp", 5, MatchKind::Recover, "error")], vec![ex], Recoveries::new(), t(11));
         assert!(p.updates.is_empty() && p.inserts.is_empty());
+    }
+
+    #[test]
+    fn different_team_does_not_fold_or_recover_old_team_alert() {
+        let mut ex = plan(&[fire("a", "fp", 10)], vec![], Recoveries::new(), t(10)).inserts.remove(0);
+        ex.is_new = false;
+        ex.touched = false;
+        let mut other_recover = m("r", "fp", 15, MatchKind::Recover, "error");
+        other_recover.team = "payments".into();
+        let p = plan(&[other_recover], vec![ex.clone()], Recoveries::new(), t(15));
+        assert!(p.updates.is_empty(), "other team's recovery must not resolve rates alert");
+        assert_eq!(p.recoveries, vec![("r".to_string(), "payments".to_string(), "fp".to_string(), t(15))]);
+
+        // Recovery watermark for payments must not suppress rates fires, and payments fires must not deactivate rates alerts.
+        let recovered: Recoveries = [(("r".to_string(), "payments".to_string(), "fp".to_string()), t(25))].into();
+        let p_rates = plan(&[fire("r2", "fp", 12)], vec![ex.clone()], recovered.clone(), t(25));
+        assert_eq!(p_rates.suppressed, 0);
+        assert_eq!(p_rates.updates.len(), 1);
+        assert_eq!(p_rates.updates[0].count, 2);
+
+        let mut other_fire = fire("b", "fp", 30);
+        other_fire.team = "payments".into();
+        let p = plan(&[other_fire], vec![ex], recovered, t(30));
+        assert!(p.updates.is_empty(), "rates alert must remain active and untouched");
+        assert_eq!(p.inserts.len(), 1);
+        assert_eq!(p.inserts[0].team, "payments");
     }
 
     #[test]

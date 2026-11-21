@@ -1083,7 +1083,7 @@ async fn timeline_entries_merge_audit_rows_escalations_and_digests(pool: PgPool)
         )
         .bind(alert)
         .bind(channel)
-        .bind(json!({ "target": "escalation", "via": "oncall:settlements", "step": 0 }))
+        .bind(json!({ "target": "escalation", "via": "oncall:settlements-primary", "step": 0 }))
         .execute(&mut *tx)
         .await
         .expect("escalation jobs");
@@ -1153,7 +1153,7 @@ async fn timeline_entries_merge_audit_rows_escalations_and_digests(pool: PgPool)
     assert_eq!(escalated_carol["actor"], json!("system"));
     assert_eq!(
         escalated_carol["message"],
-        json!("escalated to carol via oncall:settlements"),
+        json!("escalated to carol via oncall:settlements-primary"),
         "{rendered:?}"
     );
     assert_eq!(

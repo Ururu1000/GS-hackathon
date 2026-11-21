@@ -1,0 +1,59 @@
+# One command for the whole demo:
+#   docker compose up --build
+# UI + API:        http://localhost:8080
+# Webhook ingest:  POST http://localhost:8090/ingest/{source}
+# Email inbox:     http://localhost:8025 (Mailpit)
+# The demo-seed service posts the Appendix A sample events once Beacon is ready.
+
+name: beacon
+
+include:
+  - deploy/docker-compose.yml
+
+services:
+  beacon:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: beacon:local
+    environment:
+      DATABASE_URL: postgres://beacon:beacon@postgres:5432/beacon
+      BEACON_KAFKA: redpanda:9092
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      API_ADDR: 0.0.0.0:8080
+      INGEST_ADDR: 0.0.0.0:8090
+      BEACON_DEMO_USER: anna
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      mailpit: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+
+  demo-seed:
+    image: beacon:local
+    depends_on:
+      beacon: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Fail loudly: a half-seeded demo looks like a broken pipeline.
+        set -eu
+        # Two source types, as in the brief: the workflow failure and the
+        # rejected trade come from a message broker (Kafka sources), the rest
+        # arrive over the HTTP webhook.
+        beacon-loadgen --kafka redpanda:9092 --topic workflow-events --send-file /app/samples/events/workflow-failed.json
+        beacon-loadgen --kafka redpanda:9092 --topic trade-events --send-file /app/samples/events/trade-rejected.json
+        for f in high-error-rate pricing-log-warn unknown-shape; do
+          curl -fsS -X POST -H 'content-type: application/json' --data @/app/samples/events/$$f.json http://beacon:8090/ingest/demo >/dev/null
+          echo "seeded $$f.json over HTTP"
+        done
+    restart: "no"

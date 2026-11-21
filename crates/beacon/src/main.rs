@@ -31,9 +31,12 @@
 //! | `BEACON_KAFKA`       | `localhost:19092`                         | part (a) roles    |
 //! | `INGEST_ADDR`        | `0.0.0.0:8090`                            | ingest            |
 //! | `INGEST_MAX_INFLIGHT`| `20000` (events in flight before 429)     | ingest            |
-//! | `MATCHER_WORKERS`    | `2` (consumers in the matcher group)      | matcher           |
+//! | `MATCHER_WORKERS`    | `8` (consumers in the matcher group)      | matcher           |
 //! | `AGGREGATOR_WORKERS` | `2` (consumers in the aggregator group)   | aggregator        |
 //! | `RELAY_WORKERS`      | `1`                                       | relay             |
+//! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
+//! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
+//! | `BEACON_UI_DIR`      | `ui/dist` if it exists (static UI)        | api               |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +62,8 @@ enum Role {
     Aggregator,
     /// outbox 'alert_update' rows -> alerts.updates (part a)
     Relay,
+    /// REST + SSE for the UI, serves the built UI (beacon-api)
+    Api,
     /// outbox 'notify' rows -> delivery_jobs (part b)
     Router,
     /// channel workers: delivery_jobs -> email / sms / phone (part b)
@@ -73,7 +78,7 @@ enum Role {
     DeliveryApi,
 }
 
-const ROLES: &str = "ingest, sources, matcher, aggregator, relay, router, delivery, gateway, scheduler, actions, delivery-api";
+const ROLES: &str = "ingest, sources, matcher, aggregator, relay, api, router, delivery, gateway, scheduler, actions, delivery-api";
 
 impl Role {
     fn parse(s: &str) -> Result<Self> {
@@ -83,6 +88,7 @@ impl Role {
             "matcher" => Self::Matcher,
             "aggregator" => Self::Aggregator,
             "relay" => Self::Relay,
+            "api" => Self::Api,
             "router" => Self::Router,
             "delivery" => Self::Delivery,
             "gateway" => Self::Gateway,
@@ -96,7 +102,12 @@ impl Role {
     fn uses_kafka(self) -> bool {
         matches!(
             self,
-            Self::Ingest | Self::Sources | Self::Matcher | Self::Aggregator | Self::Relay
+            Self::Ingest
+                | Self::Sources
+                | Self::Matcher
+                | Self::Aggregator
+                | Self::Relay
+                | Self::Api
         )
     }
 }
@@ -252,6 +263,13 @@ async fn main() -> Result<()> {
             Role::Sources => {
                 let specs = beacon_ingest::kafka_source::load_sources(&config_dir.join("sources"))?;
                 info!(sources = specs.len(), "kafka sources starting");
+                // Demo convenience: make sure the source topics exist on our broker.
+                let local: Vec<String> = specs
+                    .iter()
+                    .filter(|s| s.bootstrap.is_none())
+                    .flat_map(|s| s.topics.clone())
+                    .collect();
+                beacon_ingest::kafka::ensure_named_topics(&kafka, &local, 6).await?;
                 let publisher =
                     beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
                 for spec in specs {
@@ -268,23 +286,43 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Matcher => {
+                // Rules come from Postgres (seeded from config/rules on first
+                // start) and reload live on every API edit.
+                beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
                 let snapshot =
-                    std::sync::Arc::new(beacon_core::load_config_dir(&config_dir).with_context(
-                        || format!("loading rules and schemas from {}", config_dir.display()),
-                    )?);
-                for _ in 0..workers("MATCHER_WORKERS", "2")? {
-                    let (kafka, snapshot, rx) =
-                        (kafka.clone(), snapshot.clone(), shutdown_rx.clone());
+                    beacon_engine::config_store::watch_config(pool.clone(), config_dir.clone())
+                        .await
+                        .with_context(|| {
+                            format!("loading rules and schemas ({})", config_dir.display())
+                        })?;
+                let samples = beacon_engine::matcher::SampleSink::start(pool.clone());
+                for _ in 0..workers("MATCHER_WORKERS", "8")? {
+                    let (kafka, snapshot, samples, rx) = (
+                        kafka.clone(),
+                        snapshot.clone(),
+                        samples.clone(),
+                        shutdown_rx.clone(),
+                    );
                     tasks.spawn(supervise("matcher", rx.clone(), move || {
                         beacon_engine::matcher::run_matcher(
                             kafka.clone(),
                             snapshot.clone(),
+                            Some(samples.clone()),
                             rx.clone(),
                         )
                     }));
                 }
             }
             Role::Aggregator => {
+                tasks.spawn({
+                    let (pool, rx) = (pool.clone(), shutdown_rx.clone());
+                    async move {
+                        if let Err(e) = beacon_engine::aggregator::run_quiet_sweeper(pool, rx).await
+                        {
+                            tracing::error!(error = %e, "quiet sweeper stopped");
+                        }
+                    }
+                });
                 for _ in 0..workers("AGGREGATOR_WORKERS", "2")? {
                     let (kafka, pool, rx) = (kafka.clone(), pool.clone(), shutdown_rx.clone());
                     tasks.spawn(supervise("aggregator", rx.clone(), move || {
@@ -295,6 +333,85 @@ async fn main() -> Result<()> {
                         )
                     }));
                 }
+            }
+            Role::Api => {
+                // No real auth yet (demo session), so local-only unless asked.
+                let addr = env_or("API_ADDR", "127.0.0.1:8080");
+                // The demo user is an admin unless BEACON_DEMO_ADMIN=false.
+                let admin = env_or("BEACON_DEMO_ADMIN", "true") != "false";
+                let session = std::sync::Arc::new(
+                    beacon_api::Session::demo_with(
+                        &config_dir,
+                        &env_or("BEACON_DEMO_USER", "anna"),
+                        admin,
+                    )
+                    .context("building the demo session from config/people and config/teams")?,
+                );
+                let (updates, _) =
+                    tokio::sync::broadcast::channel(beacon_api::feed::CHANNEL_CAPACITY);
+                let (ready_tx, ready) = tokio::sync::watch::channel(false);
+                let ui_dir = std::env::var("BEACON_UI_DIR")
+                    .map(PathBuf::from)
+                    .ok()
+                    .or_else(|| {
+                        Some(PathBuf::from("ui/dist")).filter(|p| p.join("index.html").exists())
+                    });
+                beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
+                let schemas =
+                    std::sync::Arc::new(beacon_engine::config_store::load_schemas(&config_dir)?);
+                let sources = std::sync::Arc::new(beacon_ingest::kafka_source::load_sources(
+                    &config_dir.join("sources"),
+                )?);
+                let streams =
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(beacon_api::MAX_STREAMS));
+                let state = beacon_api::ApiState {
+                    pool: pool.clone(),
+                    updates: updates.clone(),
+                    ready,
+                    session,
+                    schemas,
+                    sources,
+                    streams,
+                };
+                // Same-origin ingest for the UI's sample replay (CSRF-gated).
+                let same_origin_ingest = {
+                    let publisher =
+                        beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);
+                    let max_inflight = workers("INGEST_MAX_INFLIGHT", "20000")?;
+                    beacon_ingest::http::ingest_routes(beacon_ingest::http::IngestState::new(
+                        publisher,
+                        max_inflight,
+                    ))
+                };
+                let app = beacon_api::router_with(state, ui_dir.clone(), Some(same_origin_ingest));
+                let listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .with_context(|| format!("binding {addr}"))?;
+                info!(%addr, ui = ?ui_dir, "api listening");
+                {
+                    let (kafka, rx) = (kafka.clone(), shutdown_rx.clone());
+                    let ready_tx = std::sync::Arc::new(ready_tx);
+                    tasks.spawn(supervise("api-feed", rx.clone(), move || {
+                        let ready_tx = (*ready_tx).clone();
+                        beacon_api::feed::run_feed(
+                            kafka.clone(),
+                            updates.clone(),
+                            ready_tx,
+                            rx.clone(),
+                        )
+                    }));
+                }
+                let mut rx = shutdown_rx.clone();
+                tasks.spawn(async move {
+                    let served = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            let _ = rx.changed().await;
+                        })
+                        .await;
+                    if let Err(e) = served {
+                        tracing::error!(error = %e, "api server failed");
+                    }
+                });
             }
             Role::Relay => {
                 for _ in 0..workers("RELAY_WORKERS", "1")? {

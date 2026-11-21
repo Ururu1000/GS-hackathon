@@ -141,7 +141,7 @@ async fn insert_notify(pool: &PgPool, alert_id: Uuid, notify_seq: i32, spec: Not
 }
 
 /// The seed settlements scenario: bob (on call) is routed phone+sms, the escalation chain
-/// is `[carol via oncall:settlements]`. Returns the alert id; asserts one timer exists.
+/// is `[carol via oncall:settlements-primary]`. Returns the alert id; asserts one timer exists.
 async fn route_settlements_alert(pool: &PgPool, dir: &Directory, severity: &str, ms: u64) -> Uuid {
     let alert = insert_alert_as(
         pool,
@@ -160,7 +160,7 @@ async fn route_settlements_alert(pool: &PgPool, dir: &Directory, severity: &str,
             team_id: "settlements",
             severity,
             reason: "new",
-            route: json!([{ "to": "oncall:settlements", "channels": ["phone", "sms"] }]),
+            route: json!([{ "to": "oncall:settlements-primary", "channels": ["phone", "sms"] }]),
         },
     )
     .await;
@@ -256,7 +256,7 @@ async fn router_schedules_one_timer_and_renotify_does_not_restart_it(pool: PgPoo
             team_id: "settlements",
             severity: "critical",
             reason: "new",
-            route: json!([{ "to": "oncall:settlements", "channels": ["phone", "sms"] }]),
+            route: json!([{ "to": "oncall:settlements-primary", "channels": ["phone", "sms"] }]),
         },
     )
     .await;
@@ -283,7 +283,7 @@ async fn router_schedules_one_timer_and_renotify_does_not_restart_it(pool: PgPoo
     .expect("timer row");
     assert_eq!(
         chain,
-        json!([{ "recipient_id": "carol", "via": "oncall:settlements",
+        json!([{ "recipient_id": "carol", "via": "oncall:settlements-primary",
                  "channels": ["phone", "sms"] }])
     );
     assert_eq!(step, 0);
@@ -302,7 +302,7 @@ async fn router_schedules_one_timer_and_renotify_does_not_restart_it(pool: PgPoo
             team_id: "settlements",
             severity: "critical",
             reason: "renotify",
-            route: json!([{ "to": "oncall:settlements", "channels": ["phone", "sms"] }]),
+            route: json!([{ "to": "oncall:settlements-primary", "channels": ["phone", "sms"] }]),
         },
     )
     .await;
@@ -321,7 +321,7 @@ async fn router_schedules_one_timer_and_renotify_does_not_restart_it(pool: PgPoo
             team_id: "settlements",
             severity: "critical",
             reason: "new",
-            route: json!([{ "to": "oncall:settlements", "channels": ["phone", "sms"] }]),
+            route: json!([{ "to": "oncall:settlements-primary", "channels": ["phone", "sms"] }]),
         },
     )
     .await;
@@ -417,7 +417,7 @@ async fn due_timer_fires_carol_with_explicit_channels(pool: PgPool) {
         assert_eq!(job.status, "pending");
         assert_eq!(job.address, "+44 7700 900125");
         assert_eq!(job.route_info["target"], "escalation");
-        assert_eq!(job.route_info["via"], "oncall:settlements");
+        assert_eq!(job.route_info["via"], "oncall:settlements-primary");
         assert_eq!(job.route_info["step"], json!(0));
         assert_eq!(job.route_info["rule_id"], "settlements-workflow-failed");
         assert_eq!(job.route_info["decision"], json!({"source": "explicit"}));
@@ -735,7 +735,7 @@ async fn a_stale_leases_finalize_writes_nothing(pool: PgPool) {
         environment: None,
         chain: vec![ChainStep {
             recipient_id: "carol".into(),
-            via: "oncall:settlements".into(),
+            via: "oncall:settlements-primary".into(),
             channels: Some(vec!["phone".into(), "sms".into()]),
         }],
         step: 0,

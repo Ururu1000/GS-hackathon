@@ -806,7 +806,7 @@ mod tests {
                 "settlements",
                 &["bob", "carol"],
                 Some("carol"),
-                &[("settlements", &["bob", "carol"])],
+                &[("settlements-primary", &["bob", "carol"])],
             )],
         )
         .expect("directory")
@@ -819,13 +819,17 @@ mod tests {
         // is not repeated.
         let chain = plan_chain(
             &settlements_dir(),
-            &[entry("oncall:settlements", Some(&["phone", "sms"]))],
+            &[entry("oncall:settlements-primary", Some(&["phone", "sms"]))],
             "settlements",
             &notified(&["bob"]),
         );
         assert_eq!(
             chain,
-            vec![step("carol", "oncall:settlements", Some(&["phone", "sms"]))]
+            vec![step(
+                "carol",
+                "oncall:settlements-primary",
+                Some(&["phone", "sms"])
+            )]
         );
     }
 
@@ -923,7 +927,7 @@ mod tests {
     fn already_notified_people_are_skipped() {
         let chain = plan_chain(
             &settlements_dir(),
-            &[entry("oncall:settlements", Some(&["phone", "sms"]))],
+            &[entry("oncall:settlements-primary", Some(&["phone", "sms"]))],
             "settlements",
             &notified(&["bob", "carol"]),
         );
@@ -937,7 +941,7 @@ mod tests {
         let chain = plan_chain(
             &settlements_dir(),
             &[
-                entry("oncall:settlements", Some(&["phone"])),
+                entry("oncall:settlements-primary", Some(&["phone"])),
                 entry("team:settlements", None),
             ],
             "settlements",
@@ -945,7 +949,11 @@ mod tests {
         );
         assert_eq!(
             chain,
-            vec![step("carol", "oncall:settlements", Some(&["phone"]))]
+            vec![step(
+                "carol",
+                "oncall:settlements-primary",
+                Some(&["phone"])
+            )]
         );
     }
 

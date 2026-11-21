@@ -117,7 +117,7 @@ async fn notify_settlements(
         "settlements",
         "critical",
         reason,
-        "oncall:settlements",
+        "oncall:settlements-primary",
         event,
         Some("settlement-timeout"),
     )

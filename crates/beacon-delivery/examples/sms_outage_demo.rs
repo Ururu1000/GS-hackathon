@@ -3,7 +3,7 @@
 //! Starts a simulated `sms` outage at the fake gateway, posts `--events N` copies of
 //! `samples/events/workflow-failed.json` through the ingest webhook (each with a unique
 //! `workflowId`, so the rule `settlements-workflow-failed` routes every copy to
-//! `oncall:settlements` -> bob on `phone`+`sms`), then watches the delivery jobs drain and
+//! `oncall:settlements-primary` -> bob on `phone`+`sms`), then watches the delivery jobs drain and
 //! reconciles them against the gateway's persisted receipts.
 //!
 //! The stack must already be running:
@@ -176,7 +176,7 @@ async fn run() -> Result<(), String> {
     }
     println!(
         "run {tag}: posted {posted}/{events} WORKFLOW_FAILED events \
-         (rule settlements-workflow-failed -> oncall:settlements -> sms+phone for bob)"
+         (rule settlements-workflow-failed -> oncall:settlements-primary -> sms+phone for bob)"
     );
 
     // ---- 3. poll the database until every expected sms job is terminal -------------------------

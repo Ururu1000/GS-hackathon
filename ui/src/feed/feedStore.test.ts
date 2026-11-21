@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { FeedAlert, StreamEvent } from '../api/types'
-import { applyAlert, applyEvents, compareFeed, emptyFeed, MAX_ROWS } from './feedStore'
+import { appendHistory, applyAlert, applyEvents, compareFeed, emptyFeed, MAX_ROWS } from './feedStore'
 
 function alert(id: string, version: number, over: Partial<FeedAlert> = {}): FeedAlert {
   return {
@@ -140,4 +140,36 @@ describe('feed snapshot protocol', () => {
     s = applyAlert(s, alert('a', 4, { status: 'acked' }))
     expect(s.byId.get('a')?.status).toBe('acked')
   })
+})
+
+it('pages history separately and applies only newer stream updates and removals', () => {
+  const open = alert('latest', 3)
+  const old = alert('older', 2)
+  let state = applyEvents(emptyFeed, [snap([open]), rm('removed', 4)])
+  state = appendHistory(state, { items: [alert('latest', 1), old, alert('removed', 3)], next_cursor: 'older-cursor' })
+  expect(state.order).toEqual(['latest'])
+  expect(state.history.get('latest')).toBeUndefined()
+  expect(state.history.get('removed')).toBeUndefined()
+  expect(state.history.get('older')).toEqual(old)
+  expect(state.nextCursor).toBe('older-cursor')
+  state = applyEvents(state, [up(alert('older', 1)), up(alert('older', 3))])
+  expect(state.history.get('older')?.version).toBe(3)
+  expect(state.inserted).toEqual([])
+  state = applyEvents(state, [rm('older', 4), up(alert('older', 3))])
+  expect(state.history.has('older')).toBe(false)
+  state = applyEvents(state, [snap([open])])
+  expect(state.history.size).toBe(0)
+  expect(state.nextCursor).toBeNull()
+})
+
+it('keeps updates older than the snapshot window out of the new-alert indicator', () => {
+  const boundary = alert('boundary', 1, { first_seen: '2026-10-23T09:00:00.000Z' })
+  const older = alert('older', 2, { first_seen: '2026-10-23T08:59:00.000Z', status: 'resolved' })
+  const latest = alert('latest', 1, { first_seen: '2026-10-23T09:01:00.000Z' })
+  const snapshot: StreamEvent = {
+    type: 'snapshot', data: { team: null, items: [boundary], next_cursor: 'older', server_time: '2026-10-23T09:00:30.000Z' },
+  }
+  const state = applyEvents(emptyFeed, [snapshot, up(older), up(latest)])
+  expect(state.order).toEqual(['latest', 'boundary', 'older'])
+  expect(state.inserted).toEqual(['latest'])
 })

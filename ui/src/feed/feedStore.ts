@@ -9,9 +9,10 @@
 // Pure functions over an immutable state, so the stream hook can batch a
 // frame's worth of events into one React update and tests can drive it.
 
-import type { FeedAlert, RemoveEvent, SnapshotEvent, StreamEvent } from '../api/types'
+import type { FeedAlert, FeedPage, RemoveEvent, SnapshotEvent, StreamEvent } from '../api/types'
 
 export const MAX_ROWS = 5000
+const MAX_HISTORY = 5000
 export const MAX_TOMBSTONES = 10_000
 
 export interface FeedStats {
@@ -29,6 +30,9 @@ export interface FeedState {
   /** id → version at removal (bounded, oldest evicted first). */
   tombstones: ReadonlyMap<string, number>
   snapshotAt: string | null
+  history: ReadonlyMap<string, FeedAlert>
+  nextCursor: string | null
+  snapshotOldest: FeedAlert | null
   /** Ids that entered the page in the last applied batch (not via snapshot). */
   inserted: readonly string[]
   stats: FeedStats
@@ -39,6 +43,9 @@ export const emptyFeed: FeedState = {
   order: [],
   tombstones: new Map(),
   snapshotAt: null,
+  history: new Map(),
+  nextCursor: null,
+  snapshotOldest: null,
   inserted: [],
   stats: { snapshots: 0, upserts: 0, removes: 0, stale: 0 },
 }
@@ -67,6 +74,10 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
   let byId: Map<string, FeedAlert> | null = null
   let tombstones: Map<string, number> | null = null
   let snapshotAt = state.snapshotAt
+  let nextCursor = state.nextCursor
+  let snapshotOldest = state.snapshotOldest
+  let history: Map<string, FeedAlert> | null = null
+  const older = () => (history ??= new Map(state.history))
   let membershipChanged = false
   let replaced = false
   const inserted = new Set<string>()
@@ -87,17 +98,24 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
       }
       case 'alert.upsert': {
         const next = ev.data
-        const cur = (byId ?? state.byId).get(next.id)
+        const recent = (byId ?? state.byId).get(next.id)
+        const historical = (history ?? state.history).get(next.id)
+        const cur = recent ?? historical
         const removedAt = (tombstones ?? state.tombstones).get(next.id)
         if ((cur && next.version <= cur.version) || (removedAt !== undefined && next.version <= removedAt)) {
           stats.stale++
           break
         }
         stats.upserts++
+        if (!recent && historical) {
+          older().set(next.id, next)
+          break
+        }
         rows().set(next.id, next)
         if (!cur) {
           membershipChanged = true
-          inserted.add(next.id)
+          if (snapshotOldest && compareFeed(next, snapshotOldest) > 0) moved.add(next.id)
+          else inserted.add(next.id)
         } else if (cur.first_seen !== next.first_seen && !replaced) {
           // first_seen is immutable by contract; re-position defensively.
           membershipChanged = true
@@ -126,13 +144,23 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
       for (const id of fresh.keys()) graves().delete(id)
     }
     snapshotAt = snap.server_time
+    nextCursor = snap.next_cursor
+    snapshotOldest = null
+    if (nextCursor) {
+      for (const alert of fresh.values()) {
+        if (!snapshotOldest || compareFeed(alert, snapshotOldest) > 0) snapshotOldest = alert
+      }
+    }
+    history = new Map()
     membershipChanged = true
     replaced = true
     inserted.clear()
   }
 
   function applyRemove(rm: RemoveEvent) {
-    const cur = (byId ?? state.byId).get(rm.id)
+    const recent = (byId ?? state.byId).get(rm.id)
+    const historical = (history ?? state.history).get(rm.id)
+    const cur = recent ?? historical
     const removedAt = (tombstones ?? state.tombstones).get(rm.id)
     if ((cur && rm.version < cur.version) || (removedAt !== undefined && rm.version <= removedAt)) {
       stats.stale++
@@ -146,7 +174,8 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
       const oldest = g.keys().next().value
       if (oldest !== undefined) g.delete(oldest)
     }
-    if (cur) {
+    if (historical) older().delete(rm.id)
+    if (recent) {
       rows().delete(rm.id)
       inserted.delete(rm.id)
       removed.add(rm.id)
@@ -154,7 +183,7 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
     }
   }
 
-  if (!byId && !tombstones) {
+  if (!byId && !tombstones && !history) {
     // Only stale events: keep the state, but surface the counters.
     return stats.stale === state.stats.stale ? state : { ...state, stats, inserted: [] }
   }
@@ -194,6 +223,9 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
     order,
     tombstones: tombstones ?? state.tombstones,
     snapshotAt,
+    history: history ?? state.history,
+    nextCursor,
+    snapshotOldest,
     inserted: replaced && inserted.size === 0 ? [] : [...inserted],
     stats,
   }
@@ -203,4 +235,17 @@ export function applyEvents(state: FeedState, events: readonly StreamEvent[]): F
  * through the same version rule as the stream. */
 export function applyAlert(state: FeedState, alert: FeedAlert): FeedState {
   return applyEvents(state, [{ type: 'alert.upsert', data: alert }])
+}
+
+/** Page older alerts independently of the live SSE window. */
+export function appendHistory(state: FeedState, page: FeedPage): FeedState {
+  const history = new Map(state.history)
+  for (const alert of page.items) {
+    if (state.byId.has(alert.id) || (state.tombstones.get(alert.id) ?? -1) >= alert.version) continue
+    const existing = history.get(alert.id)
+    if (existing && existing.version >= alert.version) continue
+    if (!existing && history.size >= MAX_HISTORY) break
+    history.set(alert.id, alert)
+  }
+  return { ...state, history, nextCursor: history.size === MAX_HISTORY ? null : page.next_cursor, inserted: [] }
 }
