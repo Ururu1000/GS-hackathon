@@ -36,6 +36,8 @@
 //! | `RELAY_WORKERS`      | `1`                                       | relay             |
 //! | `API_ADDR`           | `127.0.0.1:8080` (no auth yet: local only) | api              |
 //! | `BEACON_DEMO_USER`   | `anna` (fixed demo session user)          | api               |
+//! | `BEACON_LLM`         | `off`; `mock` or `claude` turns on mapping suggestions | api |
+//! | `BEACON_LLM_MODEL`   | `claude-opus-5-5` (with `BEACON_LLM=claude`, needs `ANTHROPIC_API_KEY`) | api |
 //! | `BEACON_UI_DIR`      | `ui/dist` if it exists (static UI)        | api               |
 
 use std::path::PathBuf;
@@ -371,6 +373,19 @@ async fn main() -> Result<()> {
                 }
             }
             Role::Api => {
+                // LLM mapping proposals: BEACON_LLM=off (default) | mock | claude.
+                let llm = beacon_api::mapping_suggest::provider_from_env()?;
+                if llm != beacon_api::mapping_suggest::Provider::Off {
+                    info!(
+                        provider = if matches!(llm, beacon_api::mapping_suggest::Provider::Mock) {
+                            "mock"
+                        } else {
+                            "claude"
+                        },
+                        "mapping suggestions on (synthetic data only)"
+                    );
+                }
+                beacon_api::mapping_suggest::configure(llm);
                 // No real auth yet (demo session), so local-only unless asked.
                 let addr = env_or("API_ADDR", "127.0.0.1:8080");
                 // The demo user is an admin unless BEACON_DEMO_ADMIN=false.

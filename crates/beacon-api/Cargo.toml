@@ -26,6 +26,8 @@ tracing.workspace = true
 hex.workspace = true
 rand.workspace = true
 form_urlencoded = "1.2"
+# LLM mapping proposals (off by default): HTTPS to the Claude API.
+reqwest = { workspace = true, features = ["rustls-tls"] }
 tower-http = { version = "0.6", features = ["fs"] }
 
 [dev-dependencies]
