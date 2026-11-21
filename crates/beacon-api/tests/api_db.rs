@@ -736,6 +736,7 @@ async fn simulator_is_mounted_with_the_gateway_token_injected(pool: PgPool) {
 async fn mapping_suggestion_mock_is_validated_and_previewed(pool: PgPool) {
     beacon_api::mapping_suggest::configure(beacon_api::mapping_suggest::Provider::Mock);
     let h = harness(pool);
+    assert_eq!(get(&h.app, "/api/session").await.1["capabilities"]["llm_suggest"], json!(true));
     let event = json!({"event": "REFUND_FAILED", "level": "ERROR", "app": "payments-api", "ts": "2026-11-21T06:00:00Z", "detail": {"msg": "card declined"}});
     // A write: CSRF first.
     let (s, _) = post(&h.app, "/api/schemas/suggest", None, json!({"event": event})).await;

@@ -117,6 +117,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-pub async fn get_session(State(state): State<ApiState>) -> Json<Session> {
-    Json((*state.session).clone())
+/// The session, plus `capabilities` the UI uses to show or hide features.
+pub async fn get_session(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    let mut v = serde_json::to_value(&*state.session).expect("session serializes");
+    v["capabilities"] = serde_json::json!({ "llm_suggest": crate::mapping_suggest::enabled() });
+    Json(v)
 }

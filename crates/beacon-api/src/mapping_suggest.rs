@@ -55,13 +55,13 @@ pub enum Provider {
     Claude { api_key: String, model: String, base_url: String },
 }
 
-static PROVIDER: OnceLock<Provider> = OnceLock::new();
+static PROVIDER: std::sync::RwLock<Provider> = std::sync::RwLock::new(Provider::Off);
 static SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 static CACHE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
 
-/// Called once at startup by the binary; the default is [`Provider::Off`].
+/// Called at startup by the binary; the default is [`Provider::Off`].
 pub fn configure(p: Provider) {
-    let _ = PROVIDER.set(p);
+    *PROVIDER.write().expect("provider lock") = p;
 }
 
 /// `BEACON_LLM` = off | mock | claude, from the environment.
@@ -81,8 +81,13 @@ pub fn provider_from_env() -> anyhow::Result<Provider> {
     })
 }
 
-fn provider() -> &'static Provider {
-    PROVIDER.get_or_init(|| Provider::Off)
+/// Whether `POST /api/schemas/suggest` is on (`GET /api/session` → `capabilities.llm_suggest`).
+pub fn enabled() -> bool {
+    provider() != Provider::Off
+}
+
+fn provider() -> Provider {
+    PROVIDER.read().expect("provider lock").clone()
 }
 
 /// One path of the sample, as the model sees it.
@@ -353,7 +358,7 @@ struct SuggestBody {
 pub async fn suggest(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Result<Json<Value>, ApiError> {
     state.session.check_csrf(&headers)?;
     crate::rules::require_admin(&state, "suggesting schema mappings")?;
-    let provider = provider().clone();
+    let provider = provider();
     if provider == Provider::Off {
         return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "llm_disabled", "mapping suggestions are off (BEACON_LLM=off)"));
     }
