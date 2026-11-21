@@ -56,7 +56,7 @@ pub struct MatchRecord {
     /// Canonical event facts passed on to delivery in the notify payload.
     #[serde(default)]
     pub context: NotifyContext,
-    /// The event itself, only for fires of rules with a runbook (templates).
+    /// Bounded event data for runbook selection and templates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<NotifyEvent>,
     /// `auto_resolve.quiet_for`: resolve the alert after this long without a match.
@@ -483,7 +483,8 @@ impl ConfigSnapshot {
             if let Some((start, end)) = bucket {
                 fields.push(AlertField { path: "group.window".into(), label: "Window".into(), value: Value::String(window_label(start, end)) });
             }
-            let notify_event = rule.spec.runbook.is_some().then(|| NotifyEvent {
+            // Delivery may match a team runbook even without an explicit rule binding.
+            let notify_event = Some(NotifyEvent {
                 fields: match bounded_to(Value::Object(redacted_fields), 4096) {
                     Value::Object(m) => m,
                     _ => serde_json::Map::new(),

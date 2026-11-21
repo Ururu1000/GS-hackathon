@@ -71,7 +71,7 @@ pub struct NotifyPayload {
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub context: NotifyContext,
-    /// Present on `reason = new` for rules with a runbook.
+    /// Opening event for explicit or team-matched runbooks, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<NotifyEvent>,
 }
