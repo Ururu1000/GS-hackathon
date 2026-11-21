@@ -14,17 +14,17 @@
 //! naming ids that are no longer in the base are ignored with a warning.
 //!
 //! [`EffectiveDirectory`] caches the applied view and rebuilds it only when the table's
-//! `(count, max(updated_at))` stamp moves — one cheap query per pass, the pattern the
-//! router and the escalation scheduler use so a save applies to the next notification /
-//! escalation step. A database that is away, or an override that no longer validates,
-//! logs and serves the last good directory: a broken override must never stop a
-//! delivery.
+//! `(count, sum(revision))` stamp moves — one cheap query per pass, the pattern the
+//! router, the escalation scheduler and the actions worker use so a save applies to the
+//! next notification / escalation step / action. A database that is away logs and serves
+//! the last good directory; an override that no longer validates is dropped on its own
+//! ([`apply_lenient`]), so the other saved edits keep applying: a broken override must
+//! never stop a delivery.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{error, warn};
@@ -175,16 +175,71 @@ fn apply_team_body(t: &mut Team, body: &Value) {
     }
 }
 
-/// The `(count, max(updated_at))` stamp of the overrides table: it moves on every save.
-type Stamp = (i64, Option<DateTime<Utc>>);
+/// [`apply`], but one override that no longer validates (say a team naming a person since
+/// removed from the YAML) drops only itself, with a warning, instead of the whole set.
+/// Returns the directory and the overrides that were applied. If the whole set applies
+/// this is exactly [`apply`]; otherwise overrides are tried one at a time in a fixed
+/// order (people, then teams, each by id) and kept only if the set so far still applies.
+pub fn apply_lenient(base: &Directory, ov: &Overrides) -> (Directory, Overrides) {
+    if let Ok(dir) = apply(base, ov) {
+        return (dir, ov.clone());
+    }
+    let mut kept = Overrides::default();
+    let mut people: Vec<_> = ov.people.iter().collect();
+    people.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, o) in people {
+        let mut trial = kept.clone();
+        trial.people.insert(id.clone(), o.clone());
+        match apply(base, &trial) {
+            Ok(_) => kept = trial,
+            Err(err) => {
+                warn!(person = %id, %err, "saved preferences no longer validate, ignoring them")
+            }
+        }
+    }
+    let mut teams: Vec<_> = ov.teams.iter().collect();
+    teams.sort_by(|a, b| a.0.cmp(b.0));
+    for (id, o) in teams {
+        let mut trial = kept.clone();
+        trial.teams.insert(id.clone(), o.clone());
+        match apply(base, &trial) {
+            Ok(_) => kept = trial,
+            Err(err) => warn!(team = %id, %err, "saved team no longer validates, ignoring it"),
+        }
+    }
+    match apply(base, &kept) {
+        Ok(dir) => (dir, kept),
+        // Only reachable if the base itself does not rebuild; serve it unchanged.
+        Err(err) => {
+            error!(%err, "the base directory does not rebuild, ignoring every override");
+            (base.clone(), Overrides::default())
+        }
+    }
+}
 
-/// The cached effective view: the applied directory plus the overrides (the revisions
-/// views show) it was built from.
+/// The `(count, sum(revision))` stamp of the overrides table. Every save either inserts a
+/// row (count + 1) or bumps one row's revision (sum + 1), so the stamp moves on every
+/// committed save, whatever order concurrent saves commit in (a timestamp such as
+/// `max(updated_at)` does not: `now()` is the transaction's start, not its commit).
+type Stamp = (i64, i64);
+
+/// One consistent effective view.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// The base with every still-valid override applied.
+    pub dir: Arc<Directory>,
+    /// Every override row as stored: the revisions views show and saves compare against
+    /// (also for an override that no longer validates, so a fresh save can replace it).
+    pub overrides: Arc<Overrides>,
+    /// The overrides that were applied to `dir` (a save validates on top of these).
+    pub applied: Arc<Overrides>,
+}
+
+/// The cached effective view and the stamp it was built at.
 #[derive(Debug)]
 struct Cache {
     stamp: Option<Stamp>,
-    dir: Arc<Directory>,
-    overrides: Arc<Overrides>,
+    snap: Snapshot,
 }
 
 /// Handle around the startup base directory that serves the effective one: overrides
@@ -199,11 +254,15 @@ pub struct EffectiveDirectory {
 
 impl EffectiveDirectory {
     pub fn new(base: Arc<Directory>) -> Self {
+        let empty = Arc::new(Overrides::default());
         Self {
             cache: tokio::sync::Mutex::new(Cache {
                 stamp: None,
-                dir: base.clone(),
-                overrides: Arc::new(Overrides::default()),
+                snap: Snapshot {
+                    dir: base.clone(),
+                    overrides: empty.clone(),
+                    applied: empty,
+                },
             }),
             base,
             rebuilds: AtomicU64::new(0),
@@ -212,14 +271,14 @@ impl EffectiveDirectory {
 
     /// The effective directory.
     pub async fn get(&self, pool: &PgPool) -> Arc<Directory> {
-        self.snapshot(pool).await.0
+        self.snapshot(pool).await.dir
     }
 
-    /// The effective directory plus the overrides it applied (the revisions views show).
-    pub async fn snapshot(&self, pool: &PgPool) -> (Arc<Directory>, Arc<Overrides>) {
+    /// The effective directory with the stored and the applied overrides.
+    pub async fn snapshot(&self, pool: &PgPool) -> Snapshot {
         // One cheap query, outside the lock; a failure serves the last good directory.
         let stamp: Stamp = match sqlx::query_as(
-            "SELECT count(*), max(updated_at) FROM directory_overrides",
+            "SELECT count(*), coalesce(sum(revision), 0)::bigint FROM directory_overrides",
         )
         .fetch_one(pool)
         .await
@@ -227,38 +286,31 @@ impl EffectiveDirectory {
             Ok(stamp) => stamp,
             Err(err) => {
                 error!(%err, "cannot read directory_overrides, serving the last good directory");
-                let cache = self.cache.lock().await;
-                return (cache.dir.clone(), cache.overrides.clone());
+                return self.cache.lock().await.snap.clone();
             }
         };
 
         let mut cache = self.cache.lock().await;
         if cache.stamp == Some(stamp) {
-            return (cache.dir.clone(), cache.overrides.clone());
+            return cache.snap.clone();
         }
-        let applied = match load(pool).await {
-            Ok(ov) => match apply(&self.base, &ov) {
-                Ok(dir) => Some((ov, dir)),
-                Err(err) => {
-                    // The stamp moved but the overrides no longer apply (e.g. a body
-                    // that does not validate against the base any more): keep serving
-                    // the last good directory, retry on the next stamp change.
-                    error!(%err, "cannot apply directory overrides, serving the last good directory");
-                    None
-                }
-            },
+        match load(pool).await {
+            Ok(ov) => {
+                // A single override that no longer validates drops only itself.
+                let (dir, applied) = apply_lenient(&self.base, &ov);
+                cache.stamp = Some(stamp);
+                cache.snap = Snapshot {
+                    dir: Arc::new(dir),
+                    overrides: Arc::new(ov),
+                    applied: Arc::new(applied),
+                };
+                self.rebuilds.fetch_add(1, Ordering::Relaxed);
+            }
             Err(err) => {
                 error!(%err, "cannot load directory overrides, serving the last good directory");
-                None
             }
-        };
-        if let Some((ov, dir)) = applied {
-            cache.stamp = Some(stamp);
-            cache.dir = Arc::new(dir);
-            cache.overrides = Arc::new(ov);
-            self.rebuilds.fetch_add(1, Ordering::Relaxed);
         }
-        (cache.dir.clone(), cache.overrides.clone())
+        cache.snap.clone()
     }
 
     /// How many times the cache rebuilt the directory (test hook for the stamp cache).
@@ -444,6 +496,33 @@ mod tests {
         );
         let err = apply(&base(), &ov).expect_err("unknown member must not apply");
         assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn lenient_apply_drops_only_the_override_that_fails() {
+        let mut ov = Overrides::default();
+        insert_person(&mut ov, "bob", json!([{ "default": ["sms"] }]));
+        ov.teams.insert(
+            "rates".into(),
+            TeamOverride {
+                body: json!({ "members": ["bob", "ghost"] }),
+                revision: 3,
+            },
+        );
+        assert!(
+            apply(&base(), &ov).is_err(),
+            "the strict validator rejects the set"
+        );
+        let (dir, applied) = apply_lenient(&base(), &ov);
+        assert!(applied.people.contains_key("bob"));
+        assert!(applied.teams.is_empty());
+        assert_eq!(dir.teams["rates"].members, base().teams["rates"].members);
+        assert!(dir.person("bob").unwrap().preferences.is_some());
+
+        // A set that applies is returned whole, exactly as `apply` builds it.
+        ov.teams.clear();
+        let (_, applied) = apply_lenient(&base(), &ov);
+        assert_eq!(applied.people.len(), 1);
     }
 
     #[test]

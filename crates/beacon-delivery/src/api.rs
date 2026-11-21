@@ -809,12 +809,13 @@ async fn people_handler(
         .ok_or_else(unauthorized)?;
     let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
     let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
-    let (dir, ov) = effective.snapshot(&state.pool).await;
+    let snap = effective.snapshot(&state.pool).await;
+    let (dir, ov) = (&snap.dir, &snap.overrides);
     let mut people: Vec<&Person> = dir.people.values().collect();
     people.sort_by(|a, b| a.id.cmp(&b.id));
     let items: Vec<PersonView> = people
         .into_iter()
-        .map(|p| person_view(&dir, &ov, p, me, is_admin))
+        .map(|p| person_view(dir, ov, p, me, is_admin))
         .collect();
     Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
 }
@@ -834,12 +835,13 @@ async fn teams_handler(
         .ok_or_else(unauthorized)?;
     let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
     let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
-    let (dir, ov) = effective.snapshot(&state.pool).await;
+    let snap = effective.snapshot(&state.pool).await;
+    let (dir, ov) = (&snap.dir, &snap.overrides);
     let mut teams: Vec<&Team> = dir.teams.values().collect();
     teams.sort_by(|a, b| a.id.cmp(&b.id));
     let items: Vec<TeamView> = teams
         .into_iter()
-        .map(|t| team_view(&ov, t, me, is_admin))
+        .map(|t| team_view(ov, t, me, is_admin))
         .collect();
     Ok((StatusCode::OK, Json(json!({ "items": items }))).into_response())
 }
@@ -889,12 +891,14 @@ async fn cas_override(
         .await
 }
 
-/// The body's `expected_revision`: required, an integer (the contract's config-writes
-/// shape). Anything else is a `400 bad_request`, like the run route's shape checks.
+/// The body's `expected_revision`: required, an integer revision (`>= 1`, the YAML base
+/// is 1; below `i64::MAX` so the CAS's `+ 1` cannot overflow). Anything else is a
+/// `400 bad_request`, like the run route's shape checks.
 fn expected_revision(body: &Value) -> Result<i64, ApiError> {
     body.get("expected_revision")
         .and_then(Value::as_i64)
-        .ok_or_else(|| bad_request("expected_revision must be an integer"))
+        .filter(|r| (1..i64::MAX).contains(r))
+        .ok_or_else(|| bad_request("expected_revision must be a positive integer revision"))
 }
 
 /// A JSON array of strings, else `422 invalid`.
@@ -933,8 +937,8 @@ async fn save_preferences_handler(
     let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
     let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
 
-    let (dir, ov) = effective.snapshot(&state.pool).await;
-    let Some(person) = dir.people.get(&person_raw) else {
+    let snap = effective.snapshot(&state.pool).await;
+    let Some(person) = snap.dir.people.get(&person_raw) else {
         return Err(not_found(format!("unknown person {person_raw:?}")));
     };
     if me != person.id && !is_admin {
@@ -947,11 +951,12 @@ async fn save_preferences_handler(
     let preferences = body.get("preferences").cloned().unwrap_or(Value::Null);
     let expected = expected_revision(&body)?;
 
-    // The candidate directory after this save: the current overrides plus this body,
-    // applied over the base through the one YAML validator. A bad `preferences` value
-    // (not a list, unknown channel, bad window, ...) is a 422 naming the person.
+    // The candidate directory after this save: the applied overrides plus this body,
+    // over the base through the one YAML validator. A bad `preferences` value (not a
+    // list, unknown channel, bad window, ...) is a 422 naming the person. Validating on
+    // top of the APPLIED set means another stale override cannot block this save.
     let stored = json!({ "preferences": preferences });
-    let mut candidate = (*ov).clone();
+    let mut candidate = (*snap.applied).clone();
     candidate.people.insert(
         person_raw.clone(),
         overrides::PersonOverride {
@@ -980,10 +985,15 @@ async fn save_preferences_handler(
         let mut err = revision_conflict(format!(
             "person {person_raw} is not at revision {expected} any more"
         ));
-        err.current = Some(
-            serde_json::to_value(person_view(&dir, &ov, person, me, is_admin))
-                .map_err(ApiError::internal)?,
-        );
+        // `current` from a fresh snapshot: the concurrent save moved the stamp, so this
+        // reloads the stored rows and carries the revision the database has now.
+        let now = effective.snapshot(&state.pool).await;
+        if let Some(p) = now.dir.people.get(&person_raw) {
+            err.current = Some(
+                serde_json::to_value(person_view(&now.dir, &now.overrides, p, me, is_admin))
+                    .map_err(ApiError::internal)?,
+            );
+        }
         return Err(err);
     };
     audit::record(
@@ -1030,8 +1040,8 @@ async fn save_team_handler(
     let me = actor.strip_prefix("user:").unwrap_or(actor.as_str());
     let is_admin = admin.is_some_and(|axum::Extension(Admin(a))| a);
 
-    let (dir, ov) = effective.snapshot(&state.pool).await;
-    let Some(team) = dir.teams.get(&team_raw) else {
+    let snap = effective.snapshot(&state.pool).await;
+    let Some(team) = snap.dir.teams.get(&team_raw) else {
         return Err(not_found(format!("unknown team {team_raw:?}")));
     };
     if team.lead.as_deref() != Some(me) && !is_admin {
@@ -1063,7 +1073,12 @@ async fn save_team_handler(
         new_team.oncall = schedule;
     }
     if let Some(defaults) = body.get("default_channels") {
-        new_team.default_channels = Some(string_list(defaults, "default_channels")?);
+        let list = string_list(defaults, "default_channels")?;
+        // Same rule as the YAML loader: an explicit default must name a channel.
+        if list.is_empty() {
+            return Err(invalid("default_channels must not be empty"));
+        }
+        new_team.default_channels = Some(list);
     }
 
     // The full effective team after the save is what gets stored and re-applied; a body
@@ -1074,7 +1089,7 @@ async fn save_team_handler(
         "oncall": new_team.oncall,
         "default_channels": new_team.default_channels.clone().unwrap_or_default(),
     });
-    let mut candidate = (*ov).clone();
+    let mut candidate = (*snap.applied).clone();
     candidate.teams.insert(
         team_raw.clone(),
         overrides::TeamOverride {
@@ -1101,9 +1116,14 @@ async fn save_team_handler(
         let mut err = revision_conflict(format!(
             "team {team_raw} is not at revision {expected} any more"
         ));
-        err.current = Some(
-            serde_json::to_value(team_view(&ov, team, me, is_admin)).map_err(ApiError::internal)?,
-        );
+        // `current` from a fresh snapshot (see the person save).
+        let now = effective.snapshot(&state.pool).await;
+        if let Some(t) = now.dir.teams.get(&team_raw) {
+            err.current = Some(
+                serde_json::to_value(team_view(&now.overrides, t, me, is_admin))
+                    .map_err(ApiError::internal)?,
+            );
+        }
         return Err(err);
     };
     audit::record(

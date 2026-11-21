@@ -670,22 +670,109 @@ async fn a_saved_team_change_reaches_a_new_effective_view(pool: PgPool) {
 
     // The effective directory a router pass would read has the new membership (and
     // still everyone's base preferences — a team save does not touch them).
-    let (dir, ov) = EffectiveDirectory::new(Arc::new(fixture_dir()))
+    let snap = EffectiveDirectory::new(Arc::new(fixture_dir()))
         .snapshot(&pool)
         .await;
+    let (dir, ov) = (&snap.dir, &snap.overrides);
     let rates = dir.teams.get("rates").expect("rates is in the directory");
     assert_eq!(rates.members, ["bob", "carol"]);
     assert_eq!(rates.lead.as_deref(), Some("bob"));
     assert_eq!(rates.oncall["rates-primary"], ["carol", "bob"]);
     assert_eq!(rates.default_channels, Some(vec!["email".to_string()]));
-    assert_eq!(
-        overrides::revision_of(&ov, overrides::KIND_TEAM, "rates"),
-        2
-    );
-    assert_eq!(
-        overrides::revision_of(&ov, overrides::KIND_PERSON, "bob"),
-        1
-    );
+    assert_eq!(overrides::revision_of(ov, overrides::KIND_TEAM, "rates"), 2);
+    assert_eq!(overrides::revision_of(ov, overrides::KIND_PERSON, "bob"), 1);
     // The untouched team is unchanged.
     assert_eq!(dir.teams.get("payments").unwrap().members, ["carol"]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stale_override_drops_alone_and_can_be_replaced(pool: PgPool) {
+    // A team override naming a person no longer in the YAML (written straight to the
+    // table, as if `ghost` was removed from config/people after the save), next to a
+    // valid saved preference for bob.
+    sqlx::query(
+        "INSERT INTO directory_overrides (kind, id, body, revision, updated_by) VALUES \
+         ('team', 'rates', $1, 3, 'user:bob'), ('person', 'bob', $2, 2, 'user:bob')",
+    )
+    .bind(json!({ "members": ["bob", "ghost"], "lead": "bob", "oncall": {}, "default_channels": ["email"] }))
+    .bind(json!({ "preferences": [{ "default": ["sms"] }] }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Only the stale team override is dropped: bob's saved preference still applies.
+    let snap = EffectiveDirectory::new(Arc::new(fixture_dir()))
+        .snapshot(&pool)
+        .await;
+    assert_eq!(snap.dir.teams["rates"].members, ["bob", "anna"]);
+    let bob = snap.dir.people.get("bob").unwrap();
+    let resolution = prefs::resolve_channels(bob, None, &routing_ctx(), chrono::Utc::now());
+    assert_eq!(resolution.channels, ["sms"]);
+    assert!(snap.applied.teams.is_empty());
+    assert_eq!(
+        overrides::revision_of(&snap.overrides, overrides::KIND_TEAM, "rates"),
+        3
+    );
+
+    let state = api_state(&pool, fixture_dir());
+    // Views carry the stored revision, so a client can replace the stale row.
+    let (status, teams) = get(app_as(&state, Some("user:bob"), false), "/api/teams").await;
+    assert_eq!(status, StatusCode::OK, "{teams}");
+    assert_eq!(find(&teams, "rates")["revision"], 3);
+
+    // A stale expected revision: 409 whose `current` is the database's revision.
+    let (status, err) = put(
+        app_as(&state, Some("user:bob"), false),
+        "/api/teams/rates",
+        &json!({ "members": ["bob"], "expected_revision": 1 }),
+        JSON,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["error"]["current"]["revision"], 3);
+
+    // Retrying at the current revision replaces the stale row.
+    let (status, body) = put(
+        app_as(&state, Some("user:bob"), false),
+        "/api/teams/rates",
+        &json!({ "members": ["bob"], "expected_revision": 3 }),
+        JSON,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 4);
+
+    // Another person's save is never blocked by someone else's stale row.
+    let (status, body) = put(
+        app_as(&state, Some("user:carol"), false),
+        "/api/people/carol/preferences",
+        &json!({ "preferences": [{ "default": ["email"] }], "expected_revision": 1 }),
+        JSON,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 2);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn out_of_range_revisions_and_empty_defaults_are_rejected(pool: PgPool) {
+    let state = api_state(&pool, fixture_dir());
+    for expected in [json!(i64::MAX), json!(0), json!(-1)] {
+        let (status, body) = put(
+            app_as(&state, Some("user:bob"), false),
+            "/api/people/bob/preferences",
+            &json!({ "preferences": [], "expected_revision": expected }),
+            JSON,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected}: {body}");
+    }
+    let (status, body) = put(
+        app_as(&state, Some("user:bob"), false),
+        "/api/teams/rates",
+        &json!({ "default_channels": [], "expected_revision": 1 }),
+        JSON,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
