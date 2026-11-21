@@ -265,7 +265,8 @@ pub async fn test(State(state): State<ApiState>, headers: HeaderMap, body: Bytes
     }
     let b: TestBody = parse_body(&body, "{\"rule\": {...}, \"event\": {...}}")?;
     // Compiling and evaluating is CPU work: keep it off the async workers.
-    let schemas = state.schemas.clone();
+    // The live mappings (Postgres), so a just-published mapping is used.
+    let schemas = config_store::schema_specs(&state.pool).await?;
     let out = tokio::task::spawn_blocking(move || run_test(&schemas, b.rule, b.event, b.source))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!("rule test task failed: {e}")))?;
@@ -352,9 +353,79 @@ pub async fn recent_events(State(state): State<ApiState>, RawQuery(raw): RawQuer
     Ok(Json(json!({"items": items})))
 }
 
-pub async fn schemas(State(state): State<ApiState>) -> Json<Value> {
-    let items: Vec<Value> = state.schemas.iter().map(|s| json!({"spec": s, "revision": 1})).collect();
-    Json(Value::Array(items))
+pub async fn schemas(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let items: Vec<Value> = config_store::list_schemas(&state.pool)
+        .await?
+        .iter()
+        .map(|s| json!({"spec": s.spec, "revision": s.revision, "updated_at": ts(s.updated_at), "updated_by": s.updated_by}))
+        .collect();
+    Ok(Json(Value::Array(items)))
+}
+
+#[derive(Deserialize)]
+struct SchemaWrite {
+    spec: Value,
+    #[serde(default)]
+    expected_revision: Option<i64>,
+}
+
+/// Publish a schema mapping (create, or compare-and-set with expected_revision).
+/// Mappings are global (they recognise shapes, not team data), so publishing
+/// is limited to admins.
+pub async fn save_schema(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    state.session.check_csrf(&headers)?;
+    check_body(&body)?;
+    require_admin(&state)?;
+    let b: SchemaWrite = parse_body(&body, "{\"spec\": {...}, \"expected_revision\"?: <int>}")?;
+    match config_store::save_schema(&state.pool, &b.spec, b.expected_revision, &state.session.actor()).await? {
+        Ok((s, created)) => {
+            let v = json!({"spec": s.spec, "revision": s.revision, "updated_at": ts(s.updated_at), "updated_by": s.updated_by});
+            let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+            Ok((status, Json(v)).into_response())
+        }
+        Err(WriteError::Invalid(d)) => Err(invalid(d)),
+        Err(WriteError::NotFound) => Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no mapping with that schema name to update")),
+        Err(WriteError::Conflict(_)) => {
+            let name = b.spec.get("schema").and_then(Value::as_str).unwrap_or("");
+            let current = config_store::get_schema(&state.pool, name)
+                .await?
+                .map(|s| json!({"spec": s.spec, "revision": s.revision}))
+                .unwrap_or(Value::Null);
+            Err(ApiError::conflict("revision_conflict", "the mapping changed since you loaded it (or already exists)", current))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SchemaPreview {
+    spec: Value,
+    event: Value,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Evaluate a mapping against one event, without changing config.
+pub async fn preview_schema(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Result<Json<Value>, ApiError> {
+    state.session.check_csrf(&headers)?;
+    if body.len() > MAX_TEST_BODY {
+        return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", format!("body exceeds {MAX_TEST_BODY} bytes")));
+    }
+    let b: SchemaPreview = parse_body(&body, "{\"spec\": {...}, \"event\": {...}, \"source\": \"...\"}")?;
+    let spec = config_store::validate_schema(&b.spec).map_err(invalid)?;
+    let out = tokio::task::spawn_blocking(move || {
+        let m = beacon_core::mapping::SchemaMapping::compile(&spec).expect("validated above");
+        let event = Event::new("preview".into(), b.source.unwrap_or_else(|| "http:preview".into()), b.event);
+        let matched = m.detects(&event);
+        let (fields, diags) = if matched { m.extract(&event) } else { (Default::default(), vec![]) };
+        let mut warnings: Vec<String> = diags.iter().map(|d| format!("{}: {}", d.field, d.message)).collect();
+        if !matched {
+            warnings.push("The detector does not recognise this event".into());
+        }
+        json!({"matched": matched, "fields": fields, "warnings": warnings})
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!("preview task failed: {e}")))?;
+    Ok(Json(out))
 }
 
 pub async fn discovered(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {

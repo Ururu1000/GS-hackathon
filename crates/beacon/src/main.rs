@@ -263,10 +263,9 @@ async fn main() -> Result<()> {
                     .ok()
                     .or_else(|| Some(PathBuf::from("ui/dist")).filter(|p| p.join("index.html").exists()));
                 beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
-                let schemas = std::sync::Arc::new(beacon_engine::config_store::load_schemas(&config_dir)?);
                 let sources = std::sync::Arc::new(beacon_ingest::kafka_source::load_sources(&config_dir.join("sources"))?);
                 let streams = std::sync::Arc::new(tokio::sync::Semaphore::new(beacon_api::MAX_STREAMS));
-                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, schemas, sources, streams };
+                let state = beacon_api::ApiState { pool: pool.clone(), updates: updates.clone(), ready, session, sources, streams };
                 // Same-origin ingest for the UI's sample replay (CSRF-gated).
                 let same_origin_ingest = {
                     let publisher = beacon_ingest::EventPublisher::new(beacon_ingest::kafka::producer(&kafka)?);

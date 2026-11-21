@@ -15,6 +15,7 @@
 pub mod alerts;
 pub mod error;
 pub mod feed;
+pub mod proposals;
 pub mod rules;
 pub mod session;
 pub mod stream;
@@ -38,8 +39,6 @@ pub struct ApiState {
     /// True once this replica's `alerts.updates` consumer has partitions.
     pub ready: watch::Receiver<bool>,
     pub session: Arc<Session>,
-    /// Schema mappings (config/schemas) for the rule test panel and listing.
-    pub schemas: Arc<Vec<beacon_core::mapping::SchemaMappingSpec>>,
     /// Configured Kafka sources (config/sources).
     pub sources: Arc<Vec<beacon_ingest::kafka_source::SourceSpec>>,
     /// Bounds concurrent SSE streams on this replica.
@@ -70,7 +69,11 @@ pub fn router_with(state: ApiState, ui_dir: Option<PathBuf>, ingest: Option<Rout
         .route("/api/rules/test", post(rules::test))
         .route("/api/rules/{id}", get(rules::get).put(rules::update).delete(rules::delete))
         .route("/api/events/recent", get(rules::recent_events))
-        .route("/api/schemas", get(rules::schemas))
+        .route("/api/schemas", get(rules::schemas).post(rules::save_schema))
+        .route("/api/schemas/preview", post(rules::preview_schema))
+        .route("/api/proposals", get(proposals::list).post(proposals::create))
+        .route("/api/proposals/count", get(proposals::count))
+        .route("/api/proposals/{id}/{decision}", post(proposals::decide))
         .route("/api/schemas/discovered", get(rules::discovered))
         .route("/api/sources", get(rules::sources))
         .route("/ready", get(ready))
