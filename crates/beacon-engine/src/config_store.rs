@@ -263,6 +263,24 @@ pub async fn update_scoped(
     actor: &str,
     visible_teams: Option<&[String]>,
 ) -> Result<Result<StoredRule, WriteError>> {
+    let mut tx = pool.begin().await?;
+    let res = update_in(&mut tx, id, spec, expected_revision, actor, visible_teams).await?;
+    if res.is_ok() {
+        tx.commit().await?;
+    }
+    Ok(res)
+}
+
+/// [`update_scoped`] inside the caller's transaction, so a rule write can
+/// commit atomically with other state, e.g. a proposal being accepted.
+pub async fn update_in(
+    tx: &mut PgConnection,
+    id: &str,
+    spec: &Value,
+    expected_revision: i64,
+    actor: &str,
+    visible_teams: Option<&[String]>,
+) -> Result<Result<StoredRule, WriteError>> {
     let rule = match validate(spec) {
         Ok(r) => r,
         Err(p) => return Ok(Err(WriteError::Invalid(p))),
@@ -270,9 +288,8 @@ pub async fn update_scoped(
     if rule.id != id {
         return Ok(Err(WriteError::Invalid(vec![Invalid { path: "id".into(), message: format!("must match the URL ({id})") }])));
     }
-    let mut tx = pool.begin().await?;
-    lock_rules(&mut tx).await?;
-    let Some(existing) = current(&mut tx, id, true).await?.filter(|e| !e.deleted) else {
+    lock_rules(&mut *tx).await?;
+    let Some(existing) = current(&mut *tx, id, true).await?.filter(|e| !e.deleted) else {
         return Ok(Err(WriteError::NotFound));
     };
     if !team_visible(&existing.spec, visible_teams) {
@@ -287,9 +304,8 @@ pub async fn update_scoped(
     if existing.revision != expected_revision {
         return Ok(Err(WriteError::Conflict(Some(existing))));
     }
-    write(&mut tx, id, spec, existing.revision + 1, actor).await?;
-    let saved = current(&mut tx, id, false).await?.context("rule just written")?;
-    tx.commit().await?;
+    write(&mut *tx, id, spec, existing.revision + 1, actor).await?;
+    let saved = current(&mut *tx, id, false).await?.context("rule just written")?;
     Ok(Ok(saved))
 }
 
@@ -346,6 +362,7 @@ async fn write(tx: &mut PgConnection, id: &str, spec: &Value, revision: i64, act
 /// seed rules are reported and skipped. On existing databases, also migrates
 /// the legacy shipped `oncall:settlements` route to `oncall:settlements-primary`.
 pub async fn seed_from_yaml(pool: &PgPool, config_dir: &Path) -> Result<usize> {
+    seed_schemas_from_yaml(pool, config_dir).await?;
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM rules").fetch_one(pool).await?;
     if n > 0 {
         let mut tx = pool.begin().await?;
@@ -387,11 +404,175 @@ pub fn load_schemas(config_dir: &Path) -> Result<Vec<SchemaMappingSpec>> {
     load_yaml_files(&config_dir.join("schemas"))
 }
 
-/// Build the matcher snapshot from Postgres rules + YAML schema mappings.
-/// Rules that no longer compile are skipped with an error log rather than
-/// taking the whole ruleset down.
-pub async fn load_snapshot(pool: &PgPool, schemas: &[SchemaMappingSpec]) -> Result<ConfigSnapshot> {
+/// A stored schema mapping.
+#[derive(Debug, Clone)]
+pub struct StoredSchema {
+    pub spec: Value,
+    pub revision: i64,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: String,
+}
+
+const MAX_SCHEMA_FIELDS: usize = 64;
+
+/// Validate a mapping with the same compiler the matcher uses.
+pub fn validate_schema(spec: &Value) -> Result<SchemaMappingSpec, Vec<Invalid>> {
+    let inv = |path: &str, message: String| vec![Invalid { path: path.into(), message }];
+    if let Some(p) = forbidden_key_path(spec, "") {
+        return Err(inv(&p, "this key name is not allowed".into()));
+    }
+    if spec.to_string().len() > MAX_RULE_BYTES {
+        return Err(inv("", format!("a mapping must be under {} KiB", MAX_RULE_BYTES / 1024)));
+    }
+    let m: SchemaMappingSpec = serde_json::from_value(spec.clone()).map_err(|e| inv("", format!("not a valid mapping: {e}")))?;
+    // Each field clones its value out of the event, so the count bounds the work.
+    if m.fields.len() > MAX_SCHEMA_FIELDS {
+        return Err(inv("fields", format!("a mapping can have at most {MAX_SCHEMA_FIELDS} fields")));
+    }
+    // Redaction keys on the field name, so copying a secret into an ordinary
+    // name would let it out unmasked.
+    for (name, f) in &m.fields {
+        if f.path.as_deref().is_some_and(beacon_core::matcher::is_secret_path_str) {
+            return Err(inv(&format!("fields.{name}"), "this path holds a secret and can't be mapped".into()));
+        }
+    }
+    if let Err(e) = beacon_core::mapping::SchemaMapping::compile(&m) {
+        let msg = e.to_string();
+        let path = match &e {
+            beacon_core::mapping::MappingError::Detect { .. } => "detect".to_string(),
+            beacon_core::mapping::MappingError::FieldPath { field, .. } | beacon_core::mapping::MappingError::FieldEmpty { field, .. } => format!("fields.{field}"),
+            beacon_core::mapping::MappingError::BadName => "schema".into(),
+        };
+        return Err(inv(&path, msg));
+    }
+    Ok(m)
+}
+
+fn schema_row(r: &sqlx::postgres::PgRow) -> Result<StoredSchema> {
+    Ok(StoredSchema {
+        spec: r.try_get("spec")?,
+        revision: r.try_get("revision")?,
+        updated_at: r.try_get("updated_at")?,
+        updated_by: r.try_get("updated_by")?,
+    })
+}
+
+pub async fn list_schemas(pool: &PgPool) -> Result<Vec<StoredSchema>> {
+    let rows = sqlx::query("SELECT spec, revision, updated_at, updated_by FROM schema_mappings ORDER BY schema").fetch_all(pool).await?;
+    rows.iter().map(schema_row).collect()
+}
+
+/// Valid stored mappings, for snapshots and the rule test panel. An invalid
+/// stored mapping is skipped (and logged), never fatal.
+pub async fn schema_specs(pool: &PgPool) -> Result<Vec<SchemaMappingSpec>> {
+    Ok(valid_schema_specs(list_schemas(pool).await?))
+}
+
+/// The CPU half of [`schema_specs`] (compiles every mapping), for callers
+/// that run it on a blocking thread.
+pub fn valid_schema_specs(stored: Vec<StoredSchema>) -> Vec<SchemaMappingSpec> {
+    let mut out = Vec::new();
+    for s in stored {
+        match validate_schema(&s.spec) {
+            Ok(m) => out.push(m),
+            Err(problems) => error!(?problems, "stored schema mapping is invalid; skipped"),
+        }
+    }
+    out
+}
+
+/// Create (no `expected_revision`) or compare-and-set update a mapping.
+/// Returns the saved mapping and whether it was created.
+pub async fn save_schema(pool: &PgPool, spec: &Value, expected_revision: Option<i64>, actor: &str) -> Result<Result<(StoredSchema, bool), WriteError>> {
+    let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
+    let res = save_schema_in(&mut tx, spec, expected_revision, actor).await?;
+    if res.is_ok() {
+        tx.commit().await?;
+    }
+    Ok(res)
+}
+
+/// [`save_schema`] inside the caller's transaction, which holds the ruleset lock.
+async fn save_schema_in(tx: &mut PgConnection, spec: &Value, expected_revision: Option<i64>, actor: &str) -> Result<Result<(StoredSchema, bool), WriteError>> {
+    let m = match validate_schema(spec) {
+        Ok(m) => m,
+        Err(p) => return Ok(Err(WriteError::Invalid(p))),
+    };
+    let existing = sqlx::query("SELECT spec, revision, updated_at, updated_by FROM schema_mappings WHERE schema = $1 FOR UPDATE")
+        .bind(&m.schema)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(schema_row)
+        .transpose()?;
+    let revision = match (&existing, expected_revision) {
+        (None, None) => 1,
+        (Some(e), Some(v)) if e.revision == v => e.revision + 1,
+        (None, Some(_)) => return Ok(Err(WriteError::NotFound)),
+        (Some(_), _) => {
+            return Ok(Err(WriteError::Conflict(None)));
+        }
+    };
+    sqlx::query(
+        "INSERT INTO schema_mappings (schema, spec, revision, updated_at, updated_by) VALUES ($1, $2, $3, now(), $4)
+         ON CONFLICT (schema) DO UPDATE SET spec = EXCLUDED.spec, revision = EXCLUDED.revision, updated_at = now(), updated_by = EXCLUDED.updated_by",
+    )
+    .bind(&m.schema)
+    .bind(spec)
+    .bind(revision)
+    .bind(actor)
+    .execute(&mut *tx)
+    .await?;
+    bump(&mut *tx).await?;
+    let saved = sqlx::query("SELECT spec, revision, updated_at, updated_by FROM schema_mappings WHERE schema = $1")
+        .bind(&m.schema)
+        .fetch_one(&mut *tx)
+        .await?;
+    let saved = schema_row(&saved)?;
+    Ok(Ok((saved, existing.is_none())))
+}
+
+/// The current stored mapping for a schema name (conflict bodies).
+pub async fn get_schema(pool: &PgPool, schema: &str) -> Result<Option<StoredSchema>> {
+    sqlx::query("SELECT spec, revision, updated_at, updated_by FROM schema_mappings WHERE schema = $1")
+        .bind(schema)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(schema_row)
+        .transpose()
+}
+
+/// Import `config/schemas/*.yaml` once, when the table is empty. The check and
+/// the import share one transaction under the ruleset lock, so concurrent
+/// replicas can't both seed and a crash mid-import leaves the table empty.
+async fn seed_schemas_from_yaml(pool: &PgPool, config_dir: &Path) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    lock_rules(&mut tx).await?;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_mappings").fetch_one(&mut *tx).await?;
+    if n > 0 {
+        return Ok(());
+    }
+    let specs: Vec<Value> = load_yaml_files(&config_dir.join("schemas"))?;
+    let mut imported = 0;
+    for spec in specs {
+        match save_schema_in(&mut tx, &spec, None, "config").await? {
+            Ok(_) => imported += 1,
+            Err(e) => warn!(?e, "seed schema mapping rejected"),
+        }
+    }
+    tx.commit().await?;
+    info!(imported, "schema mappings seeded from config/schemas");
+    Ok(())
+}
+
+/// Build the matcher snapshot from Postgres rules and schema mappings. Rules
+/// or mappings that no longer compile are skipped with an error log rather
+/// than taking the whole config down.
+pub async fn load_snapshot(pool: &PgPool) -> Result<ConfigSnapshot> {
     let revision = rules_revision(pool).await?;
+    let schemas = schema_specs(pool).await?;
     let mut rules = Vec::new();
     // Each rule is validated on its own: one bad stored rule is skipped
     // (and logged) instead of making the whole ruleset fail to load.
@@ -404,19 +585,19 @@ pub async fn load_snapshot(pool: &PgPool, schemas: &[SchemaMappingSpec]) -> Resu
             }
         }
     }
-    ConfigSnapshot::build_with(revision, schemas.to_vec(), rules)
+    ConfigSnapshot::build_with(revision, schemas, rules)
 }
 
 /// Keep a live snapshot: initial load, then rebuild on NOTIFY or when the
 /// periodic check sees a newer revision.
 pub async fn watch_config(pool: PgPool, config_dir: PathBuf) -> Result<watch::Receiver<Arc<ConfigSnapshot>>> {
-    let schemas = load_schemas(&config_dir).context("loading config/schemas")?;
-    let first = load_snapshot(&pool, &schemas).await.context("loading rules from Postgres")?;
+    seed_from_yaml(&pool, &config_dir).await?;
+    let first = load_snapshot(&pool).await.context("loading rules and schemas from Postgres")?;
     info!(revision = first.revision, rules = first.rules.len(), "config snapshot loaded");
     let (tx, rx) = watch::channel(Arc::new(first));
     tokio::spawn(async move {
         loop {
-            if let Err(e) = reload_loop(&pool, &schemas, &tx).await {
+            if let Err(e) = reload_loop(&pool, &tx).await {
                 warn!(error = format!("{e:#}"), "config watcher failed; retrying");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -428,14 +609,14 @@ pub async fn watch_config(pool: PgPool, config_dir: PathBuf) -> Result<watch::Re
     Ok(rx)
 }
 
-async fn reload_loop(pool: &PgPool, schemas: &[SchemaMappingSpec], tx: &watch::Sender<Arc<ConfigSnapshot>>) -> Result<()> {
+async fn reload_loop(pool: &PgPool, tx: &watch::Sender<Arc<ConfigSnapshot>>) -> Result<()> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen(CONFIG_CHANNEL).await?;
     loop {
         let current = tx.borrow().revision;
         let latest = rules_revision(pool).await?;
         if latest != current {
-            match load_snapshot(pool, schemas).await {
+            match load_snapshot(pool).await {
                 Ok(s) => {
                     info!(revision = s.revision, rules = s.rules.len(), "config reloaded");
                     tx.send_replace(Arc::new(s));

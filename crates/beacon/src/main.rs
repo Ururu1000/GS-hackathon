@@ -325,8 +325,6 @@ async fn main() -> Result<()> {
                         Some(PathBuf::from("ui/dist")).filter(|p| p.join("index.html").exists())
                     });
                 beacon_engine::config_store::seed_from_yaml(&pool, &config_dir).await?;
-                let schemas =
-                    std::sync::Arc::new(beacon_engine::config_store::load_schemas(&config_dir)?);
                 let sources = std::sync::Arc::new(beacon_ingest::kafka_source::load_sources(
                     &config_dir.join("sources"),
                 )?);
@@ -337,7 +335,6 @@ async fn main() -> Result<()> {
                     updates: updates.clone(),
                     ready,
                     session,
-                    schemas,
                     sources,
                     streams,
                 };

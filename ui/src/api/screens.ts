@@ -96,8 +96,9 @@ export const listSchemaMappings = (signal?: AbortSignal) =>
   request<SchemaMapping[]>('/api/schemas', { signal })
 export const previewSchemaMapping = (spec: unknown, event: unknown, source: string, signal?: AbortSignal) =>
   post<SchemaPreview>('/api/schemas/preview', { spec, event, source }, signal)
-export const saveSchemaMapping = (spec: unknown, expectedRevision?: number) =>
-  post<SchemaMapping>('/api/schemas', { spec, expected_revision: expectedRevision })
+/** `editing` is the stored mapping being changed; omit it to create a new one. */
+export const saveSchemaMapping = (spec: unknown, editing?: { schema: string; revision: number }) =>
+  post<SchemaMapping>('/api/schemas', { spec, expected_revision: editing?.revision, schema: editing?.schema })
 
 export const previewRunbook = (draft: RunbookImport, signal?: AbortSignal) =>
   post<RunbookPreview>('/api/runbooks/import', draft, signal)

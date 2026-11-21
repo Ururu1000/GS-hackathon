@@ -21,6 +21,7 @@ Last updated: 2026-11-21.
 | Shared ack/resolve transitions for delivery | Done | PR #12 |
 | Rules in Postgres, live reload, rules / test panel / schemas API | Done | PR #13 |
 | One-command `docker compose up --build` | Done, verified end to end | PR #13 |
+| Proposals (suggest change → accept/reject) + schema preview/publish | Done | branch api/proposals |
 | Mount delivery M5b routes (runbooks, approvals, simulator) | Next | waits for #11 in the stack |
 | Exact counts under replay and crashes (M1) | Done: scenario e exact | PR #15 |
 | Grouping digests + quiet-for auto-resolve (M3) | Done | PR #16 |
@@ -152,6 +153,18 @@ Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
     - a missing stats index
 - **Tests:** 70+ Rust tests across core, ingest, engine and API, many of them against a real Postgres.
 
+## Proposals and schema publishing
+
+- **Proposals:**
+  - "Suggest change" creates a proposal against the rule's current revision.
+  - It is validated with the same validator as publishing.
+  - The owning team accepts it, which publishes against the base revision, or rejects it.
+  - If the rule moved in the meantime, accept returns 409, and the proposal becomes `stale`.
+- **Schema mappings live in Postgres,** like rules: seeded from `config/schemas` and validated with the matcher's compiler.
+  - `POST /api/schemas/preview` dry-runs a mapping against an event.
+  - `POST /api/schemas` publishes it (admin, compare-and-set).
+  - Matchers and the rule test panel pick it up live.
+
 ## Security fixes (audit of #12, #13, #15)
 
 - **Aggregator:** fixed a crash-loop when a batch mixed a fully replayed partition with new work (regression test). The dedup window now tracks only ids that can repeat, which cuts its memory roughly 4×.
@@ -180,7 +193,6 @@ Scenario e: `kill -9` of the matcher/aggregator process at 10k events/s.
 - **Grouping and quiet timers use processing time** (`ingested_at`), not the producer's own timestamp. If the aggregator lags more than `quiet_for`, a digest can be resolved and then reopen as a new alert.
 - **A deleted and recreated `alerts.matches` topic** is not detected. Stored checkpoints would skip the new topic's first offsets.
 - **Rare event reorderings can merge incidents.** An older fire arriving after a newer one, across batches, merges two incidents into one. The open/resolved state stays correct; only history is affected.
-- **Schema mappings are read-only through the API for now.** They come from `config/schemas`, and edits arrive with the schemas write endpoints.
 - **Audit #16 findings are deferred:** quiet_for overflow, and the shared group key when a group field is missing.
 - **The demo session is a fixed user** (`BEACON_DEMO_USER`, default `anna`). There is no real authentication yet, so the API listens on localhost by default.
 
