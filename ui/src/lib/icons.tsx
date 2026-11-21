@@ -31,6 +31,24 @@ export const CloseIcon = (p: IconProps) => (
   </Svg>
 )
 
+export const ChevronUpIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M6 15l6-6 6 6" />
+  </Svg>
+)
+
+export const ChevronLeftIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M15 6l-6 6 6 6" />
+  </Svg>
+)
+
+export const ChevronDownIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M6 9l6 6 6-6" />
+  </Svg>
+)
+
 export const CheckIcon = (p: IconProps) => (
   <Svg {...p}>
     <path d="M5 12.5l4.5 4.5L19 7.5" strokeWidth="2.5" />
@@ -61,13 +79,6 @@ export const SunIcon = (p: IconProps) => (
 export const MoonIcon = (p: IconProps) => (
   <Svg {...p}>
     <path d="M20.25 14.5A7.75 7.75 0 0 1 9.5 3.75a7.75 7.75 0 1 0 10.75 10.75Z" />
-  </Svg>
-)
-
-export const KeyboardIcon = (p: IconProps) => (
-  <Svg {...p}>
-    <rect x="2.75" y="5.5" width="18.5" height="13" rx="2.5" />
-    <path d="M6.75 9.5h.01M10.25 9.5h.01M13.75 9.5h.01M17.25 9.5h.01M6.75 13h.01M17.25 13h.01M9.5 14.5h5" />
   </Svg>
 )
 

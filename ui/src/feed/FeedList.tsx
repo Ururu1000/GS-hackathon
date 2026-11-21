@@ -2,6 +2,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { FeedAlert } from '../api/types'
 import { AlertRow } from './AlertRow'
+import { ChevronUpIcon } from '../lib/icons'
 
 export const ROW_H = 66
 const AT_TOP = ROW_H / 2
@@ -91,7 +92,7 @@ export function FeedList({ alerts, inserted, selectedId, now, onSelect, empty }:
     <div className="feed-list-wrap">
       {unseenCount > 0 && (
         <button className="new-pill" onClick={jumpToTop}>
-          ↑ {unseenCount} new alert{unseenCount === 1 ? '' : 's'}
+          <ChevronUpIcon size={14} />{unseenCount} new alert{unseenCount === 1 ? '' : 's'}
         </button>
       )}
       <div
