@@ -51,6 +51,6 @@ The submission rules ask every team that used AI tools to say how, and how it de
 
 **Security we built and reviewed with AI help**
 - Secret-looking fields are redacted before they reach alerts, samples, notifications or the LLM. Logs carry no message text, SMS codes or approval challenges, and phone numbers and addresses are masked.
-- Approval codes are stored hashed, single-use, expire after 15 minutes and allow 5 attempts, and nobody can approve their own request. SMS replies reach the API only HMAC-signed with a timestamp.
+- Approval codes are stored hashed, single-use, expire after 15 minutes and allow 5 attempts, and the approval logic refuses a decision from the person who asked. SMS replies reach the API only HMAC-signed with a timestamp. **Demo caveat:** the device simulator and Mailpit have no login, so in the demo any session can read the SMS codes and the signed approval links and reply as any number; a real SMS provider and mail relay remove that (see "What is mocked" in `docs/DELIVERY.md`).
 - Every port binds to localhost, writes need the session's CSRF token, and the fake SMS gateway refuses to listen beyond loopback without a token.
 - What is mocked, and its limits, are listed in the README and in `docs/DELIVERY.md` ("What is mocked"). How to swap in a real provider is in `docs/PROVIDERS.md`.

@@ -30,6 +30,9 @@ services:
       GATEWAY_TOKEN: ${GATEWAY_TOKEN:-beacon-demo-gateway-token}
       REPLY_SECRET: ${REPLY_SECRET:-beacon-demo-reply-secret}
       PUBLIC_URL: http://localhost:8080
+      # DNS-rebinding guard on the API and ingest ports: `beacon` is the name demo-seed
+      # posts to over the compose network. Browsers use localhost, which always passes.
+      API_ALLOWED_HOSTS: beacon
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:8090:8090"

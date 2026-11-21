@@ -2,7 +2,7 @@
 
 Delivery turns an alert into the right messages for the right people and follows up until someone acts. It covers routing, channel preferences, email/SMS/phone delivery, retries, escalation, throttling, runbooks, actions and approvals. Code: [`crates/beacon-delivery`](../crates/beacon-delivery). Config: `config/people`, `config/teams`, `config/delivery.yaml`, `config/runbooks`, `config/actions`.
 
-> Status: `main` has the M0 part (PRs #5 and #7). PR #9 (preferences, the fake gateway, the breaker and fallback) is approved. PR #11 (escalation, throttles, runbooks, approvals and the security-audit fixes) is in final review.
+> Status: everything described here is on `main`: routing and preferences, the fake gateway, the breaker and fallback (PR #9), escalation, throttles, runbooks, actions and approvals (PR #11), the people/teams API, the four-task router (M7) and signed email approval links.
 
 ## How a notification flows
 
@@ -163,7 +163,7 @@ Re-run it: Actions → `loadgen` → Run workflow (inputs: rates, duration), or 
 
 ## Security notes
 
-- No approval code is ever logged or returned by an API. Codes exist only in the SMS itself until the approval is decided.
+- No approval code is ever logged or returned by Beacon's own API. Codes exist only in the SMS itself until the approval is decided. **Demo exception:** the device simulator stands in for the phone, so any session can read the SMS it holds (approval codes included) through `GET /api/simulator/messages`, and `POST /api/simulator/reply` signs a reply from any number. Mailpit (`127.0.0.1:8025`) has no login either, so the signed approval links in the emails can be read there. A real SMS provider and mail relay remove all three; until then the "never the requester" rule is enforced by the approval state machine, not by the demo's open phone and inbox.
 - Approval codes are 4 digits, stored only as a SHA-256 hash, unique per approver, single-use, valid for 15 minutes, with 5 attempts. Only the team lead or the current on-call may approve, never the person who asked, and the hash is scrubbed once the request is decided.
 - Phone numbers and email addresses are masked in logs and error text.
 - Delivery's API trusts the `Actor` set by beacon-api's session/CSRF layer: every POST must send `Content-Type: application/json` (415 otherwise, even with an empty body), and only members, the lead or an on-call of the alert's team may run steps.
