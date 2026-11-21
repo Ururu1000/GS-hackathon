@@ -288,8 +288,11 @@ pub async fn route_once(
     Ok(stats)
 }
 
-/// Insert planned jobs `ON CONFLICT DO NOTHING`; returns how many rows were inserted. Shared with
-/// the escalation scheduler and the throttle digest (`escalation_step` is `Some` for escalations).
+/// Insert all planned jobs of one call in ONE statement: `unnest` the per-job arrays
+/// `WITH ORDINALITY` (so insertion order follows input order) and let `ON CONFLICT DO NOTHING`
+/// skip keys that already exist — including a duplicate channel twice within the same call.
+/// Returns how many rows were actually inserted (conflicts excluded). Shared with the
+/// escalation scheduler and the throttle digest (`escalation_step` is `Some` for escalations).
 pub async fn insert_jobs(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     alert_id: Uuid,
@@ -298,26 +301,30 @@ pub async fn insert_jobs(
     jobs: &[PlannedJob],
     escalation_step: Option<i32>,
 ) -> Result<u64, sqlx::Error> {
-    let mut inserted = 0;
-    for job in jobs {
-        let res = sqlx::query(
-            "INSERT INTO delivery_jobs \
-               (alert_id, notify_seq, recipient_id, channel, address, route_info, escalation_step) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING",
-        )
-        .bind(alert_id)
-        .bind(notify_seq)
-        .bind(recipient_id)
-        .bind(&job.channel)
-        .bind(&job.address)
-        .bind(&job.route_info)
-        .bind(escalation_step.unwrap_or(0))
-        .execute(&mut **tx)
-        .await?;
-        inserted += res.rows_affected();
+    if jobs.is_empty() {
+        return Ok(0);
     }
-    Ok(inserted)
+    let channels: Vec<&str> = jobs.iter().map(|j| j.channel.as_str()).collect();
+    let addresses: Vec<&str> = jobs.iter().map(|j| j.address.as_str()).collect();
+    let route_info: Vec<serde_json::Value> = jobs.iter().map(|j| j.route_info.clone()).collect();
+    let res = sqlx::query(
+        "INSERT INTO delivery_jobs \
+           (alert_id, notify_seq, recipient_id, channel, address, route_info, escalation_step) \
+         SELECT $1, $2, $3, c, a, r, $7 \
+         FROM unnest($4::text[], $5::text[], $6::jsonb[]) WITH ORDINALITY AS t(c, a, r, ord) \
+         ORDER BY ord \
+         ON CONFLICT (alert_id, recipient_id, channel, notify_seq, escalation_step) DO NOTHING",
+    )
+    .bind(alert_id)
+    .bind(notify_seq)
+    .bind(recipient_id)
+    .bind(&channels)
+    .bind(&addresses)
+    .bind(&route_info)
+    .bind(escalation_step.unwrap_or(0))
+    .execute(&mut **tx)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Facts a preference can match on: the payload plus its optional raw `context` object
